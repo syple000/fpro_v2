@@ -280,6 +280,8 @@ Content-Type: application/json
 ```
 
 下载接口是同步接口，数据完成落盘后才返回。大量合约或长时间范围建议拆成多个请求。
+部分券商内置的旧版 xtquant 不支持批量接口的 `incrementally` 参数；agent 检测到该特定
+`TypeError` 时会自动去掉参数重试，其他参数错误仍会正常返回。
 
 ### 查询历史数据
 

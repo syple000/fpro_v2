@@ -129,13 +129,22 @@ class XtDataGateway:
         """使用官方批量接口同步补充历史行情。"""
         try:
             with self._call_lock:
-                self._xtdata.download_history_data2(
-                    stock_list=list(stocks),
-                    period=period,
-                    start_time=start_time,
-                    end_time=end_time,
-                    incrementally=incrementally,
-                )
+                arguments = {
+                    "stock_list": list(stocks),
+                    "period": period,
+                    "start_time": start_time,
+                    "end_time": end_time,
+                }
+                try:
+                    self._xtdata.download_history_data2(
+                        **arguments,
+                        incrementally=incrementally,
+                    )
+                except TypeError as exc:
+                    # 部分券商内置的旧版 xtquant 没有 incrementally 参数。
+                    if "unexpected keyword argument 'incrementally'" not in str(exc):
+                        raise
+                    self._xtdata.download_history_data2(**arguments)
         except Exception as exc:
             raise QmtGatewayError(f"下载历史行情失败：{exc}") from exc
 

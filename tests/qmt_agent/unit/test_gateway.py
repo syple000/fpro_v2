@@ -163,3 +163,33 @@ def test_history_download_uses_official_batch_interface() -> None:
         "end_time": "20251231",
         "incrementally": False,
     }
+
+
+def test_history_download_supports_legacy_client_without_incremental_argument() -> None:
+    class LegacyXtData(FakeXtData):
+        def download_history_data2(
+            self,
+            stock_list: list[str],
+            period: str,
+            start_time: str,
+            end_time: str,
+        ) -> None:
+            self.method = "download_history_data2"
+            self.arguments = {
+                "stock_list": stock_list,
+                "period": period,
+                "start_time": start_time,
+                "end_time": end_time,
+            }
+
+    xtdata = LegacyXtData()
+    gateway = make_gateway(xtdata)
+
+    gateway.download_history(["000001.SZ"], "1d", "", "", True)
+
+    assert xtdata.arguments == {
+        "stock_list": ["000001.SZ"],
+        "period": "1d",
+        "start_time": "",
+        "end_time": "",
+    }
