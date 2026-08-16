@@ -17,11 +17,18 @@ from qmt_agent.models import (
     HistoryQueryRequest,
     MarketRequest,
     MarketUnsubscribeRequest,
+    SequencedQuoteRequest,
     StockRequest,
+    StockSubscriptionRequest,
     SubscribedQuoteRequest,
 )
 from qmt_agent.serialization import to_jsonable
-from qmt_agent.service import QmtMarketService, SubscriptionLimitError
+from qmt_agent.service import (
+    QmtMarketService,
+    QuoteSequenceOutOfRangeError,
+    SubscriptionLimitError,
+    SubscriptionPeriodConflictError,
+)
 
 
 def create_app(
@@ -36,6 +43,7 @@ def create_app(
         app.state.market_service = QmtMarketService(
             active_gateway,
             max_stock_subscriptions=configured_settings.max_stock_subscriptions,
+            quote_buffer_capacity=configured_settings.quote_buffer_capacity,
         )
         try:
             yield
@@ -56,6 +64,26 @@ def create_app(
     @app.exception_handler(SubscriptionLimitError)
     async def handle_limit_error(_: Request, exc: SubscriptionLimitError) -> JSONResponse:
         return JSONResponse(status_code=409, content={"detail": str(exc)})
+
+    @app.exception_handler(SubscriptionPeriodConflictError)
+    async def handle_period_conflict(
+        _: Request, exc: SubscriptionPeriodConflictError
+    ) -> JSONResponse:
+        return JSONResponse(status_code=409, content={"detail": str(exc)})
+
+    @app.exception_handler(QuoteSequenceOutOfRangeError)
+    async def handle_quote_sequence_error(
+        _: Request, exc: QuoteSequenceOutOfRangeError
+    ) -> JSONResponse:
+        return JSONResponse(
+            status_code=416,
+            content={
+                "detail": str(exc),
+                "requested_seq": exc.requested_seq,
+                "oldest_seq": exc.oldest_seq,
+                "latest_seq": exc.latest_seq,
+            },
+        )
 
     def service(request: Request) -> QmtMarketService:
         return request.app.state.market_service
@@ -83,12 +111,16 @@ def create_app(
         return service(request).unsubscribe_markets(markets)
 
     @app.post("/v1/subscriptions/stocks", summary="按列表订阅")
-    def subscribe_stocks(body: StockRequest, request: Request) -> dict[str, Any]:
-        return service(request).subscribe_stocks(body.stocks)
+    def subscribe_stocks(
+        request: Request, body: StockSubscriptionRequest
+    ) -> dict[str, Any]:
+        return service(request).subscribe_stocks(body.stocks, body.period)
 
     @app.delete("/v1/subscriptions/stocks", summary="按列表取消订阅")
-    def unsubscribe_stocks(body: StockRequest, request: Request) -> dict[str, Any]:
-        return service(request).unsubscribe_stocks(body.stocks)
+    def unsubscribe_stocks(
+        request: Request, body: StockSubscriptionRequest
+    ) -> dict[str, Any]:
+        return service(request).unsubscribe_stocks(body.stocks, body.period)
 
     @app.post("/v1/snapshots/markets", summary="获取全市场快照截面")
     def market_snapshot(
@@ -99,17 +131,35 @@ def create_app(
         return JSONResponse(content=to_jsonable({"data": result, "count": len(result)}))
 
     @app.post("/v1/snapshots/stocks", summary="按列表获取行情快照")
-    def stock_snapshot(body: StockRequest, request: Request) -> JSONResponse:
+    def stock_snapshot(request: Request, body: StockRequest) -> JSONResponse:
         result = service(request).get_stock_snapshot(body.stocks)
         return JSONResponse(content=to_jsonable({"data": result, "count": len(result)}))
 
-    @app.post("/v1/quotes/subscribed", summary="获取列表订阅的最新数据")
-    def subscribed_quotes(body: SubscribedQuoteRequest, request: Request) -> JSONResponse:
-        result = service(request).get_subscribed_quotes(body.stocks)
+    @app.post("/v1/quotes/subscribed/markets", summary="获取全市场订阅的最新数据")
+    def market_quotes(
+        request: Request, body: SubscribedQuoteRequest | None = None
+    ) -> JSONResponse:
+        stocks = body.stocks if body is not None else None
+        result = service(request).get_market_quotes(stocks)
+        return JSONResponse(content=to_jsonable(result))
+
+    @app.post("/v1/quotes/subscribed/stocks", summary="获取单股订阅的最新数据")
+    def stock_quotes(
+        request: Request, body: SubscribedQuoteRequest | None = None
+    ) -> JSONResponse:
+        stocks = body.stocks if body is not None else None
+        result = service(request).get_stock_quotes(stocks)
+        return JSONResponse(content=to_jsonable(result))
+
+    @app.post("/v1/quotes/subscribed/sequence", summary="按序获取订阅行情")
+    def sequenced_quotes(request: Request, body: SequencedQuoteRequest) -> JSONResponse:
+        result = service(request).get_subscribed_quote_sequence(
+            body.seq, body.limit, body.stocks
+        )
         return JSONResponse(content=to_jsonable(result))
 
     @app.post("/v1/history/download", summary="按列表下载增量或全量历史数据")
-    def download_history(body: HistoryDownloadRequest, request: Request) -> dict[str, Any]:
+    def download_history(request: Request, body: HistoryDownloadRequest) -> dict[str, Any]:
         return service(request).download_history(
             body.stocks,
             body.period,
@@ -119,7 +169,7 @@ def create_app(
         )
 
     @app.post("/v1/history/query", summary="按列表获取历史数据")
-    def query_history(body: HistoryQueryRequest, request: Request) -> JSONResponse:
+    def query_history(request: Request, body: HistoryQueryRequest) -> JSONResponse:
         result = service(request).get_history(
             body.stocks,
             body.fields,

@@ -3,13 +3,28 @@
 from __future__ import annotations
 
 import re
-from typing import Literal
+from typing import Literal, TypeAlias
 
 from pydantic import BaseModel, Field, field_validator
 
 _STOCK_PATTERN = re.compile(r"^[A-Z0-9_]+\.[A-Z0-9_]+$")
 _MARKET_PATTERN = re.compile(r"^[A-Z0-9_]+$")
 _TIME_PATTERN = re.compile(r"^(?:\d{8}|\d{14})?$")
+
+XtDataPeriod: TypeAlias = Literal[
+    "tick",
+    "1m",
+    "5m",
+    "15m",
+    "30m",
+    "1h",
+    "1d",
+    "1w",
+    "1mon",
+    "1q",
+    "1hy",
+    "1y",
+]
 
 
 def _unique_upper(values: list[str], pattern: re.Pattern[str], name: str) -> list[str]:
@@ -56,6 +71,10 @@ class StockRequest(BaseModel):
         return _unique_upper(values, _STOCK_PATTERN, "合约代码")
 
 
+class StockSubscriptionRequest(StockRequest):
+    period: XtDataPeriod
+
+
 class SubscribedQuoteRequest(BaseModel):
     stocks: list[str] | None = None
 
@@ -67,8 +86,13 @@ class SubscribedQuoteRequest(BaseModel):
         return _unique_upper(values, _STOCK_PATTERN, "合约代码")
 
 
+class SequencedQuoteRequest(SubscribedQuoteRequest):
+    seq: int = Field(ge=1)
+    limit: int = Field(default=100, ge=1, le=1_000)
+
+
 class HistoryDownloadRequest(StockRequest):
-    period: str = Field(default="1d", min_length=1, max_length=32)
+    period: XtDataPeriod = "1d"
     start_time: str = ""
     end_time: str = ""
     mode: Literal["incremental", "full"] = "incremental"
@@ -83,7 +107,7 @@ class HistoryDownloadRequest(StockRequest):
 
 class HistoryQueryRequest(StockRequest):
     fields: list[str] = Field(default_factory=list, max_length=100)
-    period: str = Field(default="1d", min_length=1, max_length=32)
+    period: XtDataPeriod = "1d"
     start_time: str = ""
     end_time: str = ""
     count: int = Field(default=-1, ge=-1)

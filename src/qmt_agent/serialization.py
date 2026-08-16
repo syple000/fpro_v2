@@ -15,6 +15,12 @@ def to_jsonable(value: Any) -> Any:
         return value
     if isinstance(value, float):
         return value if math.isfinite(value) else None
+    # 行情响应绝大多数是内置容器，先走快速路径，避免反复执行较昂贵的
+    # dataclass 和 collections.abc.Mapping 实例检查。
+    if isinstance(value, dict):
+        return {str(key): to_jsonable(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [to_jsonable(item) for item in value]
     if isinstance(value, bytes):
         return value.decode("utf-8", errors="replace")
     if isinstance(value, (datetime, date)):
@@ -23,8 +29,6 @@ def to_jsonable(value: Any) -> Any:
         return to_jsonable(asdict(value))
     if isinstance(value, Mapping):
         return {str(key): to_jsonable(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple, set)):
-        return [to_jsonable(item) for item in value]
 
     # 以下对象来自 pandas、numpy 或 xtdata，只能在运行时按能力判断。
     dynamic_value: Any = value

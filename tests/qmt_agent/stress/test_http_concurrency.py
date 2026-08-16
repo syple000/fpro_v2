@@ -19,12 +19,12 @@ def stock_code(number: int) -> str:
     return f"{number:06d}.SH"
 
 
-def test_concurrent_http_requests_preserve_all_300_subscriptions() -> None:
+def test_concurrent_http_requests_preserve_all_50_subscriptions() -> None:
     gateway = FakeGateway()
     app = create_app(gateway=gateway, settings=Settings())
     batches = [
         [stock_code(number) for number in range(start, start + 10)]
-        for start in range(0, 300, 10)
+        for start in range(0, 50, 10)
     ]
     barrier = Barrier(len(batches))
 
@@ -33,7 +33,8 @@ def test_concurrent_http_requests_preserve_all_300_subscriptions() -> None:
         def subscribe(batch: list[str]) -> int:
             barrier.wait()
             return client.post(
-                "/v1/subscriptions/stocks", json={"stocks": batch}
+                "/v1/subscriptions/stocks",
+                json={"stocks": batch, "period": "tick"},
             ).status_code
 
         with ThreadPoolExecutor(max_workers=len(batches)) as executor:
@@ -43,7 +44,7 @@ def test_concurrent_http_requests_preserve_all_300_subscriptions() -> None:
         active_during_run = gateway.active_codes()
 
     assert status_codes == [200] * len(batches)
-    assert status["stock_count"] == 300
-    assert status["stocks"] == [stock_code(number) for number in range(300)]
-    assert active_during_run == [status["stocks"]]
+    assert status["stock_count"] == 50
+    assert status["stocks"] == [stock_code(number) for number in range(50)]
+    assert {codes[0] for codes in active_during_run} == set(status["stocks"])
     assert gateway.active_codes() == []

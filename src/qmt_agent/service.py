@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import logging
+from collections import deque
 from collections.abc import Iterable
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import UTC, datetime
-from threading import RLock
+from threading import Lock
 from typing import Any
 
 from qmt_agent.gateway import MarketDataGateway, QmtGatewayError
@@ -18,66 +19,180 @@ class SubscriptionLimitError(ValueError):
     """列表订阅数量超过上限。"""
 
 
+class SubscriptionPeriodConflictError(ValueError):
+    """合约已使用其他周期订阅。"""
+
+
+class QuoteSequenceOutOfRangeError(ValueError):
+    """请求的行情序号不在当前循环缓存范围内。"""
+
+    def __init__(
+        self,
+        requested_seq: int,
+        oldest_seq: int | None,
+        latest_seq: int | None,
+    ) -> None:
+        self.requested_seq = requested_seq
+        self.oldest_seq = oldest_seq
+        self.latest_seq = latest_seq
+
+        if oldest_seq is None or latest_seq is None:
+            message = (
+                f"行情顺序缓存为空，请求序号 {requested_seq}；"
+                "当前没有最旧或最新序号"
+            )
+        elif requested_seq < oldest_seq:
+            message = (
+                f"请求序号 {requested_seq} 过旧；"
+                f"当前最旧序号 {oldest_seq}，最新序号 {latest_seq}"
+            )
+        else:
+            message = (
+                f"请求序号 {requested_seq} 过新；"
+                f"当前最旧序号 {oldest_seq}，最新序号 {latest_seq}"
+            )
+        super().__init__(message)
+
+
 @dataclass(slots=True)
-class _SubscriptionSlot:
-    subscription_id: int | None = None
-    codes: set[str] = field(default_factory=set)
+class _StockSubscription:
+    subscription_id: int
+    period: str
+
+
+@dataclass(frozen=True, slots=True)
+class _SequencedQuote:
+    seq: int
+    code: str
+    period: str
+    source: str
+    subscription: str
+    received_at: str
+    quote: Any
 
 
 class QmtMarketService:
-    """维护两个订阅：全市场订阅和不超过 300 个合约的列表订阅。"""
+    """维护全市场全推订阅，以及逐合约、带周期的列表订阅。"""
 
-    def __init__(self, gateway: MarketDataGateway, max_stock_subscriptions: int = 300) -> None:
-        if not 1 <= max_stock_subscriptions <= 300:
-            raise ValueError("列表订阅上限必须在 1 到 300 之间")
+    def __init__(
+        self,
+        gateway: MarketDataGateway,
+        max_stock_subscriptions: int = 50,
+        quote_buffer_capacity: int = 10_000,
+    ) -> None:
+        if not 1 <= max_stock_subscriptions <= 50:
+            raise ValueError("列表订阅上限必须在 1 到 50 之间")
+        if quote_buffer_capacity < 1:
+            raise ValueError("行情顺序缓存容量必须大于等于 1")
 
         self._gateway = gateway
         self._max_stock_subscriptions = max_stock_subscriptions
-        self._market_slot = _SubscriptionSlot()
-        self._stock_slot = _SubscriptionSlot()
-        self._operation_lock = RLock()
-        self._quote_lock = RLock()
-        self._latest_quotes: dict[str, Any] = {}
-        self._quote_updated_at: dict[str, str] = {}
+        self._quote_buffer_capacity = quote_buffer_capacity
+        self._market_subscriptions: dict[str, int] = {}
+        self._stock_subscriptions: dict[str, _StockSubscription] = {}
+        self._market_operation_lock = Lock()
+        self._stock_operation_lock = Lock()
+        self._market_quote_lock = Lock()
+        self._stock_quote_lock = Lock()
+        self._market_quotes: dict[str, Any] = {}
+        self._market_quote_updated_at: dict[str, str] = {}
+        self._stock_quotes: dict[str, Any] = {}
+        self._stock_quote_updated_at: dict[str, str] = {}
+        self._quote_sequence_lock = Lock()
+        self._quote_sequence: deque[_SequencedQuote] = deque(
+            maxlen=quote_buffer_capacity
+        )
+        self._next_quote_seq = 1
 
     def subscribe_markets(self, markets: Iterable[str]) -> dict[str, Any]:
         requested = set(markets)
-        with self._operation_lock:
-            current = set(self._market_slot.codes)
-            target = current | requested
-            self._replace_subscription(self._market_slot, target, "全市场")
-            return self._subscription_result(self._market_slot, target - current, set())
+        with self._market_operation_lock:
+            added = requested - self._market_subscriptions.keys()
+            for market in sorted(added):
+                self._clear_market_cache(market)
+                subscription_id = self._gateway.subscribe_market_quote(
+                    market,
+                    lambda quotes, market=market: self._on_market_quotes(
+                        quotes, market
+                    ),
+                )
+                self._market_subscriptions[market] = subscription_id
+            return self._market_subscription_result(added=added)
 
     def unsubscribe_markets(self, markets: Iterable[str] | None = None) -> dict[str, Any]:
-        with self._operation_lock:
-            current = set(self._market_slot.codes)
+        with self._market_operation_lock:
+            current = set(self._market_subscriptions)
             requested = current if markets is None else set(markets)
             removed = current & requested
             missing = requested - current
-            self._replace_subscription(self._market_slot, current - requested, "全市场")
-            return self._subscription_result(self._market_slot, set(), removed, missing)
+            for market in sorted(removed):
+                self._gateway.unsubscribe(self._market_subscriptions[market])
+                del self._market_subscriptions[market]
+            return self._market_subscription_result(removed=removed, missing=missing)
 
-    def subscribe_stocks(self, stocks: Iterable[str]) -> dict[str, Any]:
+    def subscribe_stocks(self, stocks: Iterable[str], period: str) -> dict[str, Any]:
         requested = set(stocks)
-        with self._operation_lock:
-            current = set(self._stock_slot.codes)
+        with self._stock_operation_lock:
+            current = set(self._stock_subscriptions)
             target = current | requested
             if len(target) > self._max_stock_subscriptions:
                 raise SubscriptionLimitError(
                     f"列表订阅总数不能超过 {self._max_stock_subscriptions}，"
                     f"当前 {len(current)}，请求后 {len(target)}"
                 )
-            self._replace_subscription(self._stock_slot, target, "列表")
-            return self._subscription_result(self._stock_slot, target - current, set())
 
-    def unsubscribe_stocks(self, stocks: Iterable[str]) -> dict[str, Any]:
+            conflicts = {
+                stock: self._stock_subscriptions[stock].period
+                for stock in requested & current
+                if self._stock_subscriptions[stock].period != period
+            }
+            if conflicts:
+                details = "，".join(
+                    f"{stock} 当前为 {current_period}"
+                    for stock, current_period in sorted(conflicts.items())
+                )
+                raise SubscriptionPeriodConflictError(
+                    f"合约已使用其他周期订阅（{details}）；"
+                    "请先按原周期显式取消，再订阅新周期"
+                )
+
+            added = requested - current
+            for stock in sorted(added):
+                with self._stock_quote_lock:
+                    self._stock_quotes.pop(stock, None)
+                    self._stock_quote_updated_at.pop(stock, None)
+                subscription_id = self._gateway.subscribe_stock_quote(
+                    stock,
+                    period,
+                    lambda quotes, stock=stock, period=period: self._on_stock_quotes(
+                        quotes, stock, period
+                    ),
+                )
+                self._stock_subscriptions[stock] = _StockSubscription(
+                    subscription_id, period
+                )
+            return self._stock_subscription_result(added=added)
+
+    def unsubscribe_stocks(self, stocks: Iterable[str], period: str) -> dict[str, Any]:
         requested = set(stocks)
-        with self._operation_lock:
-            current = set(self._stock_slot.codes)
-            removed = current & requested
+        with self._stock_operation_lock:
+            current = set(self._stock_subscriptions)
             missing = requested - current
-            self._replace_subscription(self._stock_slot, current - requested, "列表")
-            return self._subscription_result(self._stock_slot, set(), removed, missing)
+            period_mismatches = {
+                stock: self._stock_subscriptions[stock].period
+                for stock in requested & current
+                if self._stock_subscriptions[stock].period != period
+            }
+            removed = (current & requested) - period_mismatches.keys()
+            for stock in sorted(removed):
+                subscription = self._stock_subscriptions[stock]
+                self._gateway.unsubscribe(subscription.subscription_id)
+                del self._stock_subscriptions[stock]
+            return self._stock_subscription_result(
+                removed=removed,
+                missing=missing,
+                period_mismatches=period_mismatches,
+            )
 
     def get_market_snapshot(self, markets: Iterable[str]) -> dict[str, Any]:
         return self._gateway.get_full_tick(sorted(set(markets)))
@@ -85,63 +200,184 @@ class QmtMarketService:
     def get_stock_snapshot(self, stocks: Iterable[str]) -> dict[str, Any]:
         return self._gateway.get_full_tick(sorted(set(stocks)))
 
-    def get_subscribed_quotes(self, stocks: Iterable[str] | None = None) -> dict[str, Any]:
-        with self._operation_lock:
-            subscribed_stocks = set(self._stock_slot.codes)
-            subscribed_markets = set(self._market_slot.codes)
+    def get_market_quotes(self, stocks: Iterable[str] | None = None) -> dict[str, Any]:
+        """读取全市场订阅产生的最新 tick，不混入单股订阅缓存。"""
+        requested = None if stocks is None else set(stocks)
+        with self._market_operation_lock:
+            subscribed_markets = set(self._market_subscriptions)
 
-        with self._quote_lock:
-            if stocks is None:
-                requested = {
-                    code
-                    for code in self._latest_quotes
-                    if self._is_subscribed(code, subscribed_stocks, subscribed_markets)
-                }
+            if requested is None:
                 not_subscribed: set[str] = set()
             else:
-                requested = set(stocks)
                 not_subscribed = {
                     code
                     for code in requested
-                    if not self._is_subscribed(code, subscribed_stocks, subscribed_markets)
+                    if code.rpartition(".")[2] not in subscribed_markets
                 }
 
-            allowed = requested - not_subscribed
-            data = {
-                code: self._latest_quotes[code]
-                for code in sorted(allowed)
-                if code in self._latest_quotes
-            }
-            updated_at = {
-                code: self._quote_updated_at[code]
-                for code in data
-                if code in self._quote_updated_at
-            }
+            with self._market_quote_lock:
+                if requested is None:
+                    data = {
+                        code: quote
+                        for code, quote in self._market_quotes.items()
+                        if code.rpartition(".")[2] in subscribed_markets
+                    }
+                else:
+                    allowed = requested - not_subscribed
+                    data = {
+                        code: self._market_quotes[code]
+                        for code in sorted(allowed)
+                        if code in self._market_quotes
+                    }
+                updated_at = {
+                    code: self._market_quote_updated_at[code]
+                    for code in data
+                    if code in self._market_quote_updated_at
+                }
 
-        missing = allowed - data.keys()
+        missing = set() if requested is None else requested - not_subscribed - data.keys()
+
         return {
-            "data": data,
+            "data": dict(sorted(data.items())),
             "updated_at": updated_at,
+            "periods": dict.fromkeys(sorted(data), "tick"),
             "missing": sorted(missing),
             "not_subscribed": sorted(not_subscribed),
         }
 
-    @staticmethod
-    def _is_subscribed(
-        code: str, subscribed_stocks: set[str], subscribed_markets: set[str]
-    ) -> bool:
-        if code in subscribed_stocks:
-            return True
-        _, separator, market = code.rpartition(".")
-        return bool(separator) and market in subscribed_markets
+    def get_stock_quotes(self, stocks: Iterable[str] | None = None) -> dict[str, Any]:
+        """读取单股订阅产生的最新行情，不混入全市场订阅缓存。"""
+        requested = None if stocks is None else set(stocks)
+        with self._stock_operation_lock:
+            stock_periods = {
+                stock: subscription.period
+                for stock, subscription in self._stock_subscriptions.items()
+            }
+            if requested is None:
+                allowed = set(stock_periods)
+                not_subscribed: set[str] = set()
+            else:
+                not_subscribed = requested - stock_periods.keys()
+                allowed = requested - not_subscribed
+
+            with self._stock_quote_lock:
+                data = {
+                    code: self._stock_quotes[code]
+                    for code in sorted(allowed)
+                    if code in self._stock_quotes
+                }
+                updated_at = {
+                    code: self._stock_quote_updated_at[code]
+                    for code in data
+                    if code in self._stock_quote_updated_at
+                }
+
+        return {
+            "data": data,
+            "updated_at": updated_at,
+            "periods": {code: stock_periods[code] for code in data},
+            "missing": sorted(allowed - data.keys()),
+            "not_subscribed": sorted(not_subscribed),
+        }
+
+    def get_subscribed_quotes(self, stocks: Iterable[str] | None = None) -> dict[str, Any]:
+        """兼容旧接口；单股订阅优先于同代码的全市场 tick。"""
+        market_result = self.get_market_quotes(stocks)
+        stock_result = self.get_stock_quotes(stocks)
+        stock_owned = stock_result["data"].keys() | set(stock_result["missing"])
+
+        data = {
+            code: quote
+            for code, quote in market_result["data"].items()
+            if code not in stock_owned
+        }
+        data.update(stock_result["data"])
+        updated_at = {
+            code: timestamp
+            for code, timestamp in market_result["updated_at"].items()
+            if code not in stock_owned
+        }
+        updated_at.update(stock_result["updated_at"])
+        periods = {
+            code: period
+            for code, period in market_result["periods"].items()
+            if code not in stock_owned
+        }
+        periods.update(stock_result["periods"])
+
+        return {
+            "data": dict(sorted(data.items())),
+            "updated_at": dict(sorted(updated_at.items())),
+            "periods": dict(sorted(periods.items())),
+            "missing": sorted(
+                (set(market_result["missing"]) - stock_owned)
+                | set(stock_result["missing"])
+            ),
+            "not_subscribed": sorted(
+                set(market_result["not_subscribed"])
+                & set(stock_result["not_subscribed"])
+            ),
+        }
+
+    def get_subscribed_quote_sequence(
+        self,
+        seq: int,
+        limit: int,
+        stocks: Iterable[str] | None = None,
+    ) -> dict[str, Any]:
+        """从指定序号开始读取一个连续窗口，并可在窗口内按合约筛选。"""
+        requested_stocks = None if stocks is None else set(stocks)
+        with self._quote_sequence_lock:
+            oldest_seq, latest_seq = self._quote_sequence_bounds_unlocked()
+            if (
+                oldest_seq is None
+                or latest_seq is None
+                or seq < oldest_seq
+                or seq > latest_seq
+            ):
+                raise QuoteSequenceOutOfRangeError(seq, oldest_seq, latest_seq)
+
+            end_seq = min(seq + limit - 1, latest_seq)
+            records = [
+                item
+                for item in self._quote_sequence
+                if seq <= item.seq <= end_seq
+                and (requested_stocks is None or item.code in requested_stocks)
+            ]
+
+        return {
+            "data": [self._quote_sequence_item(item) for item in records],
+            "count": len(records),
+            "requested_seq": seq,
+            "next_seq": end_seq + 1,
+            "oldest_seq": oldest_seq,
+            "latest_seq": latest_seq,
+        }
+
+    def quote_sequence_status(self) -> dict[str, int | None]:
+        with self._quote_sequence_lock:
+            oldest_seq, latest_seq = self._quote_sequence_bounds_unlocked()
+            return {
+                "oldest_seq": oldest_seq,
+                "latest_seq": latest_seq,
+                "next_seq": self._next_quote_seq,
+                "size": len(self._quote_sequence),
+                "capacity": self._quote_buffer_capacity,
+            }
 
     def status(self) -> dict[str, Any]:
-        with self._operation_lock:
+        with self._market_operation_lock, self._stock_operation_lock:
+            markets = sorted(self._market_subscriptions)
+            stocks = sorted(self._stock_subscriptions)
             return {
-                "markets": sorted(self._market_slot.codes),
-                "stocks": sorted(self._stock_slot.codes),
-                "stock_count": len(self._stock_slot.codes),
+                "markets": markets,
+                "stocks": stocks,
+                "stock_periods": {
+                    stock: self._stock_subscriptions[stock].period for stock in stocks
+                },
+                "stock_count": len(stocks),
                 "stock_limit": self._max_stock_subscriptions,
+                "quote_sequence": self.quote_sequence_status(),
             }
 
     def download_history(
@@ -186,90 +422,185 @@ class QmtMarketService:
 
     def close(self) -> None:
         """进程退出时尽力释放订阅；失败也不阻碍退出。"""
-        with self._operation_lock:
-            for slot in (self._market_slot, self._stock_slot):
-                if slot.subscription_id is None:
-                    continue
+        with self._market_operation_lock, self._stock_operation_lock:
+            for market, subscription_id in list(self._market_subscriptions.items()):
                 try:
-                    self._gateway.unsubscribe(slot.subscription_id)
+                    self._gateway.unsubscribe(subscription_id)
                 except QmtGatewayError:
-                    logger.exception("退出时取消订阅失败，订阅号=%s", slot.subscription_id)
+                    logger.exception(
+                        "退出时取消 %s 全推订阅失败，订阅号=%s",
+                        market,
+                        subscription_id,
+                    )
                 finally:
-                    slot.subscription_id = None
-                    slot.codes.clear()
+                    del self._market_subscriptions[market]
 
-    def _replace_subscription(
-        self, slot: _SubscriptionSlot, target: set[str], name: str
-    ) -> None:
-        """运行中替换订阅；新订阅失败时尽力恢复原订阅。"""
-        current = set(slot.codes)
-        if current == target:
-            return
+            for stock, subscription in list(self._stock_subscriptions.items()):
+                try:
+                    self._gateway.unsubscribe(subscription.subscription_id)
+                except QmtGatewayError:
+                    logger.exception(
+                        "退出时取消 %s 订阅失败，订阅号=%s",
+                        stock,
+                        subscription.subscription_id,
+                    )
+                finally:
+                    del self._stock_subscriptions[stock]
 
-        old_subscription_id = slot.subscription_id
-        if old_subscription_id is not None:
-            self._gateway.unsubscribe(old_subscription_id)
+    def _clear_market_cache(self, market: str) -> None:
+        with self._market_quote_lock:
+            stale_codes = [
+                code
+                for code in self._market_quotes
+                if code.rpartition(".")[2] == market
+            ]
+            for code in stale_codes:
+                self._market_quotes.pop(code, None)
+                self._market_quote_updated_at.pop(code, None)
 
-        if not target:
-            slot.subscription_id = None
-            slot.codes.clear()
-            return
-
-        try:
-            new_subscription_id = self._gateway.subscribe_full_quote(
-                sorted(target), self._on_quotes
-            )
-        except QmtGatewayError as switch_error:
-            if old_subscription_id is None or not current:
-                raise
-
-            try:
-                restored_id = self._gateway.subscribe_full_quote(
-                    sorted(current), self._on_quotes
-                )
-            except QmtGatewayError as restore_error:
-                slot.subscription_id = None
-                slot.codes.clear()
-                raise QmtGatewayError(
-                    f"{name}订阅热切换失败，恢复原订阅也失败：{restore_error}"
-                ) from switch_error
-
-            slot.subscription_id = restored_id
-            slot.codes = current
-            raise QmtGatewayError(f"{name}订阅热切换失败，已恢复原订阅") from switch_error
-
-        slot.subscription_id = new_subscription_id
-        slot.codes = set(target)
-
-    def _on_quotes(self, quotes: dict[str, Any]) -> None:
-        """xtdata 可能从自己的线程回调，所以这里只做很短的内存写入。"""
+    def _on_market_quotes(self, quotes: dict[str, Any], market: str) -> None:
+        """全市场回调的每个代码对应一条 tick，逐项写入缓存。"""
         if not isinstance(quotes, dict):
-            logger.warning("忽略无法识别的行情回调：%r", type(quotes))
+            logger.warning("忽略无法识别的全市场行情回调：%r", type(quotes))
             return
 
         now = datetime.now(UTC).isoformat()
-        with self._quote_lock:
-            for code, quote in quotes.items():
-                # subscribe_quote 返回列表，全推接口返回单条字典；两种形式都兼容。
-                if isinstance(quote, (list, tuple)):
-                    if not quote:
-                        continue
-                    quote = quote[-1]
-                normalized_code = str(code).strip().upper()
-                self._latest_quotes[normalized_code] = quote
-                self._quote_updated_at[normalized_code] = now
+        normalized: dict[str, Any] = {}
+        sequence_items: list[tuple[str, Any]] = []
+        for code, quote in quotes.items():
+            normalized_code = str(code).strip().upper()
+            sequence_items.append((normalized_code, quote))
+            normalized[normalized_code] = quote
+
+        if not sequence_items:
+            return
+
+        self._append_quote_sequence(
+            sequence_items,
+            source="market",
+            subscription=market,
+            period="tick",
+            received_at=now,
+        )
+
+        with self._market_quote_lock:
+            self._market_quotes.update(normalized)
+            self._market_quote_updated_at.update(dict.fromkeys(normalized, now))
+
+    def _on_stock_quotes(
+        self, quotes: dict[str, Any], stock: str, period: str
+    ) -> None:
+        """单股回调可能携带多条行情，逐条入队并单独维护最新值。"""
+        if not isinstance(quotes, dict):
+            logger.warning("忽略无法识别的单股行情回调：%r", type(quotes))
+            return
+
+        now = datetime.now(UTC).isoformat()
+        latest: dict[str, Any] = {}
+        sequence_items: list[tuple[str, Any]] = []
+        for code, quote_rows in quotes.items():
+            normalized_code = str(code).strip().upper()
+            if isinstance(quote_rows, (list, tuple)):
+                if not quote_rows:
+                    continue
+                sequence_items.extend(
+                    (normalized_code, quote) for quote in quote_rows
+                )
+                latest[normalized_code] = quote_rows[-1]
+            else:
+                # fake 网关和部分客户端版本可能直接给出单条字典。
+                sequence_items.append((normalized_code, quote_rows))
+                latest[normalized_code] = quote_rows
+
+        if not sequence_items:
+            return
+
+        self._append_quote_sequence(
+            sequence_items,
+            source="stock",
+            subscription=stock,
+            period=period,
+            received_at=now,
+        )
+
+        with self._stock_quote_lock:
+            self._stock_quotes.update(latest)
+            self._stock_quote_updated_at.update(dict.fromkeys(latest, now))
+
+    def _append_quote_sequence(
+        self,
+        items: list[tuple[str, Any]],
+        *,
+        source: str,
+        subscription: str,
+        period: str,
+        received_at: str,
+    ) -> None:
+        with self._quote_sequence_lock:
+            for code, quote in items:
+                self._quote_sequence.append(
+                    _SequencedQuote(
+                        seq=self._next_quote_seq,
+                        code=code,
+                        period=period,
+                        source=source,
+                        subscription=subscription,
+                        received_at=received_at,
+                        quote=quote,
+                    )
+                )
+                self._next_quote_seq += 1
+
+    def _quote_sequence_bounds_unlocked(self) -> tuple[int | None, int | None]:
+        if not self._quote_sequence:
+            return None, None
+        return self._quote_sequence[0].seq, self._quote_sequence[-1].seq
 
     @staticmethod
-    def _subscription_result(
-        slot: _SubscriptionSlot,
-        added: set[str],
-        removed: set[str],
+    def _quote_sequence_item(item: _SequencedQuote) -> dict[str, Any]:
+        return {
+            "seq": item.seq,
+            "code": item.code,
+            "period": item.period,
+            "source": item.source,
+            "subscription": item.subscription,
+            "received_at": item.received_at,
+            "quote": item.quote,
+        }
+
+    def _market_subscription_result(
+        self,
+        *,
+        added: set[str] | None = None,
+        removed: set[str] | None = None,
         missing: set[str] | None = None,
     ) -> dict[str, Any]:
+        markets = sorted(self._market_subscriptions)
         return {
-            "subscription_id": slot.subscription_id,
-            "subscribed": sorted(slot.codes),
-            "added": sorted(added),
-            "removed": sorted(removed),
+            "subscribed": markets,
+            "added": sorted(added or set()),
+            "removed": sorted(removed or set()),
             "not_found": sorted(missing or set()),
+        }
+
+    def _stock_subscription_result(
+        self,
+        *,
+        added: set[str] | None = None,
+        updated: set[str] | None = None,
+        removed: set[str] | None = None,
+        missing: set[str] | None = None,
+        period_mismatches: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        stocks = sorted(self._stock_subscriptions)
+        return {
+            "periods": {
+                stock: self._stock_subscriptions[stock].period for stock in stocks
+            },
+            "subscribed": stocks,
+            "added": sorted(added or set()),
+            "updated": sorted(updated or set()),
+            "removed": sorted(removed or set()),
+            "not_found": sorted(missing or set()),
+            "period_mismatches": dict(sorted((period_mismatches or {}).items())),
         }

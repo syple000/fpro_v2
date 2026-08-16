@@ -13,23 +13,28 @@ class Settings:
     host: str = "127.0.0.1"
     port: int = 8765
     log_level: str = "info"
-    max_stock_subscriptions: int = 300
+    max_stock_subscriptions: int = 50
+    quote_buffer_capacity: int = 10_000
 
     @classmethod
     def from_env(cls) -> Settings:
         port = _read_int("QMT_AGENT_PORT", 8765)
-        max_subscriptions = _read_int("QMT_AGENT_MAX_SUBSCRIPTIONS", 300)
+        max_subscriptions = _read_int("QMT_AGENT_MAX_SUBSCRIPTIONS", 50)
+        quote_buffer_capacity = _read_int("QMT_AGENT_QUOTE_BUFFER_CAPACITY", 10_000)
 
         if not 1 <= port <= 65535:
             raise ValueError("QMT_AGENT_PORT 必须在 1 到 65535 之间")
-        if not 1 <= max_subscriptions <= 300:
-            raise ValueError("QMT_AGENT_MAX_SUBSCRIPTIONS 必须在 1 到 300 之间")
+        if not 1 <= max_subscriptions <= 50:
+            raise ValueError("QMT_AGENT_MAX_SUBSCRIPTIONS 必须在 1 到 50 之间")
+        if quote_buffer_capacity < 1:
+            raise ValueError("QMT_AGENT_QUOTE_BUFFER_CAPACITY 必须大于等于 1")
 
         return cls(
             host=os.getenv("QMT_AGENT_HOST", "127.0.0.1"),
             port=port,
             log_level=os.getenv("QMT_AGENT_LOG_LEVEL", "info").lower(),
             max_stock_subscriptions=max_subscriptions,
+            quote_buffer_capacity=quote_buffer_capacity,
         )
 
 
