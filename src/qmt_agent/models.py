@@ -3,9 +3,16 @@
 from __future__ import annotations
 
 import re
-from typing import Literal, TypeAlias
+from datetime import datetime
+from typing import Literal, Self, TypeAlias
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_validator,
+)
 
 _STOCK_PATTERN = re.compile(r"^[A-Z0-9_]+\.[A-Z0-9_]+$")
 _MARKET_PATTERN = re.compile(r"^[A-Z0-9_]+$")
@@ -42,7 +49,50 @@ def _unique_upper(values: list[str], pattern: re.Pattern[str], name: str) -> lis
     return result
 
 
-class MarketRequest(BaseModel):
+def _validate_xt_time(value: str) -> str:
+    if not _TIME_PATTERN.fullmatch(value):
+        raise ValueError("时间必须为空、YYYYMMDD 或 YYYYMMDDhhmmss")
+    if not value:
+        return value
+
+    time_format = "%Y%m%d" if len(value) == 8 else "%Y%m%d%H%M%S"
+    try:
+        datetime.strptime(value, time_format)
+    except ValueError as exc:
+        raise ValueError(f"时间不是有效日期或时刻：{value}") from exc
+    return value
+
+
+def _time_boundary(value: str, *, end_of_day: bool) -> datetime | None:
+    if not value:
+        return None
+    if len(value) == 14:
+        return datetime.strptime(value, "%Y%m%d%H%M%S")
+
+    parsed = datetime.strptime(value, "%Y%m%d")
+    if end_of_day:
+        return parsed.replace(hour=23, minute=59, second=59)
+    return parsed
+
+
+def _validate_time_range(start_time: str, end_time: str) -> None:
+    start = _time_boundary(start_time, end_of_day=False)
+    end = _time_boundary(end_time, end_of_day=True)
+    if start is not None and end is not None and start > end:
+        raise ValueError("start_time 不能晚于 end_time")
+
+
+class StrictRequestModel(BaseModel):
+    """所有 HTTP 请求共同使用的严格校验规则。"""
+
+    model_config = ConfigDict(
+        extra="forbid",
+        strict=True,
+        validate_default=True,
+    )
+
+
+class MarketRequest(StrictRequestModel):
     markets: list[str] = Field(default_factory=lambda: ["SH", "SZ"])
 
     @field_validator("markets")
@@ -51,7 +101,7 @@ class MarketRequest(BaseModel):
         return _unique_upper(values, _MARKET_PATTERN, "市场代码")
 
 
-class MarketUnsubscribeRequest(BaseModel):
+class MarketUnsubscribeRequest(StrictRequestModel):
     markets: list[str] | None = None
 
     @field_validator("markets")
@@ -62,7 +112,7 @@ class MarketUnsubscribeRequest(BaseModel):
         return _unique_upper(values, _MARKET_PATTERN, "市场代码")
 
 
-class StockRequest(BaseModel):
+class StockRequest(StrictRequestModel):
     stocks: list[str]
 
     @field_validator("stocks")
@@ -75,7 +125,7 @@ class StockSubscriptionRequest(StockRequest):
     period: XtDataPeriod
 
 
-class SubscribedQuoteRequest(BaseModel):
+class SubscribedQuoteRequest(StrictRequestModel):
     stocks: list[str] | None = None
 
     @field_validator("stocks")
@@ -100,9 +150,12 @@ class HistoryDownloadRequest(StockRequest):
     @field_validator("start_time", "end_time")
     @classmethod
     def validate_time(cls, value: str) -> str:
-        if not _TIME_PATTERN.fullmatch(value):
-            raise ValueError("时间必须为空、YYYYMMDD 或 YYYYMMDDhhmmss")
-        return value
+        return _validate_xt_time(value)
+
+    @model_validator(mode="after")
+    def validate_time_range(self) -> Self:
+        _validate_time_range(self.start_time, self.end_time)
+        return self
 
 
 class HistoryQueryRequest(StockRequest):
@@ -125,4 +178,9 @@ class HistoryQueryRequest(StockRequest):
     @field_validator("start_time", "end_time")
     @classmethod
     def validate_time(cls, value: str) -> str:
-        return HistoryDownloadRequest.validate_time(value)
+        return _validate_xt_time(value)
+
+    @model_validator(mode="after")
+    def validate_time_range(self) -> Self:
+        _validate_time_range(self.start_time, self.end_time)
+        return self

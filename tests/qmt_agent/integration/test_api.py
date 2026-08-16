@@ -89,6 +89,26 @@ def test_stock_subscription_requires_supported_period() -> None:
     assert unsupported.status_code == 422
 
 
+def test_request_validation_rejects_unknown_fields_and_type_coercion() -> None:
+    gateway = FakeGateway()
+    with TestClient(create_app(gateway=gateway, settings=Settings())) as client:
+        unknown_field = client.post(
+            "/v1/history/download",
+            json={
+                "stocks": ["000001.SZ"],
+                "mod": "full",
+            },
+        )
+        wrong_type = client.post(
+            "/v1/quotes/subscribed/sequence",
+            json={"seq": "1"},
+        )
+
+    assert unknown_field.status_code == 422
+    assert wrong_type.status_code == 422
+    assert gateway.history_download is None
+
+
 def test_stock_period_change_requires_explicit_unsubscribe() -> None:
     gateway = FakeGateway()
     with TestClient(create_app(gateway=gateway, settings=Settings())) as client:
