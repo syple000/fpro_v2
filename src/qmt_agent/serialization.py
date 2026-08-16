@@ -26,28 +26,33 @@ def to_jsonable(value: Any) -> Any:
     if isinstance(value, (list, tuple, set)):
         return [to_jsonable(item) for item in value]
 
+    # 以下对象来自 pandas、numpy 或 xtdata，只能在运行时按能力判断。
+    dynamic_value: Any = value
+
     # DataFrame 用 split 结构保留索引和列名，且不会混淆重复时间列。
-    if value.__class__.__module__.startswith("pandas") and getattr(value, "ndim", 0) == 2:
-        split = value.to_dict(orient="split")
+    if dynamic_value.__class__.__module__.startswith("pandas") and getattr(
+        dynamic_value, "ndim", 0
+    ) == 2:
+        split = dynamic_value.to_dict(orient="split")
         return to_jsonable(split)
 
-    dtype = getattr(value, "dtype", None)
+    dtype = getattr(dynamic_value, "dtype", None)
     dtype_names = getattr(dtype, "names", None)
     if dtype_names:
         return [
             {name: to_jsonable(row[name]) for name in dtype_names}
-            for row in value
+            for row in dynamic_value
         ]
 
-    item = getattr(value, "item", None)
+    item = getattr(dynamic_value, "item", None)
     if callable(item):
         try:
             return to_jsonable(item())
         except (TypeError, ValueError):
             pass
 
-    tolist = getattr(value, "tolist", None)
+    tolist = getattr(dynamic_value, "tolist", None)
     if callable(tolist):
         return to_jsonable(tolist())
 
-    return str(value)
+    return str(dynamic_value)

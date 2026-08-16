@@ -2,11 +2,9 @@
 
 from __future__ import annotations
 
-import os
-import sys
 from collections.abc import Callable, Sequence
 from numbers import Integral
-from threading import RLock
+from threading import Lock
 from typing import Any, Protocol
 
 QuoteCallback = Callable[[dict[str, Any]], None]
@@ -51,31 +49,17 @@ class XtDataGateway:
     """串行调用 xtdata，避免不同 HTTP 请求同时进入客户端接口。"""
 
     def __init__(self) -> None:
-        xtquant_path = os.getenv("QMT_XTQUANT_PATH")
-        if xtquant_path and xtquant_path not in sys.path:
-            # 追加到末尾，避免客户端目录中的旧依赖覆盖 uv 管理的依赖。
-            sys.path.append(xtquant_path)
-
-        self._dll_directory: Any = None
-        qmt_bin_path = os.getenv("QMT_BIN_PATH")
-        if os.name == "nt" and qmt_bin_path and hasattr(os, "add_dll_directory"):
-            try:
-                # 句柄需要在进程存活期间保留，否则 DLL 搜索目录会被移除。
-                self._dll_directory = os.add_dll_directory(qmt_bin_path)
-            except OSError as exc:
-                raise QmtGatewayError(f"无法加载 miniQMT DLL 目录 {qmt_bin_path!r}：{exc}") from exc
-
         try:
-            from xtquant import xtdata
+            # xtquant 由 Windows 客户端提供，不属于项目可安装依赖。
+            from xtquant import xtdata  # pyright: ignore[reportMissingImports]
         except Exception as exc:
             raise QmtGatewayError(
-                "无法导入 xtquant.xtdata；请使用 scripts/qmt_agent/start_qmt_agent.cmd 启动，"
-                "或通过 QMT_XTQUANT_PATH 指定东北证券客户端的 site-packages。"
+                "无法导入 xtquant.xtdata；请使用 scripts/qmt_agent/start_qmt_agent.cmd 启动。"
                 f"原始错误：{exc}"
             ) from exc
 
         self._xtdata = xtdata
-        self._call_lock = RLock()
+        self._call_lock = Lock()
 
     def subscribe_full_quote(self, codes: Sequence[str], callback: QuoteCallback) -> int:
         try:

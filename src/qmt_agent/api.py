@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -31,7 +31,7 @@ def create_app(
     configured_settings = settings or Settings.from_env()
 
     @asynccontextmanager
-    async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         active_gateway = gateway or XtDataGateway()
         app.state.market_service = QmtMarketService(
             active_gateway,
@@ -133,6 +133,3 @@ def create_app(
         return JSONResponse(content=to_jsonable({"data": result}))
 
     return app
-
-
-app = create_app()

@@ -39,8 +39,8 @@ def test_scientific_values_are_json_safe() -> None:
 def test_numpy_and_dataframe_are_json_safe() -> None:
     frame = pd.DataFrame(
         [[np.float64(10.5), np.nan]],
-        index=["000001.SZ"],
-        columns=["20250101", "20250102"],
+        index=pd.Index(["000001.SZ"]),
+        columns=pd.Index(["20250101", "20250102"]),
     )
 
     result = to_jsonable({"close": frame, "volume": np.array([1, 2])})

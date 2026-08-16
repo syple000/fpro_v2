@@ -16,34 +16,28 @@
 前提：
 
 1. 已安装 [uv](https://docs.astral.sh/uv/)；
-2. 桌面存在东北证券 miniQMT 客户端快捷方式；
-3. 客户端目录包含 `bin.x64\Lib\site-packages\xtquant`。
+2. 快捷方式位于 `%USERPROFILE%\Desktop\东北证券NET专业版.lnk`；
+3. `xtquant` 位于 `C:\Program Files\东北证券NET专业版\bin.x64\Lib\site-packages`。
 
-双击 `scripts\qmt_agent\start_qmt_agent.cmd`，脚本会依次完成：
+双击 `scripts\qmt_agent\start_qmt_agent.cmd`。脚本直接把上述两个路径传给启动器，
+校验后关闭正在运行的旧 qmt-agent 和该安装目录下的 miniQMT，然后启动 miniQMT，
+等待 60 秒，再启动 qmt-agent。启动器根据传入的 `qmt-bin` 配置客户端 Python 包和
+DLL 目录；不要直接用普通 Python 环境启动。
 
-1. 由 uv 运行 `scripts/qmt_agent/start_qmt_agent.py`；
-2. 阻止 Windows 因空闲自动进入睡眠；
-3. 查找并启动桌面的 miniQMT 快捷方式；
-4. 等待客户端初始化；
-5. 将客户端自带的 `xtquant` 和 DLL 目录传给 agent；
-6. 在同一个 Python 进程中启动服务。
-
-防休眠状态只在 agent 运行期间有效，agent 退出时自动恢复。它不会阻止显示器按系统设置熄屏，也不会阻止用户主动点击睡眠、关机或重启。
-
-脚本默认固定使用以下目录，不会扫描或猜测其他 QMT 客户端的位置：
+默认路径为：
 
 - `QMT bin.x64`：`C:\Program Files\东北证券NET专业版\bin.x64`
 - Python 包：`C:\Program Files\东北证券NET专业版\bin.x64\Lib\site-packages`
+- 快捷方式：`%USERPROFILE%\Desktop\东北证券NET专业版.lnk`
 
-如果安装位置发生变化，可在命令行中显式覆盖：
+启动器不会搜索目录或注册表。进程检测只匹配 qmt-agent 启动命令和明确传入的 QMT
+安装目录，不会按 `python.exe` 等通用进程名关闭程序。如果安装位置发生变化，直接覆盖参数：
 
 ```bat
 scripts\qmt_agent\start_qmt_agent.cmd ^
   --qmt-bin "C:\Program Files\东北证券NET专业版\bin.x64" ^
   --qmt-shortcut "%USERPROFILE%\Desktop\东北证券NET专业版.lnk"
 ```
-
-每次启动前，Python 启动器都会检查旧的 qmt-agent 和 miniQMT 客户端。若发现正在运行的实例，会先请求客户端正常关闭；超时后终止残留进程，确认完全退出后再重新启动客户端和 agent。客户端按安装目录匹配，agent 按启动命令匹配，不会按 `python.exe` 进程名批量结束其他 Python 程序。如果 Windows 拒绝关闭进程，启动器会报错停止，必要时可用管理员身份运行 `scripts\qmt_agent\start_qmt_agent.cmd`。
 
 可通过环境变量修改监听参数：
 
@@ -208,8 +202,8 @@ GET /v1/subscriptions
 Linux 或没有 miniQMT 的机器仍可安装依赖并运行完整测试，因为测试使用假的行情网关：
 
 ```bash
-uv sync --extra qmt-agent
-uv run --extra qmt-agent pytest tests/qmt_agent
+uv sync --group qmt-agent
+uv run --group qmt-agent pytest tests/qmt_agent
 uv run ruff check .
 ```
 
@@ -222,9 +216,9 @@ qmt-agent 的测试按职责隔离：
 可分别运行：
 
 ```bash
-uv run --extra qmt-agent pytest tests/qmt_agent/unit
-uv run --extra qmt-agent pytest tests/qmt_agent/integration
-uv run --extra qmt-agent pytest tests/qmt_agent/stress
+uv run --group qmt-agent pytest tests/qmt_agent/unit
+uv run --group qmt-agent pytest tests/qmt_agent/integration
+uv run --group qmt-agent pytest tests/qmt_agent/stress
 ```
 
 压力测试验证最终状态和并发不变量，不使用依赖机器性能的耗时阈值。
