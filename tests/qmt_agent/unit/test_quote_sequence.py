@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from threading import Thread
+
 import pytest
 
 from qmt_agent.quote_sequence import (
@@ -73,3 +75,19 @@ def test_buffer_rejects_invalid_read_limit() -> None:
 
     with pytest.raises(ValueError, match="读取条数"):
         buffer.read(1, 0)
+
+
+def test_buffer_long_poll_wakes_when_requested_sequence_arrives() -> None:
+    buffer = QuoteSequenceBuffer(capacity=2)
+    result: dict[str, object] = {}
+
+    def read() -> None:
+        result.update(buffer.read(1, 1, wait_ms=1_000))
+
+    reader = Thread(target=read)
+    reader.start()
+    append_values(buffer, 7)
+    reader.join(timeout=2)
+
+    assert not reader.is_alive()
+    assert [item["seq"] for item in result["data"]] == [1]  # type: ignore[index]

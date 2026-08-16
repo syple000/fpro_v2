@@ -97,6 +97,10 @@ qmt-agent = [
     { name = "psutil", marker = "python_full_version < '3.12'" },
     { name = "uvicorn", marker = "python_full_version < '3.12'" },
 ]
+qmt-receiver = [
+    { name = "httpx2" },
+    { name = "pyarrow" },
+]
 
 [package.metadata]
 
@@ -114,6 +118,10 @@ qmt-agent = [
     { name = "pandas", marker = "python_full_version == '3.11.*'", specifier = ">=2.2,<3.0" },
     { name = "psutil", marker = "python_full_version == '3.11.*'", specifier = ">=6.1,<8.0" },
     { name = "uvicorn", marker = "python_full_version == '3.11.*'", specifier = ">=0.34,<1.0" },
+]
+qmt-receiver = [
+    { name = "httpx2", specifier = ">=2.0,<3.0" },
+    { name = "pyarrow", specifier = ">=18.0,<24.0" },
 ]
 
 [[package]]

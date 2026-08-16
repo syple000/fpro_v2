@@ -207,7 +207,7 @@ Content-Type: application/json
 POST /v1/quotes/subscribed/sequence
 Content-Type: application/json
 
-{"seq":1201,"limit":100}
+{"seq":1201,"limit":100,"wait_ms":30000}
 ```
 
 `limit` 默认 100，范围为 1 到 1000，表示本次扫描的连续序号窗口大小。响应示例：
@@ -243,9 +243,14 @@ Content-Type: application/json
 覆盖），或大于 `latest_seq`（数据尚未到达），接口返回 HTTP 416，并在响应中明确给出
 `requested_seq`、`oldest_seq` 和 `latest_seq`。缓存尚无数据时，最旧和最新序号均为 `null`。
 
+`wait_ms` 默认 0，范围为 0 到 30000。当请求的正好是下一条待到达序号时，服务最多等待
+该时长；数据一到即返回，超时仍返回 HTTP 416。该参数让实时接收方无需固定间隔轮询，
+同时避免空闲时忙循环。
+
 `GET /v1/subscriptions` 和 `GET /health` 的 `quote_sequence` 字段会返回当前
 `oldest_seq`、`latest_seq`、下一待分配序号 `next_seq`、`size` 和 `capacity`，上游可据此
-选择首次读取序号。这里的行情 `seq` 与 XtData 内部订阅号无关。
+选择首次读取序号。状态还包含本次 agent 进程唯一的 `instance_id`，用于识别进程重启后
+从 1 重新开始的新序列。这里的行情 `seq` 与 XtData 内部订阅号无关。
 
 ### 下载历史数据
 

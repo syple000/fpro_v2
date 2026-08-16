@@ -5,9 +5,12 @@
 ## 当前模块
 
 - `qmt_agent`：东北证券 miniQMT 行情接入服务，代码位于 `src/qmt_agent`。
+- `qmt_receiver`：供 platform 调用的行情接收、Parquet 落盘和队列投递组件，代码位于
+  `src/qmt_receiver`。
 - `parquet_store`：本地、单进程的通用不可变 Parquet 存储，代码位于 `src/parquet_store`。
 
 qmt-agent 的接口、Windows 启动方式和开发说明见 [docs/qmt_agent.md](docs/qmt_agent.md)。
+WSL 实时接收组件的调用和测试说明见 [docs/qmt_receiver.md](docs/qmt_receiver.md)。
 Parquet 存储的接口和最简示例见 [docs/parquet_store.md](docs/parquet_store.md)。
 
 ## 目录约定
