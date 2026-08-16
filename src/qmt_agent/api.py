@@ -1,0 +1,138 @@
+"""qmt-agent 的 HTTP 接口。"""
+
+from __future__ import annotations
+
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from typing import Any
+
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
+
+from qmt_agent import __version__
+from qmt_agent.config import Settings
+from qmt_agent.gateway import MarketDataGateway, QmtGatewayError, XtDataGateway
+from qmt_agent.models import (
+    HistoryDownloadRequest,
+    HistoryQueryRequest,
+    MarketRequest,
+    MarketUnsubscribeRequest,
+    StockRequest,
+    SubscribedQuoteRequest,
+)
+from qmt_agent.serialization import to_jsonable
+from qmt_agent.service import QmtMarketService, SubscriptionLimitError
+
+
+def create_app(
+    gateway: MarketDataGateway | None = None,
+    settings: Settings | None = None,
+) -> FastAPI:
+    configured_settings = settings or Settings.from_env()
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+        active_gateway = gateway or XtDataGateway()
+        app.state.market_service = QmtMarketService(
+            active_gateway,
+            max_stock_subscriptions=configured_settings.max_stock_subscriptions,
+        )
+        try:
+            yield
+        finally:
+            app.state.market_service.close()
+
+    app = FastAPI(
+        title="QMT Agent",
+        description="东北证券 miniQMT 行情 HTTP 服务",
+        version=__version__,
+        lifespan=lifespan,
+    )
+
+    @app.exception_handler(QmtGatewayError)
+    async def handle_qmt_error(_: Request, exc: QmtGatewayError) -> JSONResponse:
+        return JSONResponse(status_code=502, content={"detail": str(exc)})
+
+    @app.exception_handler(SubscriptionLimitError)
+    async def handle_limit_error(_: Request, exc: SubscriptionLimitError) -> JSONResponse:
+        return JSONResponse(status_code=409, content={"detail": str(exc)})
+
+    def service(request: Request) -> QmtMarketService:
+        return request.app.state.market_service
+
+    @app.get("/health", summary="健康检查")
+    def health(request: Request) -> dict[str, Any]:
+        return {"status": "ok", "version": __version__, **service(request).status()}
+
+    @app.get("/v1/subscriptions", summary="查看当前订阅")
+    def subscriptions(request: Request) -> dict[str, Any]:
+        return service(request).status()
+
+    @app.post("/v1/subscriptions/markets", summary="全市场订阅")
+    def subscribe_markets(
+        request: Request, body: MarketRequest | None = None
+    ) -> dict[str, Any]:
+        markets = body.markets if body is not None else ["SH", "SZ"]
+        return service(request).subscribe_markets(markets)
+
+    @app.delete("/v1/subscriptions/markets", summary="全市场取消订阅")
+    def unsubscribe_markets(
+        request: Request, body: MarketUnsubscribeRequest | None = None
+    ) -> dict[str, Any]:
+        markets = body.markets if body is not None else None
+        return service(request).unsubscribe_markets(markets)
+
+    @app.post("/v1/subscriptions/stocks", summary="按列表订阅")
+    def subscribe_stocks(body: StockRequest, request: Request) -> dict[str, Any]:
+        return service(request).subscribe_stocks(body.stocks)
+
+    @app.delete("/v1/subscriptions/stocks", summary="按列表取消订阅")
+    def unsubscribe_stocks(body: StockRequest, request: Request) -> dict[str, Any]:
+        return service(request).unsubscribe_stocks(body.stocks)
+
+    @app.post("/v1/snapshots/markets", summary="获取全市场快照截面")
+    def market_snapshot(
+        request: Request, body: MarketRequest | None = None
+    ) -> JSONResponse:
+        markets = body.markets if body is not None else ["SH", "SZ"]
+        result = service(request).get_market_snapshot(markets)
+        return JSONResponse(content=to_jsonable({"data": result, "count": len(result)}))
+
+    @app.post("/v1/snapshots/stocks", summary="按列表获取行情快照")
+    def stock_snapshot(body: StockRequest, request: Request) -> JSONResponse:
+        result = service(request).get_stock_snapshot(body.stocks)
+        return JSONResponse(content=to_jsonable({"data": result, "count": len(result)}))
+
+    @app.post("/v1/quotes/subscribed", summary="获取列表订阅的最新数据")
+    def subscribed_quotes(body: SubscribedQuoteRequest, request: Request) -> JSONResponse:
+        result = service(request).get_subscribed_quotes(body.stocks)
+        return JSONResponse(content=to_jsonable(result))
+
+    @app.post("/v1/history/download", summary="按列表下载增量或全量历史数据")
+    def download_history(body: HistoryDownloadRequest, request: Request) -> dict[str, Any]:
+        return service(request).download_history(
+            body.stocks,
+            body.period,
+            body.start_time,
+            body.end_time,
+            incrementally=body.mode == "incremental",
+        )
+
+    @app.post("/v1/history/query", summary="按列表获取历史数据")
+    def query_history(body: HistoryQueryRequest, request: Request) -> JSONResponse:
+        result = service(request).get_history(
+            body.stocks,
+            body.fields,
+            body.period,
+            body.start_time,
+            body.end_time,
+            body.count,
+            body.dividend_type,
+            body.fill_data,
+        )
+        return JSONResponse(content=to_jsonable({"data": result}))
+
+    return app
+
+
+app = create_app()

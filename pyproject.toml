@@ -1,0 +1,49 @@
+[project]
+name = "fpro-v2"
+version = "0.1.0"
+description = "模块化量化系统"
+readme = "README.md"
+requires-python = ">=3.11,<3.13"
+dependencies = []
+
+[project.optional-dependencies]
+qmt-agent = [
+    "fastapi>=0.115,<1.0",
+    "numpy>=1.26,<2.0",
+    "pandas>=2.2,<3.0",
+    "psutil>=6.1,<8.0",
+    "uvicorn>=0.34,<1.0",
+]
+
+[project.scripts]
+qmt-agent = "qmt_agent.__main__:main"
+qmt-agent-start = "qmt_agent.windows_launcher:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/qmt_agent"]
+
+[dependency-groups]
+dev = [
+    "httpx2>=2.0,<3.0",
+    "pytest>=8.3,<9.0",
+    "ruff>=0.9,<1.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = ["--strict-markers"]
+markers = [
+    "integration: 模块接口与组件集成测试",
+    "stress: 并发和压力下的正确性测试",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
