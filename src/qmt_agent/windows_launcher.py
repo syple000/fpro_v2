@@ -17,6 +17,10 @@ ES_SYSTEM_REQUIRED = 0x00000001
 ES_CONTINUOUS = 0x80000000
 WM_CLOSE = 0x0010
 
+# 东北证券 NET 专业版的约定安装位置。默认只使用这个明确路径，避免扫描时
+# 误选同一台机器上的其他 QMT 客户端；仍可通过 --qmt-bin 或环境变量覆盖。
+DEFAULT_QMT_BIN = Path(r"C:\Program Files\东北证券NET专业版\bin.x64")
+
 
 def _existing_path(path: str | Path | None) -> Path | None:
     if not path:
@@ -27,42 +31,14 @@ def _existing_path(path: str | Path | None) -> Path | None:
 
 def find_qmt_bin(
     explicit_path: str | Path | None = None,
-    search_roots: Sequence[Path] | None = None,
 ) -> Path:
-    """查找包含 xtquant 的 bin.x64 目录。"""
-    explicit = _existing_path(explicit_path or os.getenv("QMT_BIN_PATH"))
-    if explicit is not None:
-        _validate_qmt_bin(explicit)
-        return explicit
-    if explicit_path or os.getenv("QMT_BIN_PATH"):
-        raise RuntimeError("指定的 QMT bin.x64 目录不存在")
-
-    roots = list(search_roots) if search_roots is not None else _program_files_roots()
-    patterns = (
-        "东北证券NET专业版/bin.x64",
-        "*NET*/bin.x64",
-        "*QMT*/bin.x64",
-    )
-    for root in roots:
-        for pattern in patterns:
-            try:
-                candidates = root.glob(pattern)
-                for candidate in candidates:
-                    if _is_qmt_bin(candidate):
-                        return candidate.resolve()
-            except OSError:
-                continue
-
-    raise RuntimeError("没有找到 miniQMT 的 bin.x64；请使用 --qmt-bin 显式指定")
-
-
-def _program_files_roots() -> list[Path]:
-    roots: list[Path] = []
-    for name in ("ProgramW6432", "ProgramFiles", "PROGRAMFILES"):
-        path = _existing_path(os.getenv(name))
-        if path is not None and path not in roots:
-            roots.append(path)
-    return roots
+    """使用明确配置的、包含 xtquant 的 bin.x64 目录。"""
+    configured_path = explicit_path or os.getenv("QMT_BIN_PATH") or DEFAULT_QMT_BIN
+    qmt_bin = _existing_path(configured_path)
+    if qmt_bin is None:
+        raise RuntimeError(f"QMT bin.x64 目录不存在：{configured_path}")
+    _validate_qmt_bin(qmt_bin)
+    return qmt_bin
 
 
 def _is_qmt_bin(path: Path) -> bool:
@@ -382,8 +358,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--client-wait-seconds",
         type=int,
-        default=10,
-        help="启动客户端后等待的秒数，默认 10",
+        default=60,
+        help="启动客户端后等待的秒数，默认 60",
     )
     return parser
 

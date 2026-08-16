@@ -30,9 +30,12 @@
 
 防休眠状态只在 agent 运行期间有效，agent 退出时自动恢复。它不会阻止显示器按系统设置熄屏，也不会阻止用户主动点击睡眠、关机或重启。
 
-脚本默认会自动查找类似
-`C:\Program Files\东北证券NET专业版\bin.x64` 的目录。如果自动查找失败，可在
-命令行中显式指定：
+脚本默认固定使用以下目录，不会扫描或猜测其他 QMT 客户端的位置：
+
+- `QMT bin.x64`：`C:\Program Files\东北证券NET专业版\bin.x64`
+- Python 包：`C:\Program Files\东北证券NET专业版\bin.x64\Lib\site-packages`
+
+如果安装位置发生变化，可在命令行中显式覆盖：
 
 ```bat
 scripts\qmt_agent\start_qmt_agent.cmd ^

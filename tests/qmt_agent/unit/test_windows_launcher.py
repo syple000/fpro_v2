@@ -11,10 +11,12 @@ def make_qmt_bin(root: Path) -> Path:
     return qmt_bin
 
 
-def test_find_qmt_bin_from_program_files(tmp_path: Path) -> None:
+def test_find_qmt_bin_from_fixed_default(tmp_path: Path, monkeypatch) -> None:
     expected = make_qmt_bin(tmp_path)
+    monkeypatch.delenv("QMT_BIN_PATH", raising=False)
+    monkeypatch.setattr(launcher, "DEFAULT_QMT_BIN", expected)
 
-    result = launcher.find_qmt_bin(search_roots=[tmp_path])
+    result = launcher.find_qmt_bin()
 
     assert result == expected.resolve()
 
