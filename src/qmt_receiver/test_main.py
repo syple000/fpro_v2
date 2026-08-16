@@ -58,31 +58,40 @@ def _summary(result: dict[str, Any]) -> dict[str, Any]:
     return summary
 
 
-def check_all_interfaces(client: QmtAgentClient) -> None:
+def check_all_interfaces(client: QmtAgentClient) -> list[str]:
     """用 000001.SZ 调用全部接口，不中断 SH/SZ 全市场订阅。"""
     stock = "000001.SZ"
-    _call("health", client.health)
-    status = _call("subscriptions", client.subscriptions) or {}
-    _call("subscribe markets", lambda: client.subscribe_markets(("SH", "SZ")))
-    _call("unsubscribe market(no-op)", lambda: client.unsubscribe_markets(("TEST",)))
-    _call("subscribe stock", lambda: client.subscribe_stocks((stock,), "tick"))
-    _call("market snapshot", client.market_snapshot)
-    _call("stock snapshot", lambda: client.stock_snapshot((stock,)))
-    _call("market quotes", lambda: client.market_quotes((stock,)))
-    _call("stock quotes", lambda: client.stock_quotes((stock,)))
+    failures: list[str] = []
 
-    latest_status = _call("subscriptions before sequence", client.subscriptions) or status
+    def check(name: str, function: Callable[[], dict[str, Any]]) -> dict[str, Any]:
+        result = _call(name, function)
+        if result is None:
+            failures.append(name)
+            return {}
+        return result
+
+    check("health", client.health)
+    status = check("subscriptions", client.subscriptions)
+    check("subscribe markets", lambda: client.subscribe_markets(("SH", "SZ")))
+    check("unsubscribe market(no-op)", lambda: client.unsubscribe_markets(("TEST",)))
+    check("subscribe stock", lambda: client.subscribe_stocks((stock,), "tick"))
+    check("market snapshot", client.market_snapshot)
+    check("stock snapshot", lambda: client.stock_snapshot((stock,)))
+    check("market quotes", lambda: client.market_quotes((stock,)))
+    check("stock quotes", lambda: client.stock_quotes((stock,)))
+
+    latest_status = check("subscriptions before sequence", client.subscriptions) or status
     sequence = latest_status.get("quote_sequence", {})
     latest_seq = sequence.get("latest_seq") if isinstance(sequence, dict) else None
-    _call(
+    check(
         "quote sequence",
         lambda: client.quote_sequence(latest_seq or 1, limit=1, wait_ms=0),
     )
-    _call(
+    check(
         "history download",
         lambda: client.download_history((stock,), period="1d", mode="incremental"),
     )
-    _call(
+    check(
         "history query",
         lambda: client.query_history(
             (stock,),
@@ -91,7 +100,8 @@ def check_all_interfaces(client: QmtAgentClient) -> None:
             count=1,
         ),
     )
-    _call("unsubscribe stock", lambda: client.unsubscribe_stocks((stock,), "tick"))
+    check("unsubscribe stock", lambda: client.unsubscribe_stocks((stock,), "tick"))
+    return failures
 
 
 def drain_queue(queue: Queue[dict[str, Any]]) -> int:
@@ -129,7 +139,9 @@ def run(base_url: str, data_dir: Path, once: bool, timeout_ms: int) -> None:
 
             now = monotonic()
             if now >= next_check:
-                check_all_interfaces(client)
+                failures = check_all_interfaces(client)
+                if failures:
+                    raise RuntimeError(f"接口巡检失败：{', '.join(failures)}")
                 if once:
                     return
                 next_check = now + 60
