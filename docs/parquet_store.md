@@ -64,4 +64,15 @@ with ParquetStore(Path("data")) as store:
 替换一个分区并丢弃该分区此前尚未刷新的缓存，空 Table 表示清空。`compact_partition` 只
 重排当前 Manifest 内的物理文件，零或单文件分区不会产生新版本。
 
-第一版不提供行级更新、去重、WAL、多进程协调、后台任务、Schema 演进或对象存储支持。
+Schema 可以在末尾追加可空字段：
+
+```python
+new_schema = pa.schema([*schema, pa.field("source", pa.string())])
+store.update_schema("events", new_schema)
+```
+
+旧文件不重写，读取时新增字段自动补 `null`；之后写入必须使用新 Schema。Schema 配置只保存
+在当前实例中，程序重启后需要用新 Schema 重新 `register`。
+
+第一版不提供行级更新、去重、WAL、多进程协调、后台任务、字段删除/改名/改类型或对象存储
+支持。

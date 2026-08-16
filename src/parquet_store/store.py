@@ -6,7 +6,7 @@ import json
 import os
 import warnings
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from threading import RLock
 from typing import Any, TypeAlias, TypeGuard
@@ -116,6 +116,20 @@ class ParquetStore:
                 raise ValueError(f"表 {config.name!r} 已使用不同配置注册")
             self._configs[config.name] = config
         self._table_path(config.name).mkdir(parents=True, exist_ok=True)
+
+    def update_schema(self, table: str, schema: pa.Schema) -> None:
+        """在现有 Schema 末尾追加可空字段。"""
+        current = self._config(table)
+        updated = replace(current, schema=schema)
+        if current.schema.equals(updated.schema, check_metadata=True):
+            return
+        _validate_schema_extension(current.schema, updated.schema)
+
+        # 旧缓冲先按旧 Schema 落盘；读取时 PyArrow 会为新增字段补 null。
+        self.flush(table)
+        with self._state_lock:
+            self._ensure_open()
+            self._configs[table] = updated
 
     def append(self, table: str, data: pa.Table) -> None:
         """按分区缓存数据，达到任一阈值时提交一个新文件。"""
@@ -432,6 +446,18 @@ def _column_tuple(value: str | Sequence[str], name: str) -> tuple[str, ...]:
     if any(not isinstance(item, str) or not item for item in result):
         raise ValueError(f"{name} 只能包含非空字段名")
     return result
+
+
+def _validate_schema_extension(current: pa.Schema, updated: pa.Schema) -> None:
+    if len(updated) <= len(current):
+        raise SchemaMismatchError("更新 Schema 只能在末尾新增字段")
+    if any(
+        not current.field(index).equals(updated.field(index), check_metadata=True)
+        for index in range(len(current))
+    ):
+        raise SchemaMismatchError("更新 Schema 不能修改、删除或重排已有字段")
+    if any(not updated.field(index).nullable for index in range(len(current), len(updated))):
+        raise SchemaMismatchError("新增字段必须允许 null")
 
 
 def _coerce_scalar(value: Any, data_type: pa.DataType) -> Any:

@@ -25,6 +25,10 @@ SCHEMA = pa.schema(
     ],
     metadata={b"schema-version": b"1"},
 )
+EXTENDED_SCHEMA = pa.schema(
+    [*SCHEMA, pa.field("source", pa.string())],
+    metadata={b"schema-version": b"2"},
+)
 
 
 def make_table(*rows: tuple[str, int, float]) -> pa.Table:
@@ -36,6 +40,16 @@ def make_table(*rows: tuple[str, int, float]) -> pa.Table:
 
 def empty_table() -> pa.Table:
     return pa.Table.from_batches([], schema=SCHEMA)
+
+
+def make_extended_table(*rows: tuple[str, int, float, str | None]) -> pa.Table:
+    return pa.Table.from_pylist(
+        [
+            {"day": day, "id": identifier, "value": value, "source": source}
+            for day, identifier, value, source in rows
+        ],
+        schema=EXTENDED_SCHEMA,
+    )
 
 
 def make_store(
@@ -236,6 +250,43 @@ def test_schema_must_match_fields_order_nullability_and_metadata(tmp_path: Path)
         store.append("events", wrong_data)
     with pytest.raises(SchemaMismatchError, match="Schema 不匹配"):
         store.replace_partition("events", "a", wrong_data)
+
+
+def test_update_schema_adds_nullable_fields_and_old_rows_read_as_null(tmp_path: Path) -> None:
+    store = make_store(tmp_path)
+    store.append("events", make_table(("a", 1, 1.0)))
+
+    store.update_schema("events", EXTENDED_SCHEMA)
+
+    assert store.read("events").to_pylist() == [
+        {"day": "a", "id": 1, "value": 1.0, "source": None}
+    ]
+    store.append("events", make_extended_table(("a", 2, 2.0, "feed")))
+    store.flush()
+    assert store.read("events").to_pylist() == [
+        {"day": "a", "id": 1, "value": 1.0, "source": None},
+        {"day": "a", "id": 2, "value": 2.0, "source": "feed"},
+    ]
+
+
+def test_update_schema_rejects_incompatible_changes(tmp_path: Path) -> None:
+    store = make_store(tmp_path)
+    required_field_schema = pa.schema(
+        [*SCHEMA, pa.field("source", pa.string(), nullable=False)]
+    )
+    changed_field_schema = pa.schema(
+        [
+            SCHEMA.field("day"),
+            pa.field("id", pa.int32(), nullable=False),
+            SCHEMA.field("value"),
+            pa.field("source", pa.string()),
+        ]
+    )
+
+    with pytest.raises(SchemaMismatchError, match="必须允许 null"):
+        store.update_schema("events", required_field_schema)
+    with pytest.raises(SchemaMismatchError, match="不能修改"):
+        store.update_schema("events", changed_field_schema)
 
 
 def test_replace_rejects_rows_from_another_partition(tmp_path: Path) -> None:
