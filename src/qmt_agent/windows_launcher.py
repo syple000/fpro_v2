@@ -23,6 +23,7 @@ AGENT_COMMAND_MARKERS = (
 
 ES_SYSTEM_REQUIRED = 0x00000001
 ES_CONTINUOUS = 0x80000000
+MINIQMT_EXECUTABLE = "xtminiqmt.exe"
 
 
 def _set_thread_execution_state(flags: int) -> None:
@@ -95,9 +96,8 @@ def _protected_process_ids() -> set[int]:
 def find_running_instances(
     qmt_bin: Path,
 ) -> tuple[list[psutil.Process], list[psutil.Process]]:
-    """查找旧 agent 和明确安装目录中的 miniQMT 进程。"""
+    """查找旧 agent，以及指定 bin.x64 目录中的 XtMiniQmt.exe。"""
     protected = _protected_process_ids()
-    install_root = qmt_bin.parent
     agents: list[psutil.Process] = []
     clients: list[psutil.Process] = []
 
@@ -106,7 +106,11 @@ def find_running_instances(
             if process.pid in protected:
                 continue
             executable = process.info.get("exe")
-            if executable and _path_is_inside(executable, install_root):
+            if (
+                executable
+                and Path(executable).name.casefold() == MINIQMT_EXECUTABLE
+                and _path_is_inside(executable, qmt_bin)
+            ):
                 clients.append(process)
                 continue
             if _looks_like_agent(process.info.get("cmdline") or []):

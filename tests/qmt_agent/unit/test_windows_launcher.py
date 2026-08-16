@@ -83,11 +83,26 @@ def test_find_running_instances_excludes_current_process_tree(
         psutil.Process,
         FakeProcess(4, command_line=["python.exe", "strategy.py"]),
     )
+    other_qmt_component = cast(
+        psutil.Process,
+        FakeProcess(5, executable=str(qmt_bin / "XtItClient.exe")),
+    )
+    miniqmt_from_other_installation = cast(
+        psutil.Process,
+        FakeProcess(6, executable=str(tmp_path / "other" / "XtMiniQmt.exe")),
+    )
     monkeypatch.setattr(launcher, "_protected_process_ids", lambda: {3})
     monkeypatch.setattr(
         launcher.psutil,
         "process_iter",
-        lambda _: [client, agent, protected, unrelated],
+        lambda _: [
+            client,
+            agent,
+            protected,
+            unrelated,
+            other_qmt_component,
+            miniqmt_from_other_installation,
+        ],
     )
 
     agents, clients = launcher.find_running_instances(qmt_bin)

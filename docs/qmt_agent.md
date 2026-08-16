@@ -35,8 +35,9 @@ DLL 目录；不要直接用普通 Python 环境启动。
 - Python 包：`C:\Program Files\东北证券NET专业版\bin.x64\Lib\site-packages`
 - 快捷方式：`%USERPROFILE%\Desktop\东北证券NET专业版.lnk`
 
-启动器不会搜索目录或注册表。进程检测只匹配 qmt-agent 启动命令和明确传入的 QMT
-安装目录，不会按 `python.exe` 等通用进程名关闭程序。如果安装位置发生变化，直接覆盖参数：
+启动器不会搜索目录或注册表。进程检测只匹配 qmt-agent 启动命令，以及明确传入的
+`bin.x64` 目录中的 `XtMiniQmt.exe`；不会关闭同目录的其他 QMT 组件，也不会按
+`python.exe` 等通用进程名关闭程序。如果安装位置发生变化，直接覆盖参数：
 
 ```bat
 scripts\qmt_agent\start_qmt_agent.cmd ^

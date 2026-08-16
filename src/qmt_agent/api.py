@@ -22,10 +22,10 @@ from qmt_agent.models import (
     StockSubscriptionRequest,
     SubscribedQuoteRequest,
 )
+from qmt_agent.quote_sequence import QuoteSequenceOutOfRangeError
 from qmt_agent.serialization import to_jsonable
 from qmt_agent.service import (
     QmtMarketService,
-    QuoteSequenceOutOfRangeError,
     SubscriptionLimitError,
     SubscriptionPeriodConflictError,
 )

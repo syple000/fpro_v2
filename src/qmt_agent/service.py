@@ -3,14 +3,15 @@
 from __future__ import annotations
 
 import logging
-from collections import deque
 from collections.abc import Iterable
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from functools import partial
 from threading import Lock
 from typing import Any
 
 from qmt_agent.gateway import MarketDataGateway, QmtGatewayError
+from qmt_agent.quote_sequence import QuoteSequenceBuffer
+from qmt_agent.subscription_callback import QuoteCallbackGate
 
 logger = logging.getLogger(__name__)
 
@@ -23,52 +24,17 @@ class SubscriptionPeriodConflictError(ValueError):
     """合约已使用其他周期订阅。"""
 
 
-class QuoteSequenceOutOfRangeError(ValueError):
-    """请求的行情序号不在当前循环缓存范围内。"""
-
-    def __init__(
-        self,
-        requested_seq: int,
-        oldest_seq: int | None,
-        latest_seq: int | None,
-    ) -> None:
-        self.requested_seq = requested_seq
-        self.oldest_seq = oldest_seq
-        self.latest_seq = latest_seq
-
-        if oldest_seq is None or latest_seq is None:
-            message = (
-                f"行情顺序缓存为空，请求序号 {requested_seq}；"
-                "当前没有最旧或最新序号"
-            )
-        elif requested_seq < oldest_seq:
-            message = (
-                f"请求序号 {requested_seq} 过旧；"
-                f"当前最旧序号 {oldest_seq}，最新序号 {latest_seq}"
-            )
-        else:
-            message = (
-                f"请求序号 {requested_seq} 过新；"
-                f"当前最旧序号 {oldest_seq}，最新序号 {latest_seq}"
-            )
-        super().__init__(message)
+@dataclass(slots=True)
+class _MarketSubscription:
+    subscription_id: int
+    callback: QuoteCallbackGate
 
 
 @dataclass(slots=True)
 class _StockSubscription:
     subscription_id: int
     period: str
-
-
-@dataclass(frozen=True, slots=True)
-class _SequencedQuote:
-    seq: int
-    code: str
-    period: str
-    source: str
-    subscription: str
-    received_at: str
-    quote: Any
+    callback: QuoteCallbackGate
 
 
 class QmtMarketService:
@@ -82,13 +48,9 @@ class QmtMarketService:
     ) -> None:
         if not 1 <= max_stock_subscriptions <= 50:
             raise ValueError("列表订阅上限必须在 1 到 50 之间")
-        if quote_buffer_capacity < 1:
-            raise ValueError("行情顺序缓存容量必须大于等于 1")
-
         self._gateway = gateway
         self._max_stock_subscriptions = max_stock_subscriptions
-        self._quote_buffer_capacity = quote_buffer_capacity
-        self._market_subscriptions: dict[str, int] = {}
+        self._market_subscriptions: dict[str, _MarketSubscription] = {}
         self._stock_subscriptions: dict[str, _StockSubscription] = {}
         self._market_operation_lock = Lock()
         self._stock_operation_lock = Lock()
@@ -98,11 +60,7 @@ class QmtMarketService:
         self._market_quote_updated_at: dict[str, str] = {}
         self._stock_quotes: dict[str, Any] = {}
         self._stock_quote_updated_at: dict[str, str] = {}
-        self._quote_sequence_lock = Lock()
-        self._quote_sequence: deque[_SequencedQuote] = deque(
-            maxlen=quote_buffer_capacity
-        )
-        self._next_quote_seq = 1
+        self._quote_sequence = QuoteSequenceBuffer(quote_buffer_capacity)
 
     def subscribe_markets(self, markets: Iterable[str]) -> dict[str, Any]:
         requested = set(markets)
@@ -110,13 +68,21 @@ class QmtMarketService:
             added = requested - self._market_subscriptions.keys()
             for market in sorted(added):
                 self._clear_market_cache(market)
-                subscription_id = self._gateway.subscribe_market_quote(
-                    market,
-                    lambda quotes, market=market: self._on_market_quotes(
-                        quotes, market
-                    ),
+                callback = QuoteCallbackGate(
+                    partial(self._on_market_quotes, market=market)
                 )
-                self._market_subscriptions[market] = subscription_id
+                try:
+                    subscription_id = self._gateway.subscribe_market_quote(
+                        market, callback
+                    )
+                except Exception:
+                    callback.close()
+                    raise
+
+                self._market_subscriptions[market] = _MarketSubscription(
+                    subscription_id, callback
+                )
+                callback.activate()
             return self._market_subscription_result(added=added)
 
     def unsubscribe_markets(self, markets: Iterable[str] | None = None) -> dict[str, Any]:
@@ -126,7 +92,15 @@ class QmtMarketService:
             removed = current & requested
             missing = requested - current
             for market in sorted(removed):
-                self._gateway.unsubscribe(self._market_subscriptions[market])
+                subscription = self._market_subscriptions[market]
+                subscription.callback.suspend()
+                try:
+                    self._gateway.unsubscribe(subscription.subscription_id)
+                except Exception:
+                    subscription.callback.activate()
+                    raise
+
+                subscription.callback.close()
                 del self._market_subscriptions[market]
             return self._market_subscription_result(removed=removed, missing=missing)
 
@@ -161,16 +135,21 @@ class QmtMarketService:
                 with self._stock_quote_lock:
                     self._stock_quotes.pop(stock, None)
                     self._stock_quote_updated_at.pop(stock, None)
-                subscription_id = self._gateway.subscribe_stock_quote(
-                    stock,
-                    period,
-                    lambda quotes, stock=stock, period=period: self._on_stock_quotes(
-                        quotes, stock, period
-                    ),
+                callback = QuoteCallbackGate(
+                    partial(self._on_stock_quotes, stock=stock, period=period)
                 )
+                try:
+                    subscription_id = self._gateway.subscribe_stock_quote(
+                        stock, period, callback
+                    )
+                except Exception:
+                    callback.close()
+                    raise
+
                 self._stock_subscriptions[stock] = _StockSubscription(
-                    subscription_id, period
+                    subscription_id, period, callback
                 )
+                callback.activate()
             return self._stock_subscription_result(added=added)
 
     def unsubscribe_stocks(self, stocks: Iterable[str], period: str) -> dict[str, Any]:
@@ -186,7 +165,14 @@ class QmtMarketService:
             removed = (current & requested) - period_mismatches.keys()
             for stock in sorted(removed):
                 subscription = self._stock_subscriptions[stock]
-                self._gateway.unsubscribe(subscription.subscription_id)
+                subscription.callback.suspend()
+                try:
+                    self._gateway.unsubscribe(subscription.subscription_id)
+                except Exception:
+                    subscription.callback.activate()
+                    raise
+
+                subscription.callback.close()
                 del self._stock_subscriptions[stock]
             return self._stock_subscription_result(
                 removed=removed,
@@ -326,44 +312,10 @@ class QmtMarketService:
         stocks: Iterable[str] | None = None,
     ) -> dict[str, Any]:
         """从指定序号开始读取一个连续窗口，并可在窗口内按合约筛选。"""
-        requested_stocks = None if stocks is None else set(stocks)
-        with self._quote_sequence_lock:
-            oldest_seq, latest_seq = self._quote_sequence_bounds_unlocked()
-            if (
-                oldest_seq is None
-                or latest_seq is None
-                or seq < oldest_seq
-                or seq > latest_seq
-            ):
-                raise QuoteSequenceOutOfRangeError(seq, oldest_seq, latest_seq)
-
-            end_seq = min(seq + limit - 1, latest_seq)
-            records = [
-                item
-                for item in self._quote_sequence
-                if seq <= item.seq <= end_seq
-                and (requested_stocks is None or item.code in requested_stocks)
-            ]
-
-        return {
-            "data": [self._quote_sequence_item(item) for item in records],
-            "count": len(records),
-            "requested_seq": seq,
-            "next_seq": end_seq + 1,
-            "oldest_seq": oldest_seq,
-            "latest_seq": latest_seq,
-        }
+        return self._quote_sequence.read(seq, limit, stocks)
 
     def quote_sequence_status(self) -> dict[str, int | None]:
-        with self._quote_sequence_lock:
-            oldest_seq, latest_seq = self._quote_sequence_bounds_unlocked()
-            return {
-                "oldest_seq": oldest_seq,
-                "latest_seq": latest_seq,
-                "next_seq": self._next_quote_seq,
-                "size": len(self._quote_sequence),
-                "capacity": self._quote_buffer_capacity,
-            }
+        return self._quote_sequence.status()
 
     def status(self) -> dict[str, Any]:
         with self._market_operation_lock, self._stock_operation_lock:
@@ -423,19 +375,22 @@ class QmtMarketService:
     def close(self) -> None:
         """进程退出时尽力释放订阅；失败也不阻碍退出。"""
         with self._market_operation_lock, self._stock_operation_lock:
-            for market, subscription_id in list(self._market_subscriptions.items()):
+            for market, subscription in list(self._market_subscriptions.items()):
+                subscription.callback.suspend()
                 try:
-                    self._gateway.unsubscribe(subscription_id)
+                    self._gateway.unsubscribe(subscription.subscription_id)
                 except QmtGatewayError:
                     logger.exception(
                         "退出时取消 %s 全推订阅失败，订阅号=%s",
                         market,
-                        subscription_id,
+                        subscription.subscription_id,
                     )
                 finally:
+                    subscription.callback.close()
                     del self._market_subscriptions[market]
 
             for stock, subscription in list(self._stock_subscriptions.items()):
+                subscription.callback.suspend()
                 try:
                     self._gateway.unsubscribe(subscription.subscription_id)
                 except QmtGatewayError:
@@ -445,6 +400,7 @@ class QmtMarketService:
                         subscription.subscription_id,
                     )
                 finally:
+                    subscription.callback.close()
                     del self._stock_subscriptions[stock]
 
     def _clear_market_cache(self, market: str) -> None:
@@ -458,13 +414,18 @@ class QmtMarketService:
                 self._market_quotes.pop(code, None)
                 self._market_quote_updated_at.pop(code, None)
 
-    def _on_market_quotes(self, quotes: dict[str, Any], market: str) -> None:
+    def _on_market_quotes(
+        self,
+        quotes: dict[str, Any],
+        received_at: str,
+        *,
+        market: str,
+    ) -> None:
         """全市场回调的每个代码对应一条 tick，逐项写入缓存。"""
         if not isinstance(quotes, dict):
             logger.warning("忽略无法识别的全市场行情回调：%r", type(quotes))
             return
 
-        now = datetime.now(UTC).isoformat()
         normalized: dict[str, Any] = {}
         sequence_items: list[tuple[str, Any]] = []
         for code, quote in quotes.items():
@@ -475,27 +436,33 @@ class QmtMarketService:
         if not sequence_items:
             return
 
-        self._append_quote_sequence(
+        self._quote_sequence.append(
             sequence_items,
             source="market",
             subscription=market,
             period="tick",
-            received_at=now,
+            received_at=received_at,
         )
 
         with self._market_quote_lock:
             self._market_quotes.update(normalized)
-            self._market_quote_updated_at.update(dict.fromkeys(normalized, now))
+            self._market_quote_updated_at.update(
+                dict.fromkeys(normalized, received_at)
+            )
 
     def _on_stock_quotes(
-        self, quotes: dict[str, Any], stock: str, period: str
+        self,
+        quotes: dict[str, Any],
+        received_at: str,
+        *,
+        stock: str,
+        period: str,
     ) -> None:
         """单股回调可能携带多条行情，逐条入队并单独维护最新值。"""
         if not isinstance(quotes, dict):
             logger.warning("忽略无法识别的单股行情回调：%r", type(quotes))
             return
 
-        now = datetime.now(UTC).isoformat()
         latest: dict[str, Any] = {}
         sequence_items: list[tuple[str, Any]] = []
         for code, quote_rows in quotes.items():
@@ -515,58 +482,19 @@ class QmtMarketService:
         if not sequence_items:
             return
 
-        self._append_quote_sequence(
+        self._quote_sequence.append(
             sequence_items,
             source="stock",
             subscription=stock,
             period=period,
-            received_at=now,
+            received_at=received_at,
         )
 
         with self._stock_quote_lock:
             self._stock_quotes.update(latest)
-            self._stock_quote_updated_at.update(dict.fromkeys(latest, now))
-
-    def _append_quote_sequence(
-        self,
-        items: list[tuple[str, Any]],
-        *,
-        source: str,
-        subscription: str,
-        period: str,
-        received_at: str,
-    ) -> None:
-        with self._quote_sequence_lock:
-            for code, quote in items:
-                self._quote_sequence.append(
-                    _SequencedQuote(
-                        seq=self._next_quote_seq,
-                        code=code,
-                        period=period,
-                        source=source,
-                        subscription=subscription,
-                        received_at=received_at,
-                        quote=quote,
-                    )
-                )
-                self._next_quote_seq += 1
-
-    def _quote_sequence_bounds_unlocked(self) -> tuple[int | None, int | None]:
-        if not self._quote_sequence:
-            return None, None
-        return self._quote_sequence[0].seq, self._quote_sequence[-1].seq
-
-    @staticmethod
-    def _quote_sequence_item(item: _SequencedQuote) -> dict[str, Any]:
-        return {
-            "seq": item.seq,
-            "code": item.code,
-            "period": item.period,
-            "source": item.source,
-            "subscription": item.subscription,
-            "received_at": item.received_at,
-            "quote": item.quote,
-        }
+            self._stock_quote_updated_at.update(
+                dict.fromkeys(latest, received_at)
+            )
 
     def _market_subscription_result(
         self,

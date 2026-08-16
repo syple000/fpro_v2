@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import pytest
 
-from qmt_agent.gateway import QmtGatewayError
+from qmt_agent.gateway import QmtGatewayError, QuoteCallback
+from qmt_agent.quote_sequence import QuoteSequenceOutOfRangeError
 from qmt_agent.service import (
     QmtMarketService,
-    QuoteSequenceOutOfRangeError,
     SubscriptionLimitError,
     SubscriptionPeriodConflictError,
 )
@@ -308,3 +308,67 @@ def test_failed_addition_never_cancels_existing_subscriptions() -> None:
     assert gateway.unsubscribed == []
     assert service.status()["markets"] == ["SH"]
     assert service.status()["stocks"] == ["000001.SZ"]
+
+
+def test_callback_during_subscribe_is_delivered_after_subscription_succeeds() -> None:
+    class ImmediateCallbackGateway(FakeGateway):
+        def subscribe_stock_quote(
+            self,
+            stock: str,
+            period: str,
+            callback: QuoteCallback,
+        ) -> int:
+            subscription_id = super().subscribe_stock_quote(stock, period, callback)
+            callback({stock: [{"close": 10.5}]})
+            return subscription_id
+
+    service = QmtMarketService(ImmediateCallbackGateway())
+
+    service.subscribe_stocks(["000001.SZ"], "1m")
+
+    assert service.get_stock_quotes()["data"] == {
+        "000001.SZ": {"close": 10.5}
+    }
+    assert service.quote_sequence_status()["latest_seq"] == 1
+
+
+def test_callback_from_failed_subscription_never_enters_quote_caches() -> None:
+    class CallbackThenFailGateway(FakeGateway):
+        def subscribe_market_quote(
+            self,
+            market: str,
+            callback: QuoteCallback,
+        ) -> int:
+            callback({"600000.SH": {"lastPrice": 10.5}})
+            raise QmtGatewayError("模拟返回订阅号前失败")
+
+    service = QmtMarketService(CallbackThenFailGateway())
+
+    with pytest.raises(QmtGatewayError):
+        service.subscribe_markets(["SH"])
+
+    assert service.get_market_quotes()["data"] == {}
+    assert service.quote_sequence_status()["size"] == 0
+
+
+def test_delayed_callback_from_old_subscription_is_ignored() -> None:
+    gateway = FakeGateway()
+    service = QmtMarketService(gateway)
+    service.subscribe_stocks(["000001.SZ"], "1m")
+    old_subscription_id = gateway.active_subscription_ids()["000001.SZ"]
+    old_callback = gateway.active[old_subscription_id][2]
+
+    service.unsubscribe_stocks(["000001.SZ"], "1m")
+    service.subscribe_stocks(["000001.SZ"], "5m")
+    old_callback({"000001.SZ": [{"close": 9.0}]})
+    gateway.push(
+        gateway.active_subscription_ids()["000001.SZ"],
+        {"000001.SZ": [{"close": 11.0}]},
+    )
+
+    assert service.get_stock_quotes()["data"] == {
+        "000001.SZ": {"close": 11.0}
+    }
+    sequence = service.get_subscribed_quote_sequence(1, 10)
+    assert [item["quote"]["close"] for item in sequence["data"]] == [11.0]
+    assert sequence["data"][0]["period"] == "5m"
