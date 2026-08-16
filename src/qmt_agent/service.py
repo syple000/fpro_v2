@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from functools import partial
 from threading import Lock
 from typing import Any
+from uuid import uuid4
 
 from qmt_agent.gateway import MarketDataGateway, QmtGatewayError
 from qmt_agent.quote_sequence import QuoteSequenceBuffer
@@ -49,6 +50,7 @@ class QmtMarketService:
         if not 1 <= max_stock_subscriptions <= 50:
             raise ValueError("列表订阅上限必须在 1 到 50 之间")
         self._gateway = gateway
+        self._instance_id = uuid4().hex
         self._max_stock_subscriptions = max_stock_subscriptions
         self._market_subscriptions: dict[str, _MarketSubscription] = {}
         self._stock_subscriptions: dict[str, _StockSubscription] = {}
@@ -310,9 +312,10 @@ class QmtMarketService:
         seq: int,
         limit: int,
         stocks: Iterable[str] | None = None,
+        wait_ms: int = 0,
     ) -> dict[str, Any]:
         """从指定序号开始读取一个连续窗口，并可在窗口内按合约筛选。"""
-        return self._quote_sequence.read(seq, limit, stocks)
+        return self._quote_sequence.read(seq, limit, stocks, wait_ms)
 
     def quote_sequence_status(self) -> dict[str, int | None]:
         return self._quote_sequence.status()
@@ -322,6 +325,7 @@ class QmtMarketService:
             markets = sorted(self._market_subscriptions)
             stocks = sorted(self._stock_subscriptions)
             return {
+                "instance_id": self._instance_id,
                 "markets": markets,
                 "stocks": stocks,
                 "stock_periods": {

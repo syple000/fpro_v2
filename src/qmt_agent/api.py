@@ -154,7 +154,7 @@ def create_app(
     @app.post("/v1/quotes/subscribed/sequence", summary="按序获取订阅行情")
     def sequenced_quotes(request: Request, body: SequencedQuoteRequest) -> JSONResponse:
         result = service(request).get_subscribed_quote_sequence(
-            body.seq, body.limit, body.stocks
+            body.seq, body.limit, body.stocks, body.wait_ms
         )
         return JSONResponse(content=to_jsonable(result))
 

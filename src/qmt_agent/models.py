@@ -139,6 +139,7 @@ class SubscribedQuoteRequest(StrictRequestModel):
 class SequencedQuoteRequest(SubscribedQuoteRequest):
     seq: int = Field(ge=1)
     limit: int = Field(default=100, ge=1, le=1_000)
+    wait_ms: int = Field(default=0, ge=0, le=30_000)
 
 
 class HistoryDownloadRequest(StockRequest):

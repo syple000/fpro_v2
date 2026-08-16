@@ -4,7 +4,8 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from dataclasses import dataclass
-from threading import Lock
+from threading import Condition, Lock
+from time import monotonic
 from typing import Any
 
 
@@ -73,6 +74,7 @@ class QuoteSequenceBuffer:
         self._next_seq = 1
         self._size = 0
         self._lock = Lock()
+        self._changed = Condition(self._lock)
 
     def append(
         self,
@@ -83,7 +85,7 @@ class QuoteSequenceBuffer:
         period: str,
         received_at: str,
     ) -> None:
-        with self._lock:
+        with self._changed:
             for code, quote in items:
                 record = SequencedQuote(
                     seq=self._next_seq,
@@ -97,19 +99,30 @@ class QuoteSequenceBuffer:
                 self._records[self._slot(record.seq)] = record
                 self._next_seq += 1
                 self._size = min(self._size + 1, self._capacity)
+            self._changed.notify_all()
 
     def read(
         self,
         seq: int,
         limit: int,
         stocks: Iterable[str] | None = None,
+        wait_ms: int = 0,
     ) -> dict[str, Any]:
-        """读取连续序号窗口；股票筛选不改变窗口推进位置。"""
+        """读取连续序号窗口；可等待下一个序号到达。"""
         if limit < 1:
             raise ValueError("行情顺序读取条数必须大于等于 1")
+        if wait_ms < 0:
+            raise ValueError("行情顺序等待时间不能小于 0")
 
         requested_stocks = None if stocks is None else set(stocks)
-        with self._lock:
+        deadline = monotonic() + wait_ms / 1000
+        with self._changed:
+            while wait_ms and seq == self._next_seq:
+                remaining = deadline - monotonic()
+                if remaining <= 0:
+                    break
+                self._changed.wait(remaining)
+
             oldest_seq, latest_seq = self._bounds_unlocked()
             if (
                 oldest_seq is None
