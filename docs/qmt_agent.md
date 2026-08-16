@@ -25,6 +25,10 @@
 等待 60 秒，再启动 qmt-agent。启动器根据传入的 `qmt-bin` 配置客户端 Python 包和
 DLL 目录；不要直接用普通 Python 环境启动。
 
+启动器从 miniQMT 启动前开始阻止 Windows 因空闲自动休眠，并在 qmt-agent 退出时恢复
+系统默认电源行为。该设置不会强制点亮显示器，也不会阻止用户通过合盖、电源按钮或系统
+菜单主动休眠。
+
 默认路径为：
 
 - `QMT bin.x64`：`C:\Program Files\东北证券NET专业版\bin.x64`

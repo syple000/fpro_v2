@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
 import os
 import sys
 import time
-from collections.abc import Sequence
-from contextlib import suppress
+from collections.abc import Generator, Sequence
+from contextlib import contextmanager, suppress
 from pathlib import Path
 
 import psutil
@@ -19,6 +20,38 @@ AGENT_COMMAND_MARKERS = (
     "qmt_agent.__main__",
     "qmt_agent.api:app",
 )
+
+ES_SYSTEM_REQUIRED = 0x00000001
+ES_CONTINUOUS = 0x80000000
+
+
+def _set_thread_execution_state(flags: int) -> None:
+    """调用 Win32 电源 API；返回 NULL 表示设置失败。"""
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
+    set_execution_state = kernel32.SetThreadExecutionState
+    set_execution_state.argtypes = [ctypes.c_uint32]
+    set_execution_state.restype = ctypes.c_uint32
+    if not set_execution_state(flags):
+        error_code = ctypes.get_last_error()  # type: ignore[attr-defined]
+        raise OSError(error_code, "SetThreadExecutionState 调用失败")
+
+
+@contextmanager
+def prevent_system_sleep() -> Generator[None, None, None]:
+    """在当前线程存活期间阻止 Windows 因空闲自动休眠。"""
+    try:
+        _set_thread_execution_state(ES_CONTINUOUS | ES_SYSTEM_REQUIRED)
+    except OSError as exc:
+        raise RuntimeError(f"无法阻止 Windows 自动休眠：{exc}") from exc
+
+    try:
+        yield
+    finally:
+        try:
+            _set_thread_execution_state(ES_CONTINUOUS)
+        except OSError as exc:
+            # 进程即将退出时 Windows 也会释放线程执行状态；这里不能掩盖原始退出原因。
+            print(f"警告：无法恢复 Windows 自动休眠：{exc}", file=sys.stderr, flush=True)
 
 
 def qmt_paths(qmt_bin_value: str, shortcut_value: str) -> tuple[Path, Path]:
@@ -150,25 +183,27 @@ def run(args: argparse.Namespace) -> None:
     qmt_bin, shortcut = qmt_paths(args.qmt_bin, args.qmt_shortcut)
     stop_running_instances(qmt_bin)
 
-    print(f"正在启动 miniQMT：{shortcut}", flush=True)
-    os.startfile(shortcut)  # type: ignore[attr-defined]
-    if args.client_wait_seconds:
-        print(f"等待 miniQMT 初始化 {args.client_wait_seconds} 秒……", flush=True)
-        time.sleep(args.client_wait_seconds)
+    with prevent_system_sleep():
+        print("已阻止 Windows 在 qmt-agent 运行期间自动休眠。", flush=True)
+        print(f"正在启动 miniQMT：{shortcut}", flush=True)
+        os.startfile(shortcut)  # type: ignore[attr-defined]
+        if args.client_wait_seconds:
+            print(f"等待 miniQMT 初始化 {args.client_wait_seconds} 秒……", flush=True)
+            time.sleep(args.client_wait_seconds)
 
-    print("正在启动 qmt-agent……", flush=True)
-    site_packages = str(qmt_bin / "Lib" / "site-packages")
-    if site_packages not in sys.path:
-        # 放在末尾，避免 QMT 自带的旧依赖覆盖 uv 环境中的依赖。
-        sys.path.append(site_packages)
+        print("正在启动 qmt-agent……", flush=True)
+        site_packages = str(qmt_bin / "Lib" / "site-packages")
+        if site_packages not in sys.path:
+            # 放在末尾，避免 QMT 自带的旧依赖覆盖 uv 环境中的依赖。
+            sys.path.append(site_packages)
 
-    try:
-        with os.add_dll_directory(qmt_bin):  # type: ignore[attr-defined]
-            from qmt_agent.__main__ import main as run_agent
+        try:
+            with os.add_dll_directory(qmt_bin):  # type: ignore[attr-defined]
+                from qmt_agent.__main__ import main as run_agent
 
-            run_agent()
-    except OSError as exc:
-        raise RuntimeError(f"无法加载 miniQMT DLL 目录 {qmt_bin}：{exc}") from exc
+                run_agent()
+        except OSError as exc:
+            raise RuntimeError(f"无法加载 miniQMT DLL 目录 {qmt_bin}：{exc}") from exc
 
 
 def main(argv: Sequence[str] | None = None) -> int:

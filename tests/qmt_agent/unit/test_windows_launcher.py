@@ -114,3 +114,50 @@ def test_stop_processes_forces_process_that_does_not_exit(monkeypatch) -> None:
 
     assert fake.terminated is True
     assert fake.killed is True
+
+
+def test_prevent_system_sleep_sets_and_restores_execution_state(monkeypatch) -> None:
+    states: list[int] = []
+    monkeypatch.setattr(launcher, "_set_thread_execution_state", states.append)
+
+    with launcher.prevent_system_sleep():
+        assert states == [launcher.ES_CONTINUOUS | launcher.ES_SYSTEM_REQUIRED]
+
+    assert states == [
+        launcher.ES_CONTINUOUS | launcher.ES_SYSTEM_REQUIRED,
+        launcher.ES_CONTINUOUS,
+    ]
+
+
+def test_prevent_system_sleep_fails_before_starting_when_windows_rejects_request(
+    monkeypatch,
+) -> None:
+    def reject(_: int) -> None:
+        raise OSError("模拟系统调用失败")
+
+    monkeypatch.setattr(launcher, "_set_thread_execution_state", reject)
+
+    with (
+        pytest.raises(RuntimeError, match="无法阻止 Windows 自动休眠"),
+        launcher.prevent_system_sleep(),
+    ):
+        pytest.fail("系统调用失败后不应继续启动")
+
+
+def test_prevent_system_sleep_does_not_mask_exit_when_restore_fails(
+    monkeypatch, capsys
+) -> None:
+    states: list[int] = []
+
+    def fail_on_restore(flags: int) -> None:
+        states.append(flags)
+        if flags == launcher.ES_CONTINUOUS:
+            raise OSError("模拟恢复失败")
+
+    monkeypatch.setattr(launcher, "_set_thread_execution_state", fail_on_restore)
+
+    with launcher.prevent_system_sleep():
+        pass
+
+    assert states[-1] == launcher.ES_CONTINUOUS
+    assert "无法恢复 Windows 自动休眠" in capsys.readouterr().err
