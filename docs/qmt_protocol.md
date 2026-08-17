@@ -47,7 +47,7 @@ XtData object
 
 行情明细使用 `extra="allow"`，因为不同券商客户端版本和行情级别确实会扩展字段。已知
 字段严格校验；未知字段保存在模型的 `__pydantic_extra__` 中并随 HTTP、Parquet
-`quote_json` 和队列事件完整传递，同时由 agent 记录 DEBUG 日志，便于后续补入正式定义。
+`quote.extra_json` 和队列事件完整传递，同时由 agent 记录 DEBUG 日志，便于后续补入正式定义。
 
 ## 行情明细
 
@@ -204,9 +204,10 @@ HTTP 416 使用 `QuoteSequenceErrorResponse`：`detail: str`，以及可为空�
 | `trading_date` | `datetime.date` |
 
 因此 platform 应创建 `Queue[QuoteEvent]`，消费者使用属性访问，例如
-`event.seq`、`event.quote.lastPrice`。Parquet 固定信封字段分别落列，`received_at` 使用
-带 UTC 时区的 timestamp；行情明细的全部字段保存在 `quote_json`，不会因动态字段未建列
-而丢失。
+`event.seq`、`event.quote.lastPrice`。Parquet 分为 `ticks`、`bars` 两张按交易日分区的表；
+固定信封字段落入顶层列，行情主体保存在具有确定 schema 的 `quote` struct 中；
+`received_at` 使用带 UTC 时区的 timestamp。未知的客户端扩展字段保存在
+`quote.extra_json`，不会因动态字段未建列而丢失。
 
 ## 字段丢弃和日志规则
 

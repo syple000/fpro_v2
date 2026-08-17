@@ -19,10 +19,18 @@ from qmt_protocol import (
 )
 from qmt_receiver.client import QmtAgentClient, QmtAgentError
 from qmt_receiver.receiver import QmtReceiver, ReceiveResult
-from qmt_receiver.storage import QuoteParquetWriter
+from qmt_receiver.storage import (
+    BAR_SCHEMA,
+    BAR_TABLE,
+    TICK_SCHEMA,
+    TICK_TABLE,
+    QuoteParquetWriter,
+)
 
 __all__ = [
     "BarQuote",
+    "BAR_SCHEMA",
+    "BAR_TABLE",
     "HealthResponse",
     "HistoryDownloadResponse",
     "HistoryFrame",
@@ -42,4 +50,6 @@ __all__ = [
     "StockSubscriptionResponse",
     "SubscriptionStatus",
     "TickQuote",
+    "TICK_SCHEMA",
+    "TICK_TABLE",
 ]

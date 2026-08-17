@@ -4,7 +4,7 @@
 也不持有消息队列。platform 决定何时及在哪个线程连续调用；receiver 每次只完成一批：
 
 1. 调用 qmt-agent 的 quote sequence；
-2. 按交易日期写入 `parquet_store`；
+2. 把 tick 与 bar 分开、按交易日期写入 `parquet_store`；
 3. 写入成功后逐条 `queue.put(event)`。
 
 ## Platform 调用
@@ -52,9 +52,38 @@ with (
 
 ## Parquet
 
-逻辑表名为 `quotes`，按 `trading_date` 分区。日期优先使用 quote 的毫秒时间戳 `time`，
-无法解析时使用 agent 的 `received_at`，默认时区为 `Asia/Shanghai`。`received_at` 以 UTC
-时区 timestamp 落列；动态 quote（包括未知的客户端扩展字段）完整保存在 `quote_json`。
+行情分成两张逻辑表，存储粒度仍为交易日：
+
+- `ticks`：只保存 `period="tick"` 的行情；
+- `bars`：保存 `1m`、`5m`、`1d` 等所有 K 线周期，通过 `period` 列区分周期。
+
+两张表都按 `trading_date` 分区，并按 `seq` 排序。日期优先使用 quote 的毫秒时间戳
+`time`，无法解析时使用 agent 的 `received_at`，默认交易时区为 `Asia/Shanghai`。目录结构
+示意为 `ticks/trading_date=.../` 和 `bars/trading_date=.../`（实际分区值由
+`parquet_store` 做 URL 编码）。
+
+两张表都有以下固定信封列：
+
+| 列 | Arrow 类型 | 可空 |
+| --- | --- | --- |
+| `trading_date` | `date32` | 否 |
+| `seq` | `int64` | 否 |
+| `code`, `period`, `source`, `subscription` | `string` | 否 |
+| `received_at` | `timestamp[us, tz=UTC]` | 否 |
+| `quote` | `struct` | 否 |
+
+行情主体不在顶层铺平，而是保存在 `quote` struct 中。`ticks.quote` 使用 `TickQuote` 的
+schema：时间和计数类子字段为 `int64`，价格、金额和比率子字段为 `float64`，`stime`、
+`timetag` 为 `string`，盘口价格/数量分别为 `list<float64>` / `list<int64>`。
+`bars.quote` 使用 `BarQuote` 的 schema：`time`、`volume`、`suspendFlag` 为 `int64`，
+OHLC、金额、结算价、持仓量及复权子字段为 `float64`。完整字段名与含义见
+[QMT 行情数据协议](qmt_protocol.md)。
+
+行情字段在不同接口和客户端版本中可能缺失，因此已知行情列允许为空，但类型固定。未知的
+券商扩展字段不会丢弃，而是只保存在 `quote.extra_json`；已知字段不再存成 JSON。
+
+旧版 `quotes` 表不会被新 writer 继续写入或自动迁移；复用已有数据目录时，可以在确认不再
+需要旧格式后单独归档该目录。
 
 每批都会 `flush`；只有落盘成功后才写入队列和推进 receiver 的内存 `next_seq`。
 
@@ -80,4 +109,3 @@ uv run --group qmt-receiver qmt-receiver-test --once
 ```
 
 可用 `--url`、`--data-dir` 和 `--timeout-ms` 覆盖默认参数。
-
