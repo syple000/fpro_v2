@@ -12,9 +12,9 @@
 ```python
 from queue import Queue
 
-from qmt_receiver import QmtAgentClient, QmtReceiver, QuoteParquetWriter
+from qmt_receiver import QmtAgentClient, QmtReceiver, QuoteEvent, QuoteParquetWriter
 
-quote_queue = Queue()  # Python Queue 本身是线程安全的，由 platform 创建和消费
+quote_queue: Queue[QuoteEvent] = Queue()  # Python Queue 本身是线程安全的
 
 with (
     QmtAgentClient("http://127.0.0.1:8765") as client,
@@ -34,6 +34,11 @@ with (
 移动，最大不超过 `latest_seq`，直到拿到可用批次。正常追到 `latest_seq + 1` 时只视为暂无
 新数据，不会回头重放缓存。
 
+客户端方法返回 `qmt_protocol` 中定义的 Pydantic 模型，而不是裸字典。receiver 会在 HTTP
+边界严格校验整个响应；字段缺失、类型错误或未知信封字段都会抛出 `QmtAgentError`。
+最终写入队列的是 `QuoteEvent`，可通过 `event.seq`、`event.period`、`event.quote` 和
+`event.trading_date` 等属性访问。完整协议见 [QMT 行情数据协议](qmt_protocol.md)。
+
 ## qmt-agent 方法
 
 `QmtAgentClient` 将 qmt-agent 的业务接口暴露为同步 Python 方法：
@@ -47,8 +52,9 @@ with (
 
 ## Parquet
 
-逻辑表名为 `quotes`，按 `trading_date` 分区。日期优先使用 quote 的 `time`，无法解析时使用
-agent 的 `received_at`，默认时区为 `Asia/Shanghai`。动态 quote 完整保存在 `quote_json`。
+逻辑表名为 `quotes`，按 `trading_date` 分区。日期优先使用 quote 的毫秒时间戳 `time`，
+无法解析时使用 agent 的 `received_at`，默认时区为 `Asia/Shanghai`。`received_at` 以 UTC
+时区 timestamp 落列；动态 quote（包括未知的客户端扩展字段）完整保存在 `quote_json`。
 
 每批都会 `flush`；只有落盘成功后才写入队列和推进 receiver 的内存 `next_seq`。
 

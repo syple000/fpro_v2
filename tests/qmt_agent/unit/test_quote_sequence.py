@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from threading import Thread
 
 import pytest
@@ -8,15 +9,16 @@ from qmt_agent.quote_sequence import (
     QuoteSequenceBuffer,
     QuoteSequenceOutOfRangeError,
 )
+from qmt_protocol import QuoteSequenceResponse, TickQuote
 
 
 def append_values(buffer: QuoteSequenceBuffer, *values: int) -> None:
     buffer.append(
-        [(f"{value:06d}.SZ", {"value": value}) for value in values],
+        [(f"{value:06d}.SZ", TickQuote.model_validate({"value": value})) for value in values],
         source="stock",
         subscription="000001.SZ",
         period="tick",
-        received_at="2026-08-16T00:00:00+00:00",
+        received_at=datetime(2026, 8, 16, tzinfo=UTC),
     )
 
 
@@ -26,10 +28,10 @@ def test_buffer_assigns_contiguous_sequences_and_reads_only_requested_window() -
 
     result = buffer.read(2, 2)
 
-    assert [item["seq"] for item in result["data"]] == [2, 3]
-    assert [item["quote"]["value"] for item in result["data"]] == [2, 3]
-    assert result["next_seq"] == 4
-    assert buffer.status() == {
+    assert [item.seq for item in result.data] == [2, 3]
+    assert [item.quote.model_dump()["value"] for item in result.data] == [2, 3]
+    assert result.next_seq == 4
+    assert buffer.status().model_dump() == {
         "oldest_seq": 1,
         "latest_seq": 4,
         "next_seq": 5,
@@ -44,8 +46,8 @@ def test_buffer_overwrites_only_oldest_records_and_reports_boundaries() -> None:
 
     result = buffer.read(3, 10)
 
-    assert [item["seq"] for item in result["data"]] == [3, 4, 5]
-    assert buffer.status()["oldest_seq"] == 3
+    assert [item.seq for item in result.data] == [3, 4, 5]
+    assert buffer.status().oldest_seq == 3
     with pytest.raises(QuoteSequenceOutOfRangeError) as too_old:
         buffer.read(2, 1)
     with pytest.raises(QuoteSequenceOutOfRangeError) as too_new:
@@ -60,8 +62,8 @@ def test_stock_filter_does_not_change_sequence_window_progress() -> None:
 
     result = buffer.read(1, 2, ["000002.SZ"])
 
-    assert [item["seq"] for item in result["data"]] == [2]
-    assert result["next_seq"] == 3
+    assert [item.seq for item in result.data] == [2]
+    assert result.next_seq == 3
 
 
 def test_buffer_rejects_invalid_capacity() -> None:
@@ -79,10 +81,10 @@ def test_buffer_rejects_invalid_read_limit() -> None:
 
 def test_buffer_long_poll_wakes_when_requested_sequence_arrives() -> None:
     buffer = QuoteSequenceBuffer(capacity=2)
-    result: dict[str, object] = {}
+    result: list[QuoteSequenceResponse] = []
 
     def read() -> None:
-        result.update(buffer.read(1, 1, wait_ms=1_000))
+        result.append(buffer.read(1, 1, wait_ms=1_000))
 
     reader = Thread(target=read)
     reader.start()
@@ -90,4 +92,4 @@ def test_buffer_long_poll_wakes_when_requested_sequence_arrives() -> None:
     reader.join(timeout=2)
 
     assert not reader.is_alive()
-    assert [item["seq"] for item in result["data"]] == [1]  # type: ignore[index]
+    assert [item.seq for item in result[0].data] == [1]

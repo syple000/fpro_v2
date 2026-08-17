@@ -3,10 +3,18 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
-from dataclasses import dataclass
+from datetime import datetime
 from threading import Condition, Lock
 from time import monotonic
-from typing import Any
+
+from qmt_protocol import (
+    QuotePayload,
+    QuoteSequenceResponse,
+    QuoteSequenceStatus,
+    QuoteSource,
+    SequencedQuote,
+    XtDataPeriod,
+)
 
 
 class QuoteSequenceOutOfRangeError(ValueError):
@@ -23,43 +31,16 @@ class QuoteSequenceOutOfRangeError(ValueError):
         self.latest_seq = latest_seq
 
         if oldest_seq is None or latest_seq is None:
-            message = (
-                f"行情顺序缓存为空，请求序号 {requested_seq}；"
-                "当前没有最旧或最新序号"
-            )
+            message = f"行情顺序缓存为空，请求序号 {requested_seq}；当前没有最旧或最新序号"
         elif requested_seq < oldest_seq:
             message = (
-                f"请求序号 {requested_seq} 过旧；"
-                f"当前最旧序号 {oldest_seq}，最新序号 {latest_seq}"
+                f"请求序号 {requested_seq} 过旧；当前最旧序号 {oldest_seq}，最新序号 {latest_seq}"
             )
         else:
             message = (
-                f"请求序号 {requested_seq} 过新；"
-                f"当前最旧序号 {oldest_seq}，最新序号 {latest_seq}"
+                f"请求序号 {requested_seq} 过新；当前最旧序号 {oldest_seq}，最新序号 {latest_seq}"
             )
         super().__init__(message)
-
-
-@dataclass(frozen=True, slots=True)
-class SequencedQuote:
-    seq: int
-    code: str
-    period: str
-    source: str
-    subscription: str
-    received_at: str
-    quote: Any
-
-    def as_dict(self) -> dict[str, Any]:
-        return {
-            "seq": self.seq,
-            "code": self.code,
-            "period": self.period,
-            "source": self.source,
-            "subscription": self.subscription,
-            "received_at": self.received_at,
-            "quote": self.quote,
-        }
 
 
 class QuoteSequenceBuffer:
@@ -78,12 +59,12 @@ class QuoteSequenceBuffer:
 
     def append(
         self,
-        items: Iterable[tuple[str, Any]],
+        items: Iterable[tuple[str, QuotePayload]],
         *,
-        source: str,
+        source: QuoteSource,
         subscription: str,
-        period: str,
-        received_at: str,
+        period: XtDataPeriod,
+        received_at: datetime,
     ) -> None:
         with self._changed:
             for code, quote in items:
@@ -107,7 +88,7 @@ class QuoteSequenceBuffer:
         limit: int,
         stocks: Iterable[str] | None = None,
         wait_ms: int = 0,
-    ) -> dict[str, Any]:
+    ) -> QuoteSequenceResponse:
         """读取连续序号窗口；可等待下一个序号到达。"""
         if limit < 1:
             raise ValueError("行情顺序读取条数必须大于等于 1")
@@ -124,12 +105,7 @@ class QuoteSequenceBuffer:
                 self._changed.wait(remaining)
 
             oldest_seq, latest_seq = self._bounds_unlocked()
-            if (
-                oldest_seq is None
-                or latest_seq is None
-                or seq < oldest_seq
-                or seq > latest_seq
-            ):
+            if oldest_seq is None or latest_seq is None or seq < oldest_seq or seq > latest_seq:
                 raise QuoteSequenceOutOfRangeError(seq, oldest_seq, latest_seq)
 
             end_seq = min(seq + limit - 1, latest_seq)
@@ -142,25 +118,25 @@ class QuoteSequenceBuffer:
                 if requested_stocks is None or record.code in requested_stocks:
                     records.append(record)
 
-        return {
-            "data": [record.as_dict() for record in records],
-            "count": len(records),
-            "requested_seq": seq,
-            "next_seq": end_seq + 1,
-            "oldest_seq": oldest_seq,
-            "latest_seq": latest_seq,
-        }
+        return QuoteSequenceResponse(
+            data=records,
+            count=len(records),
+            requested_seq=seq,
+            next_seq=end_seq + 1,
+            oldest_seq=oldest_seq,
+            latest_seq=latest_seq,
+        )
 
-    def status(self) -> dict[str, int | None]:
+    def status(self) -> QuoteSequenceStatus:
         with self._lock:
             oldest_seq, latest_seq = self._bounds_unlocked()
-            return {
-                "oldest_seq": oldest_seq,
-                "latest_seq": latest_seq,
-                "next_seq": self._next_seq,
-                "size": self._size,
-                "capacity": self._capacity,
-            }
+            return QuoteSequenceStatus(
+                oldest_seq=oldest_seq,
+                latest_seq=latest_seq,
+                next_seq=self._next_seq,
+                size=self._size,
+                capacity=self._capacity,
+            )
 
     def _slot(self, seq: int) -> int:
         return (seq - 1) % self._capacity

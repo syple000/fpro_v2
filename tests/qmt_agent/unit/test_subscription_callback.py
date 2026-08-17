@@ -5,9 +5,7 @@ from qmt_agent.subscription_callback import QuoteCallbackGate
 
 def test_gate_preserves_callbacks_received_before_subscription_confirmation() -> None:
     received: list[int] = []
-    gate = QuoteCallbackGate(
-        lambda quotes, _: received.append(quotes["000001.SZ"]["value"])
-    )
+    gate = QuoteCallbackGate(lambda quotes, _: received.append(quotes["000001.SZ"]["value"]))
 
     gate({"000001.SZ": {"value": 1}})
     gate({"000001.SZ": {"value": 2}})
@@ -20,9 +18,7 @@ def test_gate_preserves_callbacks_received_before_subscription_confirmation() ->
 
 def test_gate_discards_failed_or_closed_subscription_callbacks() -> None:
     received: list[int] = []
-    gate = QuoteCallbackGate(
-        lambda quotes, _: received.append(quotes["000001.SZ"]["value"])
-    )
+    gate = QuoteCallbackGate(lambda quotes, _: received.append(quotes["000001.SZ"]["value"]))
     gate({"000001.SZ": {"value": 1}})
 
     gate.close()
@@ -34,9 +30,7 @@ def test_gate_discards_failed_or_closed_subscription_callbacks() -> None:
 
 def test_gate_can_restore_callbacks_when_unsubscribe_fails() -> None:
     received: list[int] = []
-    gate = QuoteCallbackGate(
-        lambda quotes, _: received.append(quotes["000001.SZ"]["value"])
-    )
+    gate = QuoteCallbackGate(lambda quotes, _: received.append(quotes["000001.SZ"]["value"]))
     gate.activate()
     gate.suspend()
     gate({"000001.SZ": {"value": 1}})

@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 
 import pyarrow.parquet as pq
 
+from qmt_protocol import SequencedQuote, TickQuote
 from qmt_receiver.storage import QuoteParquetWriter
 
 
@@ -13,15 +15,29 @@ def test_writer_partitions_by_quote_date_and_preserves_quote(tmp_path: Path) -> 
 
     events = writer.append(
         [
-            {
-                "seq": 8,
-                "code": "000001.SZ",
-                "period": "tick",
-                "source": "market",
-                "subscription": "SZ",
-                "received_at": "2026-08-17T01:00:00+00:00",
-                "quote": {"time": "20260816145959", "lastPrice": 10.5},
-            }
+            SequencedQuote(
+                seq=8,
+                code="000001.SZ",
+                period="tick",
+                source="market",
+                subscription="SZ",
+                received_at=datetime(2026, 8, 17, 1, tzinfo=UTC),
+                quote=TickQuote(
+                    time=int(
+                        datetime(
+                            2026,
+                            8,
+                            16,
+                            14,
+                            59,
+                            59,
+                            tzinfo=timezone(timedelta(hours=8)),
+                        ).timestamp()
+                        * 1_000
+                    ),
+                    lastPrice=10.5,
+                ),
+            )
         ]
     )
     writer.close()
@@ -34,5 +50,6 @@ def test_writer_partitions_by_quote_date_and_preserves_quote(tmp_path: Path) -> 
     assert row["trading_date"].isoformat() == "2026-08-16"
     assert row["seq"] == 8
     assert json.loads(row["quote_json"])["lastPrice"] == 10.5
-    assert events[0]["trading_date"] == "2026-08-16"
-    assert events[0]["quote"]["lastPrice"] == 10.5
+    assert events[0].trading_date.isoformat() == "2026-08-16"
+    assert isinstance(events[0].quote, TickQuote)
+    assert events[0].quote.lastPrice == 10.5

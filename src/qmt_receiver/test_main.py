@@ -8,14 +8,16 @@ from collections.abc import Callable
 from pathlib import Path
 from queue import Empty, Queue
 from time import monotonic
-from typing import Any
+from typing import TypeVar
 
+from qmt_protocol import ProtocolModel, QuoteEvent
 from qmt_receiver import QmtAgentClient, QmtReceiver, QuoteParquetWriter
 
 logger = logging.getLogger("qmt_receiver.test_main")
+ResponseModel = TypeVar("ResponseModel", bound=ProtocolModel)
 
 
-def _call(name: str, function: Callable[[], dict[str, Any]]) -> dict[str, Any] | None:
+def _call(name: str, function: Callable[[], ResponseModel]) -> ResponseModel | None:
     started = monotonic()
     try:
         result = function()
@@ -31,9 +33,9 @@ def _call(name: str, function: Callable[[], dict[str, Any]]) -> dict[str, Any] |
     return result
 
 
-def _summary(result: dict[str, Any]) -> dict[str, Any]:
-    summary = {
-        key: result[key]
+def _summary(result: ProtocolModel) -> dict[str, object]:
+    summary: dict[str, object] = {
+        key: getattr(result, key)
         for key in (
             "status",
             "count",
@@ -50,9 +52,9 @@ def _summary(result: dict[str, Any]) -> dict[str, Any]:
             "latest_seq",
             "completed",
         )
-        if key in result
+        if key in type(result).model_fields
     }
-    data = result.get("data")
+    data = getattr(result, "data", None)
     if isinstance(data, (dict, list)):
         summary["data_size"] = len(data)
     return summary
@@ -63,11 +65,10 @@ def check_all_interfaces(client: QmtAgentClient) -> list[str]:
     stock = "000001.SZ"
     failures: list[str] = []
 
-    def check(name: str, function: Callable[[], dict[str, Any]]) -> dict[str, Any]:
+    def check(name: str, function: Callable[[], ResponseModel]) -> ResponseModel | None:
         result = _call(name, function)
         if result is None:
             failures.append(name)
-            return {}
         return result
 
     check("health", client.health)
@@ -81,8 +82,7 @@ def check_all_interfaces(client: QmtAgentClient) -> list[str]:
     check("stock quotes", lambda: client.stock_quotes((stock,)))
 
     latest_status = check("subscriptions before sequence", client.subscriptions) or status
-    sequence = latest_status.get("quote_sequence", {})
-    latest_seq = sequence.get("latest_seq") if isinstance(sequence, dict) else None
+    latest_seq = latest_status.quote_sequence.latest_seq if latest_status is not None else None
     check(
         "quote sequence",
         lambda: client.quote_sequence(latest_seq or 1, limit=1, wait_ms=0),
@@ -104,7 +104,7 @@ def check_all_interfaces(client: QmtAgentClient) -> list[str]:
     return failures
 
 
-def drain_queue(queue: Queue[dict[str, Any]]) -> int:
+def drain_queue(queue: Queue[QuoteEvent]) -> int:
     count = 0
     while True:
         try:
@@ -115,7 +115,7 @@ def drain_queue(queue: Queue[dict[str, Any]]) -> int:
 
 
 def run(base_url: str, data_dir: Path, once: bool, timeout_ms: int) -> None:
-    quote_queue: Queue[dict[str, Any]] = Queue()
+    quote_queue: Queue[QuoteEvent] = Queue()
     with (
         QmtAgentClient(base_url) as client,
         QuoteParquetWriter(data_dir) as writer,

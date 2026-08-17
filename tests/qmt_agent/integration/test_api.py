@@ -26,9 +26,7 @@ def test_main_http_flow() -> None:
         )
         status = client.get("/v1/subscriptions")
         snapshot = client.post("/v1/snapshots/markets", json={"markets": ["SH", "SZ"]})
-        stock_snapshot = client.post(
-            "/v1/snapshots/stocks", json={"stocks": ["000001.SZ"]}
-        )
+        stock_snapshot = client.post("/v1/snapshots/stocks", json={"stocks": ["000001.SZ"]})
         removed = client.request(
             "DELETE",
             "/v1/subscriptions/stocks",
@@ -54,6 +52,26 @@ def test_main_http_flow() -> None:
     assert "subscription_ids" not in removed.json()
 
 
+def test_openapi_exposes_explicit_response_and_quote_schemas() -> None:
+    with make_client() as client:
+        schema = client.get("/openapi.json").json()
+
+    components = schema["components"]["schemas"]
+    assert {
+        "TickQuote",
+        "BarQuote",
+        "SnapshotResponse",
+        "LatestQuotesResponse",
+        "QuoteSequenceResponse",
+        "SubscriptionStatus",
+        "HistoryQueryResponse",
+    } <= components.keys()
+    response_schema = schema["paths"]["/v1/quotes/subscribed/sequence"]["post"]["responses"]["200"][
+        "content"
+    ]["application/json"]["schema"]
+    assert response_schema["$ref"].endswith("/QuoteSequenceResponse")
+
+
 def test_limit_error_is_http_409() -> None:
     with make_client(max_subscriptions=1) as client:
         response = client.post(
@@ -77,9 +95,7 @@ def test_invalid_stock_code_is_rejected() -> None:
 
 def test_stock_subscription_requires_supported_period() -> None:
     with make_client() as client:
-        missing = client.post(
-            "/v1/subscriptions/stocks", json={"stocks": ["000001.SZ"]}
-        )
+        missing = client.post("/v1/subscriptions/stocks", json={"stocks": ["000001.SZ"]})
         unsupported = client.post(
             "/v1/subscriptions/stocks",
             json={"stocks": ["000001.SZ"], "period": "2m"},
@@ -241,13 +257,9 @@ def test_market_and_stock_quote_endpoints_return_separate_caches() -> None:
         )
 
     assert market_quotes.status_code == 200
-    assert market_quotes.json()["data"] == {
-        "600000.SH": {"lastPrice": 10.2, "kind": "tick"}
-    }
+    assert market_quotes.json()["data"] == {"600000.SH": {"lastPrice": 10.2, "kind": "tick"}}
     assert market_quotes.json()["periods"] == {"600000.SH": "tick"}
     assert stock_quotes.status_code == 200
-    assert stock_quotes.json()["data"] == {
-        "600000.SH": {"close": 10.1, "kind": "1m"}
-    }
+    assert stock_quotes.json()["data"] == {"600000.SH": {"close": 10.1, "kind": "1m"}}
     assert stock_quotes.json()["periods"] == {"600000.SH": "1m"}
     assert market_filter.json()["not_subscribed"] == ["000001.SZ"]

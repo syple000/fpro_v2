@@ -159,10 +159,12 @@ class ParquetStore:
                 self._ensure_open()
 
         with self._state_lock:
-            keys = sorted(
-                key for key, buffer in self._buffers.items() if buffer.rows and key[0] == table
-            ) if table is not None else sorted(
-                key for key, buffer in self._buffers.items() if buffer.rows
+            keys = (
+                sorted(
+                    key for key, buffer in self._buffers.items() if buffer.rows and key[0] == table
+                )
+                if table is not None
+                else sorted(key for key, buffer in self._buffers.items() if buffer.rows)
             )
 
         for table_name, partition_id in keys:
@@ -269,8 +271,7 @@ class ParquetStore:
             raise TypeError("data 必须是 pyarrow.Table")
         if not data.schema.equals(config.schema, check_metadata=True):
             raise SchemaMismatchError(
-                f"表 {config.name!r} 的输入 Schema 不匹配；"
-                f"期望 {config.schema}，实际 {data.schema}"
+                f"表 {config.name!r} 的输入 Schema 不匹配；期望 {config.schema}，实际 {data.schema}"
             )
 
     def _group_rows(self, config: TableConfig, data: pa.Table) -> dict[str, list[int]]:
@@ -549,9 +550,7 @@ def _filter_expression(filter: FilterSpec | None) -> ds.Expression | None:
             if not _is_filter_predicate(item):
                 raise ValueError("过滤条件必须是 (字段, 操作符, 值) 三元组")
             predicates.append(item)
-        conjunction = _combine_expressions(
-            _predicate_expression(item) for item in predicates
-        )
+        conjunction = _combine_expressions(_predicate_expression(item) for item in predicates)
         disjunction = conjunction if disjunction is None else disjunction | conjunction
     return disjunction
 
@@ -597,7 +596,9 @@ def _combine_expressions(expressions: Iterable[ds.Expression]) -> ds.Expression:
 
 
 def _fsync_file(path: Path) -> None:
-    with path.open("rb") as file:
+    # Windows 的 CRT 不允许对只读文件描述符执行 fsync；r+b 不会截断或改写文件，
+    # 只为刷新刚完成的 Parquet 写入提供一个可同步的文件描述符。
+    with path.open("r+b") as file:
         os.fsync(file.fileno())
 
 

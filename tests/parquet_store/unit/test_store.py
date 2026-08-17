@@ -83,9 +83,7 @@ def manifest_for(root: Path, day: str) -> tuple[Path, ManifestPayload]:
     for path in manifests:
         payload = read_manifest(path)
         table = (
-            pq.ParquetFile(path.parent / payload["files"][0]).read()
-            if payload["files"]
-            else None
+            pq.ParquetFile(path.parent / payload["files"][0]).read() if payload["files"] else None
         )
         if table is not None and table.column("day")[0].as_py() == day:
             return path, payload
@@ -258,9 +256,7 @@ def test_update_schema_adds_nullable_fields_and_old_rows_read_as_null(tmp_path: 
 
     store.update_schema("events", EXTENDED_SCHEMA)
 
-    assert store.read("events").to_pylist() == [
-        {"day": "a", "id": 1, "value": 1.0, "source": None}
-    ]
+    assert store.read("events").to_pylist() == [{"day": "a", "id": 1, "value": 1.0, "source": None}]
     store.append("events", make_extended_table(("a", 2, 2.0, "feed")))
     store.flush()
     assert store.read("events").to_pylist() == [
@@ -271,9 +267,7 @@ def test_update_schema_adds_nullable_fields_and_old_rows_read_as_null(tmp_path: 
 
 def test_update_schema_rejects_incompatible_changes(tmp_path: Path) -> None:
     store = make_store(tmp_path)
-    required_field_schema = pa.schema(
-        [*SCHEMA, pa.field("source", pa.string(), nullable=False)]
-    )
+    required_field_schema = pa.schema([*SCHEMA, pa.field("source", pa.string(), nullable=False)])
     changed_field_schema = pa.schema(
         [
             SCHEMA.field("day"),

@@ -69,9 +69,7 @@ def test_history_models_reject_impossible_dates_and_reversed_ranges(
     model: type[BaseModel],
 ) -> None:
     with pytest.raises(ValidationError, match="有效日期"):
-        model.model_validate(
-            {"stocks": ["000001.SZ"], "start_time": "20250230"}
-        )
+        model.model_validate({"stocks": ["000001.SZ"], "start_time": "20250230"})
     with pytest.raises(ValidationError, match="不能晚于"):
         model.model_validate(
             {

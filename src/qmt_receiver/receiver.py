@@ -2,17 +2,32 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Protocol
 
-from qmt_receiver.client import QmtAgentClient, QuoteSequenceOutOfRange
-from qmt_receiver.storage import QuoteParquetWriter
+from qmt_protocol import QuoteEvent, QuoteSequenceResponse, SequencedQuote
+from qmt_receiver.client import QuoteSequenceOutOfRange
+
+
+class QuoteSequenceClient(Protocol):
+    def quote_sequence(
+        self,
+        seq: int,
+        limit: int = 1_000,
+        stocks: Sequence[str] | None = None,
+        wait_ms: int = 0,
+    ) -> QuoteSequenceResponse: ...
+
+
+class QuoteWriter(Protocol):
+    def append(self, records: Sequence[SequencedQuote]) -> list[QuoteEvent]: ...
 
 
 class QuoteQueue(Protocol):
     """platform 传入的队列只需提供线程安全的 put。"""
 
-    def put(self, item: dict[str, Any]) -> object: ...
+    def put(self, item: QuoteEvent) -> object: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -28,8 +43,8 @@ class QmtReceiver:
 
     def __init__(
         self,
-        client: QmtAgentClient,
-        writer: QuoteParquetWriter,
+        client: QuoteSequenceClient,
+        writer: QuoteWriter,
         *,
         start_seq: int = 1,
         batch_size: int = 1_000,
@@ -68,16 +83,14 @@ class QmtReceiver:
             if payload is None:
                 return ReceiveResult(0, requested_seq, probes=probes)
 
-        records = payload.get("data")
-        if not isinstance(records, list):
-            raise ValueError("quote sequence 的 data 必须是列表")
-        next_seq = int(payload["next_seq"])
+        records = payload.data
+        next_seq = payload.next_seq
         events = self._writer.append(records)
         for event in events:
             queue.put(event)
         self._next_seq = next_seq
 
-        first_seq = int(records[0]["seq"]) if records else requested_seq
+        first_seq = records[0].seq if records else requested_seq
         return ReceiveResult(
             count=len(records),
             next_seq=next_seq,
@@ -87,7 +100,7 @@ class QmtReceiver:
 
     def _probe_available_sequence(
         self, initial: QuoteSequenceOutOfRange
-    ) -> tuple[dict[str, Any] | None, int]:
+    ) -> tuple[QuoteSequenceResponse | None, int]:
         """从 oldest-1 开始，以 +1/+2/+4... 向最新序号内试探。"""
         if initial.oldest_seq is None or initial.latest_seq is None:
             return None, 0

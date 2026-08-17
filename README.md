@@ -11,6 +11,8 @@
 
 qmt-agent 的接口、Windows 启动方式和开发说明见 [docs/qmt_agent.md](docs/qmt_agent.md)。
 WSL 实时接收组件的调用和测试说明见 [docs/qmt_receiver.md](docs/qmt_receiver.md)。
+两端共用的响应、行情字段和队列事件类型见
+[docs/qmt_protocol.md](docs/qmt_protocol.md)。
 Parquet 存储的接口和最简示例见 [docs/parquet_store.md](docs/parquet_store.md)。
 
 ## 目录约定

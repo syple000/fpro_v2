@@ -3,7 +3,80 @@ from __future__ import annotations
 import httpx2
 import pytest
 
-from qmt_receiver.client import QmtAgentClient, QuoteSequenceOutOfRange
+from qmt_protocol import HealthResponse
+from qmt_receiver.client import (
+    QmtAgentClient,
+    QmtAgentError,
+    QuoteSequenceOutOfRange,
+)
+
+STATUS = {
+    "instance_id": "test-instance",
+    "markets": [],
+    "stocks": [],
+    "stock_periods": {},
+    "stock_count": 0,
+    "stock_limit": 50,
+    "quote_sequence": {
+        "oldest_seq": None,
+        "latest_seq": None,
+        "next_seq": 1,
+        "size": 0,
+        "capacity": 10_000,
+    },
+}
+
+
+def response_payload(request: httpx2.Request) -> dict[str, object]:
+    path = request.url.path
+    if path == "/health":
+        return {"status": "ok", "version": "0.1.0", **STATUS}
+    if path == "/v1/subscriptions" and request.method == "GET":
+        return STATUS
+    if path == "/v1/subscriptions/markets":
+        return {"subscribed": [], "added": [], "removed": [], "not_found": []}
+    if path == "/v1/subscriptions/stocks":
+        return {
+            "periods": {},
+            "subscribed": [],
+            "added": [],
+            "updated": [],
+            "removed": [],
+            "not_found": [],
+            "period_mismatches": {},
+        }
+    if path.startswith("/v1/snapshots/"):
+        return {"data": {}, "count": 0}
+    if path in {
+        "/v1/quotes/subscribed/markets",
+        "/v1/quotes/subscribed/stocks",
+    }:
+        return {
+            "data": {},
+            "updated_at": {},
+            "periods": {},
+            "missing": [],
+            "not_subscribed": [],
+        }
+    if path == "/v1/quotes/subscribed/sequence":
+        return {
+            "data": [],
+            "count": 0,
+            "requested_seq": 1,
+            "next_seq": 2,
+            "oldest_seq": 1,
+            "latest_seq": 1,
+        }
+    if path == "/v1/history/download":
+        return {
+            "stocks": ["000001.SZ"],
+            "period": "1d",
+            "mode": "incremental",
+            "completed": True,
+        }
+    if path == "/v1/history/query":
+        return {"data": {}}
+    raise AssertionError(f"未处理的测试路径：{request.method} {path}")
 
 
 def test_client_exposes_all_qmt_agent_business_interfaces() -> None:
@@ -11,13 +84,13 @@ def test_client_exposes_all_qmt_agent_business_interfaces() -> None:
 
     def handler(request: httpx2.Request) -> httpx2.Response:
         requests.append((request.method, request.url.path))
-        return httpx2.Response(200, json={})
+        return httpx2.Response(200, json=response_payload(request))
 
     http_client = httpx2.Client(
         transport=httpx2.MockTransport(handler), base_url="http://qmt-agent"
     )
     client = QmtAgentClient(client=http_client)
-    client.health()
+    assert isinstance(client.health(), HealthResponse)
     client.subscriptions()
     client.subscribe_markets()
     client.unsubscribe_markets(("TEST",))
@@ -71,4 +144,19 @@ def test_client_preserves_sequence_bounds_on_416() -> None:
 
     assert error.value.oldest_seq == 100
     assert error.value.latest_seq == 200
+    http_client.close()
+
+
+def test_client_rejects_unknown_top_level_fields_instead_of_dropping_them() -> None:
+    def handler(_: httpx2.Request) -> httpx2.Response:
+        return httpx2.Response(200, json={**STATUS, "unexpected": 1})
+
+    http_client = httpx2.Client(
+        transport=httpx2.MockTransport(handler), base_url="http://qmt-agent"
+    )
+    client = QmtAgentClient(client=http_client)
+
+    with pytest.raises(QmtAgentError, match="extra_forbidden"):
+        client.subscriptions()
+
     http_client.close()

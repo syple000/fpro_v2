@@ -3,4 +3,3 @@
 from parquet_store.store import ParquetStore, SchemaMismatchError, TableConfig
 
 __all__ = ["ParquetStore", "SchemaMismatchError", "TableConfig"]
-

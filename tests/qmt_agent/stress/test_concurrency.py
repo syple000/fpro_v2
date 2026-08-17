@@ -21,8 +21,7 @@ def test_concurrent_subscriptions_keep_consistent_per_stock_subscriptions() -> N
     gateway = FakeGateway()
     service = QmtMarketService(gateway)
     batches = [
-        [stock_code(number) for number in range(start, start + 10)]
-        for start in range(0, 50, 10)
+        [stock_code(number) for number in range(start, start + 10)] for start in range(0, 50, 10)
     ]
     barrier = Barrier(len(batches))
 
@@ -39,8 +38,8 @@ def test_concurrent_subscriptions_keep_consistent_per_stock_subscriptions() -> N
     status = service.status()
     active_subscriptions = gateway.active_codes()
 
-    assert status["stock_count"] == 50
-    assert set(status["stocks"]) == expected
+    assert status.stock_count == 50
+    assert set(status.stocks) == expected
     assert len(active_subscriptions) == 50
     assert {codes[0] for codes in active_subscriptions} == expected
     assert gateway.active_stock_periods() == dict.fromkeys(expected, "tick")
@@ -68,9 +67,9 @@ def test_concurrent_over_limit_requests_never_break_the_50_stock_invariant() -> 
     active_subscriptions = gateway.active_codes()
 
     assert results == [False] * 32
-    assert status["stock_count"] == 50
+    assert status.stock_count == 50
     assert len(active_subscriptions) == 50
-    assert {codes[0] for codes in active_subscriptions} == set(status["stocks"])
+    assert {codes[0] for codes in active_subscriptions} == set(status.stocks)
 
 
 @pytest.mark.stress
@@ -97,11 +96,11 @@ def test_quote_callbacks_and_reads_remain_consistent_under_pressure() -> None:
         expected = set(stocks)
         for _ in range(1_000):
             result = service.get_stock_quotes()
-            assert set(result["data"]) <= expected
-            assert set(result["missing"]) <= expected
-            assert not result["not_subscribed"]
-            for quote in result["data"].values():
-                assert 0 <= quote["sequence"] < 500
+            assert set(result.data) <= expected
+            assert set(result.missing) <= expected
+            assert not result.not_subscribed
+            for quote in result.data.values():
+                assert 0 <= quote.model_dump()["sequence"] < 500
 
     with ThreadPoolExecutor(max_workers=16) as executor:
         futures = [
@@ -115,19 +114,17 @@ def test_quote_callbacks_and_reads_remain_consistent_under_pressure() -> None:
     final_quotes = service.get_stock_quotes()
     sequence_status = service.quote_sequence_status()
     final_sequence_window = service.get_subscribed_quote_sequence(19_001, 1_000)
-    assert set(final_quotes["data"]) == set(stocks)
-    assert final_quotes["missing"] == []
-    assert all(quote["sequence"] == 499 for quote in final_quotes["data"].values())
-    assert sequence_status == {
+    assert set(final_quotes.data) == set(stocks)
+    assert final_quotes.missing == []
+    assert all(quote.model_dump()["sequence"] == 499 for quote in final_quotes.data.values())
+    assert sequence_status.model_dump() == {
         "oldest_seq": 10_001,
         "latest_seq": 20_000,
         "next_seq": 20_001,
         "size": 10_000,
         "capacity": 10_000,
     }
-    assert [item["seq"] for item in final_sequence_window["data"]] == list(
-        range(19_001, 20_001)
-    )
+    assert [item.seq for item in final_sequence_window.data] == list(range(19_001, 20_001))
 
 
 @pytest.mark.stress
@@ -165,8 +162,8 @@ def test_market_callback_never_blocks_stock_callback_cache_write() -> None:
 
     market_quotes = service.get_market_quotes()
     stock_quotes = service.get_stock_quotes()
-    assert set(market_quotes["data"]) == {"600000.SH"}
-    assert set(stock_quotes["data"]) == {"000001.SZ"}
+    assert set(market_quotes.data) == {"600000.SH"}
+    assert set(stock_quotes.data) == {"000001.SZ"}
 
 
 @pytest.mark.stress
@@ -178,7 +175,7 @@ def test_market_operation_never_blocks_stock_subscription_state() -> None:
         future = executor.submit(service.subscribe_stocks, ["000001.SZ"], "tick")
         result = future.result(timeout=1)
 
-    assert result["added"] == ["000001.SZ"]
+    assert result.added == ["000001.SZ"]
 
 
 @pytest.mark.stress
@@ -203,6 +200,6 @@ def test_concurrent_hot_switch_with_one_failure_preserves_state_consistency() ->
     status = service.status()
     active_subscriptions = gateway.active_codes()
 
-    assert 1 <= status["stock_count"] <= 33
-    assert len(active_subscriptions) == status["stock_count"]
-    assert {codes[0] for codes in active_subscriptions} == set(status["stocks"])
+    assert 1 <= status.stock_count <= 33
+    assert len(active_subscriptions) == status.stock_count
+    assert {codes[0] for codes in active_subscriptions} == set(status.stocks)

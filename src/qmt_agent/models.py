@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import logging
 import re
 from datetime import datetime
-from typing import Literal, Self, TypeAlias
+from typing import Self
 
 from pydantic import (
     BaseModel,
@@ -14,24 +15,13 @@ from pydantic import (
     model_validator,
 )
 
+from qmt_protocol import DividendType, HistoryMode, XtDataPeriod
+
+logger = logging.getLogger(__name__)
+
 _STOCK_PATTERN = re.compile(r"^[A-Z0-9_]+\.[A-Z0-9_]+$")
 _MARKET_PATTERN = re.compile(r"^[A-Z0-9_]+$")
 _TIME_PATTERN = re.compile(r"^(?:\d{8}|\d{14})?$")
-
-XtDataPeriod: TypeAlias = Literal[
-    "tick",
-    "1m",
-    "5m",
-    "15m",
-    "30m",
-    "1h",
-    "1d",
-    "1w",
-    "1mon",
-    "1q",
-    "1hy",
-    "1y",
-]
 
 
 def _unique_upper(values: list[str], pattern: re.Pattern[str], name: str) -> list[str]:
@@ -44,6 +34,9 @@ def _unique_upper(values: list[str], pattern: re.Pattern[str], name: str) -> lis
         if value not in seen:
             seen.add(value)
             result.append(value)
+        else:
+            # 请求中的重复项不会传给 XtData；明确记录，避免清洗行为不可见。
+            logger.debug("丢弃重复的%s值：原始值=%r，规范值=%s", name, raw_value, value)
     if not result:
         raise ValueError(f"{name}列表不能为空")
     return result
@@ -146,7 +139,7 @@ class HistoryDownloadRequest(StockRequest):
     period: XtDataPeriod = "1d"
     start_time: str = ""
     end_time: str = ""
-    mode: Literal["incremental", "full"] = "incremental"
+    mode: HistoryMode = "incremental"
 
     @field_validator("start_time", "end_time")
     @classmethod
@@ -165,16 +158,27 @@ class HistoryQueryRequest(StockRequest):
     start_time: str = ""
     end_time: str = ""
     count: int = Field(default=-1, ge=-1)
-    dividend_type: Literal[
-        "none", "front", "back", "front_ratio", "back_ratio"
-    ] = "none"
+    dividend_type: DividendType = "none"
     fill_data: bool = True
 
     @field_validator("fields")
     @classmethod
     def normalize_fields(cls, values: list[str]) -> list[str]:
-        # 空字段没有含义；重复字段直接去重，不把负担传给 xtdata。
-        return list(dict.fromkeys(value.strip() for value in values if value.strip()))
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for raw_value in values:
+            value = raw_value.strip()
+            if not value:
+                # 空字段没有含义且不会传给 XtData；按要求留下可追踪的 DEBUG 记录。
+                logger.debug("丢弃历史查询中的空字段名：原始值=%r", raw_value)
+                continue
+            if value in seen:
+                # 重复字段直接去重，避免 XtData 返回重复列。
+                logger.debug("丢弃历史查询中的重复字段名：%s", value)
+                continue
+            seen.add(value)
+            normalized.append(value)
+        return normalized
 
     @field_validator("start_time", "end_time")
     @classmethod

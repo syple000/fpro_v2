@@ -63,9 +63,7 @@ class FakeProcess:
         self.killed = True
 
 
-def test_find_running_instances_excludes_current_process_tree(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_find_running_instances_excludes_current_process_tree(tmp_path: Path, monkeypatch) -> None:
     qmt_bin, _ = make_qmt_files(tmp_path)
     client = cast(
         psutil.Process,
@@ -117,7 +115,8 @@ def test_stop_processes_forces_process_that_does_not_exit(monkeypatch) -> None:
     waits = 0
 
     def wait_procs(
-        processes: Sequence[psutil.Process], timeout: float,
+        processes: Sequence[psutil.Process],
+        timeout: float,
     ) -> tuple[list[psutil.Process], list[psutil.Process]]:
         nonlocal waits
         waits += 1
@@ -159,9 +158,7 @@ def test_prevent_system_sleep_fails_before_starting_when_windows_rejects_request
         pytest.fail("系统调用失败后不应继续启动")
 
 
-def test_prevent_system_sleep_does_not_mask_exit_when_restore_fails(
-    monkeypatch, capsys
-) -> None:
+def test_prevent_system_sleep_does_not_mask_exit_when_restore_fails(monkeypatch, capsys) -> None:
     states: list[int] = []
 
     def fail_on_restore(flags: int) -> None:

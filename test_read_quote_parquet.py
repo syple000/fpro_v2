@@ -21,4 +21,3 @@ if __name__ == "__main__":
         raise SystemExit("用法: python test_read_quote_parquet.py <parquet文件> [行数]")
     result = read_parquet_file(sys.argv[1], int(sys.argv[2]) if len(sys.argv) > 2 else 5)
     print(json.dumps(result, ensure_ascii=False, indent=2))
-

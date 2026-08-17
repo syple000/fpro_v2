@@ -3,11 +3,17 @@ from __future__ import annotations
 import sys
 from threading import Lock
 from types import ModuleType
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
-from qmt_agent.gateway import QmtGatewayError, XtDataGateway
+from qmt_agent.gateway import (
+    MarketQuotePush,
+    QmtGatewayError,
+    StockQuotePush,
+    XtDataGateway,
+)
+from qmt_protocol import HistoryFrame
 
 
 class FakeXtData:
@@ -41,17 +47,27 @@ class FakeXtData:
     def get_local_data(self, **kwargs: Any) -> dict[str, Any]:
         self.method = "get_local_data"
         self.arguments = kwargs
-        return {"close": "data"}
+        return {
+            "000001.SZ": {
+                "index": [20250101],
+                "columns": ["close"],
+                "data": [[10.0]],
+            }
+        }
 
 
-def make_gateway(xtdata: FakeXtData) -> XtDataGateway:
+def make_gateway(xtdata: object) -> XtDataGateway:
     gateway = object.__new__(XtDataGateway)
-    gateway._xtdata = xtdata
+    gateway._xtdata = cast(Any, xtdata)
     gateway._call_lock = Lock()
     return gateway
 
 
-def ignore_quotes(_: dict[str, Any]) -> None:
+def ignore_market_quotes(_: MarketQuotePush) -> None:
+    pass
+
+
+def ignore_stock_quotes(_: StockQuotePush) -> None:
     pass
 
 
@@ -82,7 +98,7 @@ def test_history_is_read_locally_without_implicit_subscription() -> None:
         True,
     )
 
-    assert result == {"close": "data"}
+    assert result == {"000001.SZ": HistoryFrame(index=[20250101], columns=["close"], data=[[10.0]])}
     assert xtdata.arguments["stock_list"] == ["000001.SZ"]
     assert xtdata.arguments["field_list"] == ["close"]
 
@@ -91,27 +107,71 @@ def test_market_subscription_uses_whole_quote() -> None:
     xtdata = FakeXtData()
     gateway = make_gateway(xtdata)
 
-    subscription_id = gateway.subscribe_market_quote("SH", ignore_quotes)
+    subscription_id = gateway.subscribe_market_quote("SH", ignore_market_quotes)
 
     assert subscription_id == 11
     assert xtdata.method == "subscribe_whole_quote"
-    assert xtdata.arguments == {"code_list": ["SH"], "callback": ignore_quotes}
+    assert xtdata.arguments["code_list"] == ["SH"]
+    assert callable(xtdata.arguments["callback"])
 
 
 def test_stock_subscription_uses_period_and_realtime_only_count() -> None:
     xtdata = FakeXtData()
     gateway = make_gateway(xtdata)
 
-    subscription_id = gateway.subscribe_stock_quote("000001.SZ", "1m", ignore_quotes)
+    subscription_id = gateway.subscribe_stock_quote("000001.SZ", "1m", ignore_stock_quotes)
 
     assert subscription_id == 12
     assert xtdata.method == "subscribe_quote"
-    assert xtdata.arguments == {
-        "stock_code": "000001.SZ",
-        "period": "1m",
-        "count": 0,
-        "callback": ignore_quotes,
-    }
+    assert xtdata.arguments["stock_code"] == "000001.SZ"
+    assert xtdata.arguments["period"] == "1m"
+    assert xtdata.arguments["count"] == 0
+    assert callable(xtdata.arguments["callback"])
+
+
+def test_gateway_validates_callback_and_preserves_unknown_quote_fields(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    xtdata = FakeXtData()
+    gateway = make_gateway(xtdata)
+    received: list[MarketQuotePush] = []
+    caplog.set_level("DEBUG", logger="qmt_agent.gateway")
+
+    gateway.subscribe_market_quote("SH", received.append)
+    callback = xtdata.arguments["callback"]
+    assert callable(callback)
+    callback(
+        {
+            "600000.SH": {
+                "time": 1786944183000,
+                "lastPrice": 9.06,
+                "amount": 341471100,
+                "vendorField": {"level": 1},
+            }
+        }
+    )
+
+    quote = received[0]["600000.SH"]
+    assert quote.amount == 341471100.0
+    assert quote.model_dump(exclude_none=True)["vendorField"] == {"level": 1}
+    assert "字段不会丢弃" in caplog.text
+
+
+def test_gateway_logs_raw_callback_when_invalid_data_is_dropped(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    xtdata = FakeXtData()
+    gateway = make_gateway(xtdata)
+    received: list[MarketQuotePush] = []
+    caplog.set_level("DEBUG", logger="qmt_agent.gateway")
+
+    gateway.subscribe_market_quote("SH", received.append)
+    callback = xtdata.arguments["callback"]
+    assert callable(callback)
+    callback({"600000.SH": {"volume": "not-an-int"}})
+
+    assert received == []
+    assert "被丢弃的 XtData 全市场行情原始数据" in caplog.text
 
 
 def test_unsubscribe_and_snapshot_use_official_parameter_names() -> None:
@@ -119,7 +179,7 @@ def test_unsubscribe_and_snapshot_use_official_parameter_names() -> None:
     gateway = make_gateway(xtdata)
 
     result = gateway.get_full_tick(["000001.SZ"])
-    assert result == {"000001.SZ": {"lastPrice": 10.0}}
+    assert result["000001.SZ"].lastPrice == 10.0
     assert xtdata.method == "get_full_tick"
     assert xtdata.arguments == {"code_list": ["000001.SZ"]}
 
@@ -139,7 +199,7 @@ def test_gateway_errors_do_not_expose_subscription_ids() -> None:
     gateway = make_gateway(InvalidSubscriptionXtData())
 
     with pytest.raises(QmtGatewayError) as subscribe_error:
-        gateway.subscribe_stock_quote("000001.SZ", "1m", ignore_quotes)
+        gateway.subscribe_stock_quote("000001.SZ", "1m", ignore_stock_quotes)
     with pytest.raises(QmtGatewayError) as unsubscribe_error:
         gateway.unsubscribe(456)
 
@@ -151,9 +211,7 @@ def test_history_download_uses_official_batch_interface() -> None:
     xtdata = FakeXtData()
     gateway = make_gateway(xtdata)
 
-    gateway.download_history(
-        ["000001.SZ", "600000.SH"], "1d", "20250101", "20251231", False
-    )
+    gateway.download_history(["000001.SZ", "600000.SH"], "1d", "20250101", "20251231", False)
 
     assert xtdata.method == "download_history_data2"
     assert xtdata.arguments == {
@@ -166,7 +224,10 @@ def test_history_download_uses_official_batch_interface() -> None:
 
 
 def test_history_download_supports_legacy_client_without_incremental_argument() -> None:
-    class LegacyXtData(FakeXtData):
+    class LegacyXtData:
+        def __init__(self) -> None:
+            self.arguments: dict[str, Any] = {}
+
         def download_history_data2(
             self,
             stock_list: list[str],

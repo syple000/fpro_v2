@@ -1,45 +1,57 @@
-"""可由 platform 直接调用的 QMT 行情接收组件。"""
+"""qmt-agent 与 qmt-receiver 的共享数据协议。"""
 
-from qmt_protocol import (
+from qmt_protocol.models import (
     BarQuote,
+    DividendType,
+    ErrorResponse,
     HealthResponse,
     HistoryDownloadResponse,
     HistoryFrame,
+    HistoryMode,
     HistoryQueryResponse,
     LatestQuotesResponse,
     MarketSubscriptionResponse,
+    ProtocolModel,
     QuoteEvent,
+    QuotePayload,
+    QuoteSequenceErrorResponse,
     QuoteSequenceResponse,
     QuoteSequenceStatus,
+    QuoteSource,
     SequencedQuote,
     SnapshotResponse,
     StockSubscriptionResponse,
     SubscriptionStatus,
     TickQuote,
+    XtDataPeriod,
+    quote_model_for_period,
+    validate_quote,
 )
-from qmt_receiver.client import QmtAgentClient, QmtAgentError
-from qmt_receiver.receiver import QmtReceiver, ReceiveResult
-from qmt_receiver.storage import QuoteParquetWriter
 
 __all__ = [
     "BarQuote",
+    "DividendType",
+    "ErrorResponse",
     "HealthResponse",
     "HistoryDownloadResponse",
     "HistoryFrame",
+    "HistoryMode",
     "HistoryQueryResponse",
     "LatestQuotesResponse",
     "MarketSubscriptionResponse",
-    "QmtAgentClient",
-    "QmtAgentError",
-    "QmtReceiver",
+    "ProtocolModel",
     "QuoteEvent",
-    "QuoteParquetWriter",
+    "QuotePayload",
+    "QuoteSequenceErrorResponse",
     "QuoteSequenceResponse",
     "QuoteSequenceStatus",
-    "ReceiveResult",
+    "QuoteSource",
     "SequencedQuote",
     "SnapshotResponse",
     "StockSubscriptionResponse",
     "SubscriptionStatus",
     "TickQuote",
+    "XtDataPeriod",
+    "quote_model_for_period",
+    "validate_quote",
 ]

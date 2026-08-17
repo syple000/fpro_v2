@@ -100,6 +100,8 @@ qmt-agent = [
 qmt-receiver = [
     { name = "httpx2" },
     { name = "pyarrow" },
+    { name = "pydantic" },
+    { name = "tzdata" },
 ]
 
 [package.metadata]
@@ -122,6 +124,8 @@ qmt-agent = [
 qmt-receiver = [
     { name = "httpx2", specifier = ">=2.0,<3.0" },
     { name = "pyarrow", specifier = ">=18.0,<24.0" },
+    { name = "pydantic", specifier = ">=2.10,<3.0" },
+    { name = "tzdata", specifier = ">=2025.2" },
 ]
 
 [[package]]

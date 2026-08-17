@@ -23,8 +23,7 @@ def test_concurrent_http_requests_preserve_all_50_subscriptions() -> None:
     gateway = FakeGateway()
     app = create_app(gateway=gateway, settings=Settings())
     batches = [
-        [stock_code(number) for number in range(start, start + 10)]
-        for start in range(0, 50, 10)
+        [stock_code(number) for number in range(start, start + 10)] for start in range(0, 50, 10)
     ]
     barrier = Barrier(len(batches))
 

@@ -1,28 +1,43 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
+from datetime import UTC, date, datetime
 from queue import Queue
-from typing import Any
 
+from qmt_protocol import (
+    QuoteEvent,
+    QuoteSequenceErrorResponse,
+    QuoteSequenceResponse,
+    SequencedQuote,
+    TickQuote,
+)
 from qmt_receiver.client import QuoteSequenceOutOfRange
 from qmt_receiver.receiver import QmtReceiver
 
 
 def out_of_range(requested: int, oldest: int | None, latest: int | None) -> Exception:
     return QuoteSequenceOutOfRange(
-        {
-            "requested_seq": requested,
-            "oldest_seq": oldest,
-            "latest_seq": latest,
-        }
+        QuoteSequenceErrorResponse(
+            detail="行情序号越界",
+            requested_seq=requested,
+            oldest_seq=oldest,
+            latest_seq=latest,
+        )
     )
 
 
 class FakeClient:
-    def __init__(self, responses: list[dict[str, Any] | Exception]) -> None:
+    def __init__(self, responses: list[QuoteSequenceResponse | Exception]) -> None:
         self.responses = responses
         self.requested: list[tuple[int, int, int]] = []
 
-    def quote_sequence(self, seq: int, limit: int, wait_ms: int = 0) -> dict[str, Any]:
+    def quote_sequence(
+        self,
+        seq: int,
+        limit: int = 1_000,
+        stocks: Sequence[str] | None = None,
+        wait_ms: int = 0,
+    ) -> QuoteSequenceResponse:
         self.requested.append((seq, limit, wait_ms))
         response = self.responses.pop(0)
         if isinstance(response, Exception):
@@ -32,46 +47,63 @@ class FakeClient:
 
 class FakeWriter:
     def __init__(self) -> None:
-        self.records: list[dict[str, Any]] = []
+        self.records: list[SequencedQuote] = []
 
-    def append(self, records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def append(self, records: Sequence[SequencedQuote]) -> list[QuoteEvent]:
         self.records.extend(records)
-        return records
+        return [
+            QuoteEvent(
+                trading_date=date(2026, 8, 16),
+                **record.model_dump(mode="python"),
+            )
+            for record in records
+        ]
 
 
-def quote(seq: int) -> dict[str, Any]:
-    return {
-        "seq": seq,
-        "code": "000001.SZ",
-        "period": "tick",
-        "source": "market",
-        "subscription": "SZ",
-        "received_at": "2026-08-16T01:00:00+00:00",
-        "quote": {"lastPrice": 10.0},
-    }
+def quote(seq: int) -> SequencedQuote:
+    return SequencedQuote(
+        seq=seq,
+        code="000001.SZ",
+        period="tick",
+        source="market",
+        subscription="SZ",
+        received_at=datetime(2026, 8, 16, 1, tzinfo=UTC),
+        quote=TickQuote(lastPrice=10.0),
+    )
+
+
+def batch(records: list[SequencedQuote], *, requested: int, next_seq: int) -> QuoteSequenceResponse:
+    latest = max(next_seq - 1, requested)
+    return QuoteSequenceResponse(
+        data=records,
+        count=len(records),
+        requested_seq=requested,
+        next_seq=next_seq,
+        oldest_seq=min(requested, latest),
+        latest_seq=latest,
+    )
 
 
 def test_receive_writes_and_publishes_one_batch() -> None:
-    client = FakeClient([{"data": [quote(1), quote(2)], "next_seq": 3}])
+    records = [quote(1), quote(2)]
+    client = FakeClient([batch(records, requested=1, next_seq=3)])
     writer = FakeWriter()
-    queue: Queue[dict[str, Any]] = Queue()
-    receiver = QmtReceiver(client, writer, timeout_ms=123)  # type: ignore[arg-type]
+    queue: Queue[QuoteEvent] = Queue()
+    receiver = QmtReceiver(client, writer, timeout_ms=123)
 
     result = receiver.receive(queue)
 
     assert result.count == 2
     assert result.next_seq == 3
-    assert writer.records == [quote(1), quote(2)]
-    assert [queue.get_nowait()["seq"], queue.get_nowait()["seq"]] == [1, 2]
+    assert writer.records == records
+    assert [queue.get_nowait().seq, queue.get_nowait().seq] == [1, 2]
     assert client.requested == [(1, 1_000, 123)]
 
 
 def test_receive_returns_empty_after_long_poll_timeout_at_latest() -> None:
     client = FakeClient([out_of_range(11, 1, 10)])
     writer = FakeWriter()
-    receiver = QmtReceiver(  # type: ignore[arg-type]
-        client, writer, start_seq=11, timeout_ms=500
-    )
+    receiver = QmtReceiver(client, writer, start_seq=11, timeout_ms=500)
 
     result = receiver.receive(Queue())
 
@@ -81,17 +113,18 @@ def test_receive_returns_empty_after_long_poll_timeout_at_latest() -> None:
 
 
 def test_outdated_sequence_probes_oldest_minus_one_then_exponential_offsets() -> None:
+    available = batch([quote(122)], requested=122, next_seq=123)
     client = FakeClient(
         [
             out_of_range(1, 100, 199),
             out_of_range(99, 110, 209),
             out_of_range(111, 120, 219),
-            {"data": [quote(122)], "next_seq": 123},
+            available,
         ]
     )
     writer = FakeWriter()
-    queue: Queue[dict[str, Any]] = Queue()
-    receiver = QmtReceiver(client, writer, timeout_ms=1_000)  # type: ignore[arg-type]
+    queue: Queue[QuoteEvent] = Queue()
+    receiver = QmtReceiver(client, writer, timeout_ms=1_000)
 
     result = receiver.receive(queue)
 
@@ -100,4 +133,4 @@ def test_outdated_sequence_probes_oldest_minus_one_then_exponential_offsets() ->
     assert result.probes == 3
     assert result.skipped == 121
     assert result.next_seq == 123
-    assert queue.get_nowait()["seq"] == 122
+    assert queue.get_nowait().seq == 122

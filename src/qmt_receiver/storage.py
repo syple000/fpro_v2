@@ -1,18 +1,21 @@
-"""quote sequence 的按日 Parquet 写入。"""
+"""强类型 quote sequence 的按日 Parquet 写入。"""
 
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping, Sequence
+import logging
+from collections.abc import Sequence
 from datetime import UTC, date, datetime
 from pathlib import Path
-from typing import Any
+from typing import TypedDict
 from zoneinfo import ZoneInfo
 
 import pyarrow as pa
 
 from parquet_store import ParquetStore, TableConfig
+from qmt_protocol import QuoteEvent, QuotePayload, SequencedQuote
 
+logger = logging.getLogger(__name__)
 QUOTE_TABLE = "quotes"
 QUOTE_SCHEMA = pa.schema(
     [
@@ -22,10 +25,21 @@ QUOTE_SCHEMA = pa.schema(
         pa.field("period", pa.string(), nullable=False),
         pa.field("source", pa.string(), nullable=False),
         pa.field("subscription", pa.string(), nullable=False),
-        pa.field("received_at", pa.string(), nullable=False),
+        pa.field("received_at", pa.timestamp("us", tz="UTC"), nullable=False),
         pa.field("quote_json", pa.large_string(), nullable=False),
     ]
 )
+
+
+class _QuoteParquetRow(TypedDict):
+    trading_date: date
+    seq: int
+    code: str
+    period: str
+    source: str
+    subscription: str
+    received_at: datetime
+    quote_json: str
 
 
 class QuoteParquetWriter:
@@ -41,31 +55,43 @@ class QuoteParquetWriter:
             )
         )
 
-    def append(self, records: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
-        rows: list[dict[str, Any]] = []
-        events: list[dict[str, Any]] = []
+    def append(self, records: Sequence[SequencedQuote]) -> list[QuoteEvent]:
+        rows: list[_QuoteParquetRow] = []
+        events: list[QuoteEvent] = []
         for record in records:
-            received_at = str(record["received_at"])
-            quote = record.get("quote")
-            trading_date = _trading_date(quote, received_at, self._timezone)
+            trading_date = _trading_date(record.quote, record.received_at, self._timezone)
+            # quote_json 保存行情模型的全部已知字段和 __pydantic_extra__ 扩展字段；
+            # Parquet 只把固定信封字段单列，不会静默丢弃动态行情字段。
+            quote_data = record.quote.model_dump(mode="json", exclude_none=True)
             rows.append(
                 {
                     "trading_date": trading_date,
-                    "seq": int(record["seq"]),
-                    "code": str(record["code"]),
-                    "period": str(record["period"]),
-                    "source": str(record["source"]),
-                    "subscription": str(record["subscription"]),
-                    "received_at": received_at,
+                    "seq": record.seq,
+                    "code": record.code,
+                    "period": record.period,
+                    "source": record.source,
+                    "subscription": record.subscription,
+                    "received_at": record.received_at.astimezone(UTC),
                     "quote_json": json.dumps(
-                        quote,
+                        quote_data,
                         ensure_ascii=False,
                         allow_nan=False,
                         separators=(",", ":"),
                     ),
                 }
             )
-            events.append({"trading_date": trading_date.isoformat(), **dict(record)})
+            events.append(
+                QuoteEvent(
+                    trading_date=trading_date,
+                    seq=record.seq,
+                    code=record.code,
+                    period=record.period,
+                    source=record.source,
+                    subscription=record.subscription,
+                    received_at=record.received_at,
+                    quote=record.quote,
+                )
+            )
 
         if rows:
             self._store.append(QUOTE_TABLE, pa.Table.from_pylist(rows, schema=QUOTE_SCHEMA))
@@ -82,50 +108,24 @@ class QuoteParquetWriter:
         self.close()
 
 
-def _trading_date(quote: Any, received_at: str, timezone: ZoneInfo) -> date:
-    if isinstance(quote, Mapping):
-        parsed = _parse_quote_time(quote.get("time"), timezone)
+def _trading_date(quote: QuotePayload, received_at: datetime, timezone: ZoneInfo) -> date:
+    if quote.time is not None:
+        parsed = _parse_quote_time(quote.time, timezone)
         if parsed is not None:
             return parsed.date()
+        logger.debug(
+            "行情 time 无法解析，交易日期回退到 received_at：time=%s，received_at=%s",
+            quote.time,
+            received_at,
+        )
+    return received_at.astimezone(timezone).date()
 
+
+def _parse_quote_time(value: int, timezone: ZoneInfo) -> datetime | None:
+    timestamp = float(value)
+    while abs(timestamp) >= 100_000_000_000:
+        timestamp /= 1_000
     try:
-        parsed_received_at = datetime.fromisoformat(received_at.replace("Z", "+00:00"))
-    except ValueError:
-        parsed_received_at = datetime.now(UTC)
-    if parsed_received_at.tzinfo is None:
-        parsed_received_at = parsed_received_at.replace(tzinfo=UTC)
-    return parsed_received_at.astimezone(timezone).date()
-
-
-def _parse_quote_time(value: Any, timezone: ZoneInfo) -> datetime | None:
-    if isinstance(value, bool):
+        return datetime.fromtimestamp(timestamp, UTC).astimezone(timezone)
+    except (OverflowError, OSError, ValueError):
         return None
-    if isinstance(value, (int, float)):
-        timestamp = float(value)
-        while abs(timestamp) >= 100_000_000_000:
-            timestamp /= 1_000
-        try:
-            return datetime.fromtimestamp(timestamp, UTC).astimezone(timezone)
-        except (OverflowError, OSError, ValueError):
-            return None
-    if not isinstance(value, str):
-        return None
-
-    compact = value.strip()
-    if compact.isdigit() and len(compact) not in {8, 14}:
-        try:
-            return _parse_quote_time(float(compact), timezone)
-        except ValueError:
-            return None
-    if len(compact) >= 8 and compact[:8].isdigit():
-        try:
-            return datetime.strptime(compact[:8], "%Y%m%d").replace(tzinfo=timezone)
-        except ValueError:
-            pass
-    try:
-        parsed = datetime.fromisoformat(compact.replace("Z", "+00:00"))
-    except ValueError:
-        return None
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone)
-    return parsed.astimezone(timezone)
