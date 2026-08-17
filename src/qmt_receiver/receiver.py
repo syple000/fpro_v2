@@ -67,7 +67,7 @@ class QmtReceiver:
         return self._next_seq
 
     def receive(self, queue: QuoteQueue) -> ReceiveResult:
-        """读取、按日期落盘并投递一批；连续调用节奏由 platform 决定。"""
+        """读取、写入按日存储缓冲区并投递一批；调用节奏由 platform 决定。"""
         requested_seq = self._next_seq
         probes = 0
         try:

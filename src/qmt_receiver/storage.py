@@ -137,17 +137,14 @@ class QuoteParquetWriter:
                 )
             )
 
-        # 先完成两张 Arrow Table 的构造和 schema 校验，再开始写入任何一张表。
+        # 先完成两张 Arrow Table 的构造和 schema 校验，再写入 ParquetStore 缓冲区。
+        # 是否立即落盘由 store 的缓冲阈值决定，close() 会提交剩余数据。
         tick_table = pa.Table.from_pylist(tick_rows, schema=TICK_SCHEMA) if tick_rows else None
         bar_table = pa.Table.from_pylist(bar_rows, schema=BAR_SCHEMA) if bar_rows else None
         if tick_table is not None:
             self._store.append(TICK_TABLE, tick_table)
         if bar_table is not None:
             self._store.append(BAR_TABLE, bar_table)
-        if tick_table is not None:
-            self._store.flush(TICK_TABLE)
-        if bar_table is not None:
-            self._store.flush(BAR_TABLE)
         return events
 
     def close(self) -> None:

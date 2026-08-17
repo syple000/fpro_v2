@@ -117,20 +117,24 @@ def test_writer_separates_tick_and_bar_with_fixed_schemas(tmp_path: Path) -> Non
 
 
 def test_writer_only_creates_manifest_for_received_quote_kind(tmp_path: Path) -> None:
-    with QuoteParquetWriter(tmp_path) as writer:
-        writer.append(
-            [
-                SequencedQuote(
-                    seq=1,
-                    code="000001.SZ",
-                    period="tick",
-                    source="market",
-                    subscription="SZ",
-                    received_at=datetime(2026, 8, 17, 1, tzinfo=UTC),
-                    quote=TickQuote(lastPrice=10.5),
-                )
-            ]
-        )
+    writer = QuoteParquetWriter(tmp_path)
+    writer.append(
+        [
+            SequencedQuote(
+                seq=1,
+                code="000001.SZ",
+                period="tick",
+                source="market",
+                subscription="SZ",
+                received_at=datetime(2026, 8, 17, 1, tzinfo=UTC),
+                quote=TickQuote(lastPrice=10.5),
+            )
+        ]
+    )
+
+    # append 只需进入 store 缓冲区，小批次不会立即生成 Parquet manifest。
+    assert list((tmp_path / "ticks").rglob("_manifest.json")) == []
+    writer.close()
 
     assert len(list((tmp_path / "ticks").rglob("_manifest.json"))) == 1
     assert list((tmp_path / "bars").rglob("_manifest.json")) == []

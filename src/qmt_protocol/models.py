@@ -349,6 +349,6 @@ class QuoteSequenceErrorResponse(ErrorResponse):
 
 
 class QuoteEvent(SequencedQuote):
-    """qmt-receiver 落盘成功后向 platform 队列投递的结构。"""
+    """qmt-receiver 写入存储缓冲区后向 platform 队列投递的结构。"""
 
     trading_date: date

@@ -5,7 +5,7 @@
 
 1. 调用 qmt-agent 的 quote sequence；
 2. 把 tick 与 bar 分开、按交易日期写入 `parquet_store`；
-3. 写入成功后逐条 `queue.put(event)`。
+3. 进入存储缓冲区后逐条 `queue.put(event)`。
 
 ## Platform 调用
 
@@ -85,7 +85,9 @@ OHLC、金额、结算价、持仓量及复权子字段为 `float64`。完整字
 旧版 `quotes` 表不会被新 writer 继续写入或自动迁移；复用已有数据目录时，可以在确认不再
 需要旧格式后单独归档该目录。
 
-每批都会 `flush`；只有落盘成功后才写入队列和推进 receiver 的内存 `next_seq`。
+`append()` 不会为每个接收批次强制 `flush`。数据进入 `ParquetStore` 缓冲区后即可写入队列并
+推进 receiver 的内存 `next_seq`；达到 store 的行数或内存阈值时自动提交，writer
+`close()` 时会提交全部剩余数据。这样可以避免每个接收批次产生一个小 Parquet 文件。
 
 ## 测试 main
 
