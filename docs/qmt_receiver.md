@@ -31,8 +31,8 @@ with (
 
 如果 `next_seq` 已被环形缓存覆盖，receiver 按接口返回的边界进行试探：先请求
 `oldest_seq - 1` 获取新边界，再从新 `oldest_seq + 1` 开始按 `+2`、`+4`……指数向缓存内部
-移动，最大不超过 `latest_seq`，直到拿到可用批次。正常追到 `latest_seq + 1` 时只视为暂无
-新数据，不会回头重放缓存。
+移动，最大不超过 `latest_seq`，直到拿到可用批次。正常追到 `latest_seq + 1` 时，长轮询
+超时会返回 HTTP 200 的空批次，只视为暂无新数据，不会产生 416 或回头重放缓存。
 
 客户端方法返回 `qmt_protocol` 中定义的 Pydantic 模型，而不是裸字典。receiver 会在 HTTP
 边界严格校验整个响应；字段缺失、类型错误或未知信封字段都会抛出 `QmtAgentError`。

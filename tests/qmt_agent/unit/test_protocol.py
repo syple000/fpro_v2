@@ -104,6 +104,26 @@ def test_sequence_response_rejects_inconsistent_count() -> None:
         )
 
 
+def test_sequence_response_accepts_empty_long_poll_without_advancing_cursor() -> None:
+    empty = QuoteSequenceResponse(
+        data=[],
+        count=0,
+        requested_seq=1,
+        next_seq=1,
+    )
+    caught_up = QuoteSequenceResponse(
+        data=[],
+        count=0,
+        requested_seq=11,
+        next_seq=11,
+        oldest_seq=1,
+        latest_seq=10,
+    )
+
+    assert empty.oldest_seq is None
+    assert caught_up.latest_seq == 10
+
+
 def test_sequence_parses_aware_iso_time_and_rejects_naive_time() -> None:
     common = {
         "seq": 1,

@@ -84,6 +84,17 @@ def batch(records: list[SequencedQuote], *, requested: int, next_seq: int) -> Qu
     )
 
 
+def empty_batch(requested: int, oldest: int | None, latest: int | None) -> QuoteSequenceResponse:
+    return QuoteSequenceResponse(
+        data=[],
+        count=0,
+        requested_seq=requested,
+        next_seq=requested,
+        oldest_seq=oldest,
+        latest_seq=latest,
+    )
+
+
 def test_receive_writes_and_publishes_one_batch() -> None:
     records = [quote(1), quote(2)]
     client = FakeClient([batch(records, requested=1, next_seq=3)])
@@ -101,7 +112,7 @@ def test_receive_writes_and_publishes_one_batch() -> None:
 
 
 def test_receive_returns_empty_after_long_poll_timeout_at_latest() -> None:
-    client = FakeClient([out_of_range(11, 1, 10)])
+    client = FakeClient([empty_batch(11, 1, 10)])
     writer = FakeWriter()
     receiver = QmtReceiver(client, writer, start_seq=11, timeout_ms=500)
 

@@ -296,16 +296,24 @@ class QuoteSequenceResponse(ProtocolModel):
     count: int = Field(ge=0)
     requested_seq: int = Field(ge=1)
     next_seq: int = Field(ge=1)
-    oldest_seq: int = Field(ge=1)
-    latest_seq: int = Field(ge=1)
+    oldest_seq: int | None = Field(default=None, ge=1)
+    latest_seq: int | None = Field(default=None, ge=1)
 
     @model_validator(mode="after")
     def validate_window(self) -> QuoteSequenceResponse:
         if self.count != len(self.data):
             raise ValueError("顺序行情 count 与 data 数量不一致")
-        if self.next_seq <= self.requested_seq:
-            raise ValueError("顺序行情 next_seq 必须晚于 requested_seq")
-        if self.oldest_seq > self.latest_seq:
+        if self.next_seq < self.requested_seq:
+            raise ValueError("顺序行情 next_seq 不能早于 requested_seq")
+        if self.next_seq == self.requested_seq and self.count:
+            raise ValueError("未推进的顺序行情必须是空批次")
+        if (self.oldest_seq is None) != (self.latest_seq is None):
+            raise ValueError("顺序行情边界不一致")
+        if (
+            self.oldest_seq is not None
+            and self.latest_seq is not None
+            and self.oldest_seq > self.latest_seq
+        ):
             raise ValueError("顺序行情边界不一致")
         return self
 

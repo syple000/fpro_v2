@@ -244,12 +244,14 @@ Content-Type: application/json
 ```
 
 调用方下一次应使用响应的 `next_seq`。如果请求序号小于 `oldest_seq`（数据已被循环缓存
-覆盖），或大于 `latest_seq`（数据尚未到达），接口返回 HTTP 416，并在响应中明确给出
-`requested_seq`、`oldest_seq` 和 `latest_seq`。缓存尚无数据时，最旧和最新序号均为 `null`。
+覆盖），或大于下一待分配序号 `next_seq`（跳过合法游标请求未来数据），接口返回 HTTP
+416，并在响应中明确给出 `requested_seq`、`oldest_seq` 和 `latest_seq`。
 
 `wait_ms` 默认 0，范围为 0 到 30000。当请求的正好是下一条待到达序号时，服务最多等待
-该时长；数据一到即返回，超时仍返回 HTTP 416。该参数让实时接收方无需固定间隔轮询，
-同时避免空闲时忙循环。
+该时长；数据一到即返回，超时返回 HTTP 200 的空批次：`data=[]`、`count=0`，且
+`next_seq` 与 `requested_seq` 相同。缓存尚无数据时，从 `seq=1` 开始使用相同语义，响应会
+省略为空的 `oldest_seq`、`latest_seq`。该参数让实时接收方无需固定间隔轮询，同时避免
+空闲时忙循环和重复 416 日志。
 
 `GET /v1/subscriptions` 和 `GET /health` 的 `quote_sequence` 字段会返回当前
 `oldest_seq`、`latest_seq`、下一待分配序号 `next_seq`、`size` 和 `capacity`，上游可据此

@@ -50,8 +50,11 @@ def test_buffer_overwrites_only_oldest_records_and_reports_boundaries() -> None:
     assert buffer.status().oldest_seq == 3
     with pytest.raises(QuoteSequenceOutOfRangeError) as too_old:
         buffer.read(2, 1)
+    caught_up = buffer.read(6, 1)
     with pytest.raises(QuoteSequenceOutOfRangeError) as too_new:
-        buffer.read(6, 1)
+        buffer.read(7, 1)
+    assert caught_up.count == 0
+    assert caught_up.next_seq == 6
     assert (too_old.value.oldest_seq, too_old.value.latest_seq) == (3, 5)
     assert (too_new.value.oldest_seq, too_new.value.latest_seq) == (3, 5)
 
@@ -93,3 +96,28 @@ def test_buffer_long_poll_wakes_when_requested_sequence_arrives() -> None:
 
     assert not reader.is_alive()
     assert [item.seq for item in result[0].data] == [1]
+
+
+def test_empty_buffer_and_caught_up_timeout_return_successful_empty_batch() -> None:
+    buffer = QuoteSequenceBuffer(capacity=2)
+
+    empty = buffer.read(1, 1, wait_ms=1)
+    append_values(buffer, 7)
+    caught_up = buffer.read(2, 1, wait_ms=1)
+
+    assert empty.model_dump() == {
+        "data": [],
+        "count": 0,
+        "requested_seq": 1,
+        "next_seq": 1,
+        "oldest_seq": None,
+        "latest_seq": None,
+    }
+    assert caught_up.model_dump() == {
+        "data": [],
+        "count": 0,
+        "requested_seq": 2,
+        "next_seq": 2,
+        "oldest_seq": 1,
+        "latest_seq": 1,
+    }

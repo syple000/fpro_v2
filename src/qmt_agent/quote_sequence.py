@@ -105,6 +105,15 @@ class QuoteSequenceBuffer:
                 self._changed.wait(remaining)
 
             oldest_seq, latest_seq = self._bounds_unlocked()
+            if seq == self._next_seq:
+                return QuoteSequenceResponse(
+                    data=[],
+                    count=0,
+                    requested_seq=seq,
+                    next_seq=seq,
+                    oldest_seq=oldest_seq,
+                    latest_seq=latest_seq,
+                )
             if oldest_seq is None or latest_seq is None or seq < oldest_seq or seq > latest_seq:
                 raise QuoteSequenceOutOfRangeError(seq, oldest_seq, latest_seq)
 

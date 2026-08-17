@@ -174,9 +174,12 @@ def test_quote_sequence_ring_reports_oldest_and_latest_boundaries() -> None:
     assert [item.quote.model_dump()["value"] for item in result.data] == [3, 4, 5]
     with pytest.raises(QuoteSequenceOutOfRangeError) as too_old:
         service.get_subscribed_quote_sequence(2, 10)
+    caught_up = service.get_subscribed_quote_sequence(6, 10)
     with pytest.raises(QuoteSequenceOutOfRangeError) as too_new:
-        service.get_subscribed_quote_sequence(6, 10)
+        service.get_subscribed_quote_sequence(7, 10)
 
+    assert caught_up.count == 0
+    assert caught_up.next_seq == 6
     assert (too_old.value.oldest_seq, too_old.value.latest_seq) == (3, 5)
     assert "过旧" in str(too_old.value)
     assert (too_new.value.oldest_seq, too_new.value.latest_seq) == (3, 5)

@@ -171,11 +171,14 @@ XtData object
 | `received_at` | 有时区的 `datetime`；JSON 为 ISO 8601 字符串 |
 | `quote` | 按 `period` 确定的 `TickQuote | BarQuote` |
 
-`QuoteSequenceResponse`：`data: list[SequencedQuote]`、`count`、`requested_seq`、
-`next_seq`、`oldest_seq`、`latest_seq` 均为 `int`。模型校验数量和序号边界。
+`QuoteSequenceResponse`：`data: list[SequencedQuote]`，`count`、`requested_seq`、
+`next_seq` 为 `int`，`oldest_seq`、`latest_seq` 为 `int | None`。模型校验数量和序号边界。
+长轮询在合法的下一游标处超时时返回成功空批次，此时 `next_seq == requested_seq`；空缓存的
+两个边界为空，已有数据但已追到最新时仍返回当前边界。
 
-HTTP 416 使用 `QuoteSequenceErrorResponse`：`detail: str`，以及可为空的
-`requested_seq`、`oldest_seq`、`latest_seq`。
+只有请求序号已被覆盖或越过下一合法游标时才返回 HTTP 416，使用
+`QuoteSequenceErrorResponse`：`detail: str`，以及可为空的 `requested_seq`、`oldest_seq`、
+`latest_seq`。
 
 ### 历史行情
 

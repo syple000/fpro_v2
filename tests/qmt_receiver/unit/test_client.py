@@ -147,6 +147,32 @@ def test_client_preserves_sequence_bounds_on_416() -> None:
     http_client.close()
 
 
+def test_client_accepts_successful_empty_sequence_without_bounds() -> None:
+    def handler(_: httpx2.Request) -> httpx2.Response:
+        return httpx2.Response(
+            200,
+            json={
+                "data": [],
+                "count": 0,
+                "requested_seq": 1,
+                "next_seq": 1,
+            },
+        )
+
+    http_client = httpx2.Client(
+        transport=httpx2.MockTransport(handler), base_url="http://qmt-agent"
+    )
+    client = QmtAgentClient(client=http_client)
+
+    result = client.quote_sequence(1, wait_ms=30_000)
+
+    assert result.count == 0
+    assert result.next_seq == 1
+    assert result.oldest_seq is None
+    assert result.latest_seq is None
+    http_client.close()
+
+
 def test_client_rejects_unknown_top_level_fields_instead_of_dropping_them() -> None:
     def handler(_: httpx2.Request) -> httpx2.Response:
         return httpx2.Response(200, json={**STATUS, "unexpected": 1})

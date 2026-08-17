@@ -205,9 +205,13 @@ def test_sequenced_quote_api_preserves_all_rows_and_reports_range_errors() -> No
             "/v1/quotes/subscribed/sequence",
             json={"seq": 1},
         )
-        too_new = client.post(
+        caught_up = client.post(
             "/v1/quotes/subscribed/sequence",
             json={"seq": 4},
+        )
+        too_new = client.post(
+            "/v1/quotes/subscribed/sequence",
+            json={"seq": 5},
         )
         status = client.get("/v1/subscriptions")
 
@@ -220,6 +224,15 @@ def test_sequenced_quote_api_preserves_all_rows_and_reports_range_errors() -> No
     assert too_old.status_code == 416
     assert too_old.json()["requested_seq"] == 1
     assert (too_old.json()["oldest_seq"], too_old.json()["latest_seq"]) == (2, 3)
+    assert caught_up.status_code == 200
+    assert caught_up.json() == {
+        "data": [],
+        "count": 0,
+        "requested_seq": 4,
+        "next_seq": 4,
+        "oldest_seq": 2,
+        "latest_seq": 3,
+    }
     assert too_new.status_code == 416
     assert (too_new.json()["oldest_seq"], too_new.json()["latest_seq"]) == (2, 3)
     assert status.json()["quote_sequence"] == {
@@ -229,6 +242,29 @@ def test_sequenced_quote_api_preserves_all_rows_and_reports_range_errors() -> No
         "size": 2,
         "capacity": 2,
     }
+
+
+def test_empty_sequence_long_poll_returns_200_without_advancing_cursor() -> None:
+    with make_client() as client:
+        first = client.post(
+            "/v1/quotes/subscribed/sequence",
+            json={"seq": 1, "wait_ms": 1},
+        )
+        second = client.post(
+            "/v1/quotes/subscribed/sequence",
+            json={"seq": 1, "wait_ms": 1},
+        )
+
+    expected = {
+        "data": [],
+        "count": 0,
+        "requested_seq": 1,
+        "next_seq": 1,
+    }
+    assert first.status_code == 200
+    assert first.json() == expected
+    assert second.status_code == 200
+    assert second.json() == expected
 
 
 def test_market_and_stock_quote_endpoints_return_separate_caches() -> None:
