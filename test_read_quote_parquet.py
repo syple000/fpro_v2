@@ -10,9 +10,6 @@ import pyarrow.parquet as pq
 def read_parquet_file(path: str | Path, limit: int = 5) -> list[dict]:
     table = pq.ParquetFile(path).read().slice(0, limit)
     rows = table.to_pylist()
-    for row in rows:
-        row["trading_date"] = row["trading_date"].isoformat()
-        row["quote"] = json.loads(row.pop("quote_json"))
     return rows
 
 

@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import math
+from datetime import UTC, datetime, timedelta, timezone
 
 import numpy as np
 import pandas as pd
+import pytest
 
+from fpro_common import datetime_to_utc_us
 from qmt_agent.serialization import to_jsonable
 
 
@@ -53,3 +56,20 @@ def test_numpy_and_dataframe_are_json_safe() -> None:
         },
         "volume": [1, 2],
     }
+
+
+def test_datetime_boundary_is_normalised_to_microseconds_and_naive_is_rejected() -> None:
+    local_time = datetime(
+        2026,
+        8,
+        18,
+        9,
+        30,
+        tzinfo=timezone(timedelta(hours=8)),
+    )
+
+    expected = datetime_to_utc_us(local_time)
+    assert to_jsonable(local_time) == expected
+    assert to_jsonable(local_time.astimezone(UTC)) == expected
+    with pytest.raises(ValueError, match="必须包含时区"):
+        to_jsonable(datetime(2026, 8, 18, 1, 30))

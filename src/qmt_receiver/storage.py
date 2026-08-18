@@ -5,15 +5,16 @@ from __future__ import annotations
 import json
 import logging
 from collections.abc import Sequence
-from datetime import UTC, date, datetime
+from datetime import date
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
 import pyarrow as pa
 
+from fpro_common import utc_us_to_datetime
 from parquet_store import ParquetStore, TableConfig
-from qmt_protocol import BarQuote, QuoteEvent, QuotePayload, SequencedQuote, TickQuote
+from qmt_protocol import BarQuote, QuoteEvent, SequencedQuote, TickQuote
 
 logger = logging.getLogger(__name__)
 
@@ -27,7 +28,8 @@ _ENVELOPE_FIELDS = (
     pa.field("period", pa.string(), nullable=False),
     pa.field("source", pa.string(), nullable=False),
     pa.field("subscription", pa.string(), nullable=False),
-    pa.field("received_at", pa.timestamp("us", tz="UTC"), nullable=False),
+    pa.field("received_at", pa.int64(), nullable=False),
+    pa.field("event_at", pa.int64()),
 )
 
 _TICK_QUOTE_FIELDS = (
@@ -113,7 +115,7 @@ class QuoteParquetWriter:
         events: list[QuoteEvent] = []
 
         for record in records:
-            trading_date = _trading_date(record.quote, record.received_at, self._timezone)
+            trading_date = _trading_date(record.event_at, record.received_at, self._timezone)
             common = _envelope_row(record, trading_date)
             if record.period == "tick":
                 if not isinstance(record.quote, TickQuote):
@@ -133,6 +135,7 @@ class QuoteParquetWriter:
                     source=record.source,
                     subscription=record.subscription,
                     received_at=record.received_at,
+                    event_at=record.event_at,
                     quote=record.quote,
                 )
             )
@@ -165,7 +168,8 @@ def _envelope_row(record: SequencedQuote, trading_date: date) -> dict[str, Any]:
         "period": record.period,
         "source": record.source,
         "subscription": record.subscription,
-        "received_at": record.received_at.astimezone(UTC),
+        "received_at": record.received_at,
+        "event_at": record.event_at,
     }
 
 
@@ -193,24 +197,15 @@ def _extra_json(quote: TickQuote | BarQuote) -> str | None:
     )
 
 
-def _trading_date(quote: QuotePayload, received_at: datetime, timezone: ZoneInfo) -> date:
-    if quote.time is not None:
-        parsed = _parse_quote_time(quote.time, timezone)
-        if parsed is not None:
-            return parsed.date()
-        logger.debug(
-            "行情 time 无法解析，交易日期回退到 received_at：time=%s，received_at=%s",
-            quote.time,
-            received_at,
-        )
-    return received_at.astimezone(timezone).date()
-
-
-def _parse_quote_time(value: int, timezone: ZoneInfo) -> datetime | None:
-    timestamp = float(value)
-    while abs(timestamp) >= 100_000_000_000:
-        timestamp /= 1_000
-    try:
-        return datetime.fromtimestamp(timestamp, UTC).astimezone(timezone)
-    except (OverflowError, OSError, ValueError):
-        return None
+def _trading_date(
+    event_at: int | None,
+    received_at: int,
+    timezone: ZoneInfo,
+) -> date:
+    if event_at is not None:
+        return utc_us_to_datetime(event_at).astimezone(timezone).date()
+    logger.debug(
+        "行情缺少可解析的 event_at，交易日期回退到 received_at：received_at=%s",
+        received_at,
+    )
+    return utc_us_to_datetime(received_at).astimezone(timezone).date()

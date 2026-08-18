@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
-from datetime import datetime
 from threading import Condition, Lock
 from time import monotonic
 
@@ -64,7 +63,7 @@ class QuoteSequenceBuffer:
         source: QuoteSource,
         subscription: str,
         period: XtDataPeriod,
-        received_at: datetime,
+        received_at: int,
     ) -> None:
         with self._changed:
             for code, quote in items:

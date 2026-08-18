@@ -23,8 +23,16 @@ qmt-receiver = [
     "pyarrow>=18.0,<24.0",
     "tzdata>=2025.2",
 ]
+tushare-data = [
+    "pandas>=2.2,<3.0",
+    "pyarrow>=18.0,<24.0",
+    "tushare>=1.4,<2.0",
+    "tzdata>=2025.2",
+]
 dev = [
     "httpx2>=2.0,<3.0",
+    "pandas>=2.2,<3.0",
+    "pyright>=1.1,<2.0",
     "pyarrow-stubs==20.0.0.20260625",
     "pytest>=8.3,<9.0",
     "ruff>=0.9,<1.0",
@@ -37,13 +45,21 @@ qmt-agent = { requires-python = ">=3.11,<3.12" }
 qmt-agent = "qmt_agent.__main__:main"
 qmt-agent-start = "qmt_agent.windows_launcher:main"
 qmt-receiver-test = "qmt_receiver.test_main:main"
+tushare-data-test = "tushare_data.test_main:main"
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/parquet_store", "src/qmt_agent", "src/qmt_protocol", "src/qmt_receiver"]
+packages = [
+    "src/fpro_common",
+    "src/parquet_store",
+    "src/qmt_agent",
+    "src/qmt_protocol",
+    "src/qmt_receiver",
+    "src/tushare_data",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

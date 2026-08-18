@@ -5,7 +5,6 @@ from __future__ import annotations
 import logging
 from collections.abc import Iterable
 from dataclasses import dataclass
-from datetime import datetime
 from functools import partial
 from threading import Lock
 from uuid import uuid4
@@ -79,9 +78,9 @@ class QmtMarketService:
         self._market_quote_lock = Lock()
         self._stock_quote_lock = Lock()
         self._market_quotes: dict[str, TickQuote] = {}
-        self._market_quote_updated_at: dict[str, datetime] = {}
+        self._market_quote_updated_at: dict[str, int] = {}
         self._stock_quotes: dict[str, QuotePayload] = {}
-        self._stock_quote_updated_at: dict[str, datetime] = {}
+        self._stock_quote_updated_at: dict[str, int] = {}
         self._quote_sequence = QuoteSequenceBuffer(quote_buffer_capacity)
 
     def subscribe_markets(self, markets: Iterable[str]) -> MarketSubscriptionResponse:
@@ -429,7 +428,7 @@ class QmtMarketService:
     def _on_market_quotes(
         self,
         quotes: MarketQuotePush,
-        received_at: datetime,
+        received_at: int,
         *,
         market: str,
     ) -> None:
@@ -459,7 +458,7 @@ class QmtMarketService:
     def _on_stock_quotes(
         self,
         quotes: StockQuotePush,
-        received_at: datetime,
+        received_at: int,
         *,
         stock: str,
         period: XtDataPeriod,

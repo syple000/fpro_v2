@@ -225,7 +225,8 @@ Content-Type: application/json
       "period": "1m",
       "source": "stock",
       "subscription": "000001.SZ",
-      "received_at": "2026-08-16T01:02:03+00:00",
+      "received_at": 1786842123000000,
+      "event_at": 1786842120000000,
       "quote": {"close": 10.2}
     }
   ],
@@ -236,6 +237,9 @@ Content-Type: application/json
   "latest_seq": 1350
 }
 ```
+
+`received_at`、`event_at` 以及响应行情中的 `quote.time` 均为 Unix Epoch 微秒 `int64`；
+HTTP/JSON 不传 ISO 时间字符串。
 
 可选的 `stocks` 只筛选当前序号窗口中的返回项，不改变全局序号，也不改变窗口推进规则：
 

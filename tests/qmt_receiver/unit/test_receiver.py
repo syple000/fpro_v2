@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from datetime import UTC, date, datetime
+from datetime import date
 from queue import Queue
 
 from qmt_protocol import (
@@ -67,7 +67,7 @@ def quote(seq: int) -> SequencedQuote:
         period="tick",
         source="market",
         subscription="SZ",
-        received_at=datetime(2026, 8, 16, 1, tzinfo=UTC),
+        received_at=1_786_842_000_000_000,
         quote=TickQuote(lastPrice=10.0),
     )
 

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 import re
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Self
 
 from pydantic import (
@@ -15,6 +15,7 @@ from pydantic import (
     model_validator,
 )
 
+from fpro_common import datetime_to_utc_us
 from qmt_protocol import DividendType, HistoryMode, XtDataPeriod
 
 logger = logging.getLogger(__name__)
@@ -22,6 +23,7 @@ logger = logging.getLogger(__name__)
 _STOCK_PATTERN = re.compile(r"^[A-Z0-9_]+\.[A-Z0-9_]+$")
 _MARKET_PATTERN = re.compile(r"^[A-Z0-9_]+$")
 _TIME_PATTERN = re.compile(r"^(?:\d{8}|\d{14})?$")
+_QMT_TIMEZONE = timezone(timedelta(hours=8), name="Asia/Shanghai")
 
 
 def _unique_upper(values: list[str], pattern: re.Pattern[str], name: str) -> list[str]:
@@ -48,24 +50,24 @@ def _validate_xt_time(value: str) -> str:
     if not value:
         return value
 
-    time_format = "%Y%m%d" if len(value) == 8 else "%Y%m%d%H%M%S"
     try:
-        datetime.strptime(value, time_format)
+        _time_boundary(value, end_of_day=False)
     except ValueError as exc:
         raise ValueError(f"时间不是有效日期或时刻：{value}") from exc
     return value
 
 
-def _time_boundary(value: str, *, end_of_day: bool) -> datetime | None:
+def _time_boundary(value: str, *, end_of_day: bool) -> int | None:
     if not value:
         return None
     if len(value) == 14:
-        return datetime.strptime(value, "%Y%m%d%H%M%S")
+        local_time = datetime.strptime(value, "%Y%m%d%H%M%S").replace(tzinfo=_QMT_TIMEZONE)
+        return datetime_to_utc_us(local_time)
 
     parsed = datetime.strptime(value, "%Y%m%d")
     if end_of_day:
-        return parsed.replace(hour=23, minute=59, second=59)
-    return parsed
+        parsed = parsed.replace(hour=23, minute=59, second=59)
+    return datetime_to_utc_us(parsed.replace(tzinfo=_QMT_TIMEZONE))
 
 
 def _validate_time_range(start_time: str, end_time: str) -> None:

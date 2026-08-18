@@ -10,6 +10,7 @@ from queue import Empty, Queue
 from time import monotonic
 from typing import TypeVar
 
+from fpro_common import configure_beijing_logging
 from qmt_protocol import ProtocolModel, QuoteEvent
 from qmt_receiver import QmtAgentClient, QmtReceiver, QuoteParquetWriter
 
@@ -154,7 +155,7 @@ def main() -> None:
     parser.add_argument("--timeout-ms", type=int, default=30_000)
     parser.add_argument("--once", action="store_true")
     args = parser.parse_args()
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    configure_beijing_logging(logging.INFO)
     try:
         run(args.url, args.data_dir, args.once, args.timeout_ms)
     except KeyboardInterrupt:

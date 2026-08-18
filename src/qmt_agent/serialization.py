@@ -11,6 +11,8 @@ from typing import Any
 
 from pydantic import JsonValue
 
+from fpro_common import datetime_to_utc_us
+
 logger = logging.getLogger(__name__)
 
 
@@ -46,7 +48,9 @@ def to_jsonable(value: object) -> JsonValue:
             # 非法字节会替换为 U+FFFD，这部分原始字节信息会丢失，必须留下记录。
             logger.debug("bytes 不是有效 UTF-8，序列化时替换无法解码的字节：%r", value)
             return value.decode("utf-8", errors="replace")
-    if isinstance(value, (datetime, date)):
+    if isinstance(value, datetime):
+        return datetime_to_utc_us(value)
+    if isinstance(value, date):
         return value.isoformat()
     if is_dataclass(value) and not isinstance(value, type):
         return to_jsonable(asdict(value))

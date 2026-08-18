@@ -4,14 +4,15 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable
-from datetime import UTC, datetime
 from threading import Lock
 from typing import Generic, Literal, TypeVar
+
+from fpro_common import utc_now_us
 
 logger = logging.getLogger(__name__)
 
 QuotePush = TypeVar("QuotePush")
-QuoteHandler = Callable[[QuotePush, datetime], None]
+QuoteHandler = Callable[[QuotePush, int], None]
 
 
 class QuoteCallbackGate(Generic[QuotePush]):
@@ -21,10 +22,10 @@ class QuoteCallbackGate(Generic[QuotePush]):
         self._handler = handler
         self._lock = Lock()
         self._state: Literal["pending", "active", "closed"] = "pending"
-        self._pending: list[tuple[QuotePush, datetime]] = []
+        self._pending: list[tuple[QuotePush, int]] = []
 
     def __call__(self, quotes: QuotePush) -> None:
-        received_at = datetime.now(UTC)
+        received_at = utc_now_us()
         with self._lock:
             if self._state == "closed":
                 # 反订阅后到达的延迟回调必须丢弃；留下 DEBUG 记录便于核对竞态。
@@ -60,7 +61,7 @@ class QuoteCallbackGate(Generic[QuotePush]):
             self._state = "closed"
             self._pending.clear()
 
-    def _deliver(self, quotes: QuotePush, received_at: datetime) -> None:
+    def _deliver(self, quotes: QuotePush, received_at: int) -> None:
         try:
             self._handler(quotes, received_at)
         except Exception:

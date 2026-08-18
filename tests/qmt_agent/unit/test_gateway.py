@@ -20,6 +20,13 @@ class FakeXtData:
     def __init__(self) -> None:
         self.arguments: dict[str, Any] = {}
         self.method: str | None = None
+        self.history: dict[str, Any] = {
+            "000001.SZ": {
+                "index": [20250101],
+                "columns": ["close"],
+                "data": [[10.0]],
+            }
+        }
 
     def subscribe_whole_quote(self, **kwargs: Any) -> int:
         self.method = "subscribe_whole_quote"
@@ -47,13 +54,7 @@ class FakeXtData:
     def get_local_data(self, **kwargs: Any) -> dict[str, Any]:
         self.method = "get_local_data"
         self.arguments = kwargs
-        return {
-            "000001.SZ": {
-                "index": [20250101],
-                "columns": ["close"],
-                "data": [[10.0]],
-            }
-        }
+        return self.history
 
 
 def make_gateway(xtdata: object) -> XtDataGateway:
@@ -101,6 +102,31 @@ def test_history_is_read_locally_without_implicit_subscription() -> None:
     assert result == {"000001.SZ": HistoryFrame(index=[20250101], columns=["close"], data=[[10.0]])}
     assert xtdata.arguments["stock_list"] == ["000001.SZ"]
     assert xtdata.arguments["field_list"] == ["close"]
+
+
+def test_history_time_column_is_normalised_to_microseconds() -> None:
+    xtdata = FakeXtData()
+    xtdata.history = {
+        "000001.SZ": {
+            "index": [20250101],
+            "columns": ["time", "close"],
+            "data": [[1_735_689_600_000, 10.0]],
+        }
+    }
+    gateway = make_gateway(xtdata)
+
+    result = gateway.get_history(
+        ["000001.SZ"],
+        ["time", "close"],
+        "1d",
+        "20250101",
+        "20251231",
+        -1,
+        "none",
+        True,
+    )
+
+    assert result["000001.SZ"].data == [[1_735_689_600_000_000, 10.0]]
 
 
 def test_market_subscription_uses_whole_quote() -> None:

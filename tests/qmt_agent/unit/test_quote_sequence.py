@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
 from threading import Thread
 
 import pytest
@@ -18,7 +17,7 @@ def append_values(buffer: QuoteSequenceBuffer, *values: int) -> None:
         source="stock",
         subscription="000001.SZ",
         period="tick",
-        received_at=datetime(2026, 8, 16, tzinfo=UTC),
+        received_at=1_786_838_400_000_000,
     )
 
 

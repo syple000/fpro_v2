@@ -245,7 +245,7 @@ def _successful_payload(response: httpx2.Response, model: type[ResponseModel]) -
 
 def _decode_response(response: httpx2.Response, model: type[ResponseModel]) -> ResponseModel:
     try:
-        # 直接从 JSON 字节校验，strict 模式仍可按 JSON 标准解析 datetime/date。
+        # 直接从 JSON 字节校验；业务时刻按协议保持 int64 微秒整数。
         return model.model_validate_json(response.content)
     except ValidationError as exc:
         extra_paths = [

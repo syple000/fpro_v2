@@ -8,7 +8,7 @@ from numbers import Integral
 from threading import Lock
 from typing import Protocol, TypeAlias, cast
 
-from pydantic import ValidationError
+from pydantic import JsonValue, ValidationError
 
 from qmt_agent.serialization import to_jsonable
 from qmt_protocol import (
@@ -20,6 +20,7 @@ from qmt_protocol import (
     TickQuote,
     XtDataPeriod,
     quote_model_for_period,
+    unix_timestamp_to_utc_us,
 )
 
 logger = logging.getLogger(__name__)
@@ -256,7 +257,11 @@ class XtDataGateway:
                     fill_data=fill_data,
                 )
             json_data = to_jsonable({} if raw is None else raw)
-            return HistoryQueryResponse.model_validate({"data": json_data}).data
+            frames = HistoryQueryResponse.model_validate({"data": json_data}).data
+            return {
+                code: _normalise_history_time(frame, code)
+                for code, frame in frames.items()
+            }
         except ValidationError as exc:
             logger.debug("被拒绝的 XtData 历史行情原始数据：%r", raw)
             raise QmtGatewayError(f"历史行情返回结构不合法：{exc}") from exc
@@ -264,6 +269,28 @@ class XtDataGateway:
             raise
         except Exception as exc:
             raise QmtGatewayError(f"读取历史行情失败：{exc}") from exc
+
+
+def _normalise_history_time(frame: HistoryFrame, code: str) -> HistoryFrame:
+    """把历史 DataFrame 中明确名为 time 的 XtData 时间列统一成微秒。"""
+    try:
+        time_index = frame.columns.index("time")
+    except ValueError:
+        return frame
+
+    rows: list[list[JsonValue]] = []
+    for row_index, source_row in enumerate(frame.data):
+        row = list(source_row)
+        value = row[time_index]
+        if value is not None:
+            converted = unix_timestamp_to_utc_us(value)
+            if converted is None:
+                raise QmtGatewayError(
+                    f"{code} 历史行情第 {row_index} 行 time 不是有效整数时间戳"
+                )
+            row[time_index] = converted
+        rows.append(row)
+    return frame.model_copy(update={"data": rows})
 
 
 def _subscription_id(value: object, message: str) -> int:

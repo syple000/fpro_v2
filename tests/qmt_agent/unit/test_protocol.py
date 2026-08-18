@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
-
 import pytest
 from pydantic import ValidationError
 
@@ -45,6 +43,7 @@ def test_tick_model_matches_real_xtdata_snapshot_and_callback_types() -> None:
     )
 
     assert quote.amount == 687998800.0
+    assert quote.time == 1_786_944_183_000_000
     assert quote.settlementPrice == 0.0
     assert quote.askPrice == [11.09, 11.1]
 
@@ -69,6 +68,7 @@ def test_bar_model_covers_real_callback_extensions_and_both_settlement_spellings
         }
     )
 
+    assert quote.time == 1_786_944_300_000_000
     assert quote.openInterest == 13.0
     assert quote.settelementPrice == quote.settlementPrice == 0.0
 
@@ -80,7 +80,7 @@ def test_sequence_selects_quote_model_from_period_without_guessing() -> None:
         period="1m",
         source="stock",
         subscription="000001.SZ",
-        received_at=datetime(2026, 8, 17, tzinfo=UTC),
+        received_at=1_786_838_400_000_000,
         quote=BarQuote(close=11.08),
     )
 
@@ -124,7 +124,7 @@ def test_sequence_response_accepts_empty_long_poll_without_advancing_cursor() ->
     assert caught_up.latest_seq == 10
 
 
-def test_sequence_parses_aware_iso_time_and_rejects_naive_time() -> None:
+def test_sequence_accepts_only_int64_microseconds() -> None:
     common = {
         "seq": 1,
         "code": "000001.SZ",
@@ -135,9 +135,21 @@ def test_sequence_parses_aware_iso_time_and_rejects_naive_time() -> None:
     }
 
     parsed = SequencedQuote.model_validate(
-        {**common, "received_at": "2026-08-17T05:51:05.934481+00:00"}
+        {
+            **common,
+            "received_at": 1_786_923_065_934_481,
+            "quote": TickQuote(time=1_786_944_183_000, lastPrice=10.0),
+        }
     )
-    assert parsed.received_at.tzinfo is not None
+    assert parsed.received_at == 1_786_923_065_934_481
+    assert parsed.quote.time == 1_786_944_183_000_000
+    assert parsed.event_at == 1_786_944_183_000_000
 
-    with pytest.raises(ValidationError, match="必须包含时区"):
-        SequencedQuote.model_validate({**common, "received_at": "2026-08-17T05:51:05"})
+    for invalid in (
+        "2026-08-17T05:51:05+00:00",
+        1.0,
+        True,
+        2**63,
+    ):
+        with pytest.raises(ValidationError, match="Unix Epoch 微秒整数|int64"):
+            SequencedQuote.model_validate({**common, "received_at": invalid})

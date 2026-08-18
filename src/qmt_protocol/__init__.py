@@ -25,6 +25,7 @@ from qmt_protocol.models import (
     TickQuote,
     XtDataPeriod,
     quote_model_for_period,
+    unix_timestamp_to_utc_us,
     validate_quote,
 )
 
@@ -53,5 +54,6 @@ __all__ = [
     "TickQuote",
     "XtDataPeriod",
     "quote_model_for_period",
+    "unix_timestamp_to_utc_us",
     "validate_quote",
 ]

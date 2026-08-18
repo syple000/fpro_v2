@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pyarrow as pa
@@ -40,6 +40,7 @@ def test_writer_separates_tick_and_bar_with_fixed_schemas(tmp_path: Path) -> Non
         ).timestamp()
         * 1_000
     )
+    received_at = 1_786_928_400_000_000
     writer = QuoteParquetWriter(tmp_path)
 
     events = writer.append(
@@ -50,7 +51,7 @@ def test_writer_separates_tick_and_bar_with_fixed_schemas(tmp_path: Path) -> Non
                 period="tick",
                 source="market",
                 subscription="SZ",
-                received_at=datetime(2026, 8, 17, 1, tzinfo=UTC),
+                received_at=received_at,
                 quote=TickQuote.model_validate(
                     {
                         "time": quote_time,
@@ -66,7 +67,7 @@ def test_writer_separates_tick_and_bar_with_fixed_schemas(tmp_path: Path) -> Non
                 period="1m",
                 source="stock",
                 subscription="000001.SZ",
-                received_at=datetime(2026, 8, 17, 1, tzinfo=UTC),
+                received_at=received_at,
                 quote=BarQuote.model_validate(
                     {
                         "time": quote_time,
@@ -90,6 +91,10 @@ def test_writer_separates_tick_and_bar_with_fixed_schemas(tmp_path: Path) -> Non
     assert tick_row["trading_date"].isoformat() == "2026-08-16"
     assert tick_row["seq"] == 8
     assert tick_row["period"] == "tick"
+    assert TICK_SCHEMA.field("received_at").type == pa.int64()
+    assert TICK_SCHEMA.field("event_at").type == pa.int64()
+    assert tick_row["received_at"] == received_at
+    assert tick_row["event_at"] == quote_time * 1_000
     assert tick_row["quote"]["lastPrice"] == 10.5
     assert tick_row["quote"]["askPrice"] == [10.6, 10.7]
     assert json.loads(tick_row["quote"]["extra_json"]) == {
@@ -102,6 +107,9 @@ def test_writer_separates_tick_and_bar_with_fixed_schemas(tmp_path: Path) -> Non
     assert bar_row["trading_date"].isoformat() == "2026-08-16"
     assert bar_row["seq"] == 9
     assert bar_row["period"] == "1m"
+    assert BAR_SCHEMA.field("received_at").type == pa.int64()
+    assert BAR_SCHEMA.field("event_at").type == pa.int64()
+    assert bar_row["event_at"] == quote_time * 1_000
     assert bar_row["quote"]["open"] == 10.1
     assert bar_row["quote"]["close"] == 10.5
     assert bar_row["quote"]["volume"] == 123
@@ -113,6 +121,7 @@ def test_writer_separates_tick_and_bar_with_fixed_schemas(tmp_path: Path) -> Non
 
     assert [event.seq for event in events] == [8, 9]
     assert isinstance(events[0].quote, TickQuote)
+    assert events[0].event_at == quote_time * 1_000
     assert isinstance(events[1].quote, BarQuote)
 
 
@@ -126,7 +135,7 @@ def test_writer_only_creates_manifest_for_received_quote_kind(tmp_path: Path) ->
                 period="tick",
                 source="market",
                 subscription="SZ",
-                received_at=datetime(2026, 8, 17, 1, tzinfo=UTC),
+                received_at=1_786_928_400_000_000,
                 quote=TickQuote(lastPrice=10.5),
             )
         ]

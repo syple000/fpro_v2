@@ -7,7 +7,7 @@
 from __future__ import annotations
 
 import math
-from datetime import date, datetime
+from datetime import date
 from typing import Annotated, Literal, TypeAlias
 
 from pydantic import (
@@ -18,6 +18,8 @@ from pydantic import (
     JsonValue,
     model_validator,
 )
+
+from fpro_common import normalise_unix_timestamp_us, require_utc_us
 
 XtDataPeriod: TypeAlias = Literal[
     "tick",
@@ -56,20 +58,30 @@ def _float_list(value: object) -> object:
     return [_finite_float(item) for item in value]
 
 
-def _aware_datetime(value: object) -> object:
-    if isinstance(value, str):
-        try:
-            value = datetime.fromisoformat(value.replace("Z", "+00:00"))
-        except ValueError:
-            return value
-    if isinstance(value, datetime) and value.utcoffset() is None:
-        raise ValueError("行情时间必须包含时区")
-    return value
+def _utc_timestamp_us(value: object) -> object:
+    try:
+        return require_utc_us(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(str(exc)) from exc
+
+
+def _xt_timestamp_us(value: object) -> object:
+    """接入 XtData 时识别其历史版本使用的时间单位，并统一为微秒。"""
+    converted = normalise_unix_timestamp_us(value)
+    if converted is None:
+        raise ValueError("XtData time 必须是可转换为 int64 微秒的整数")
+    return converted
+
+
+def unix_timestamp_to_utc_us(value: object) -> int | None:
+    """把 XtData 的秒/毫秒/微秒/纳秒时间戳统一为 Unix Epoch 微秒。"""
+    return normalise_unix_timestamp_us(value)
 
 
 OptionalFiniteFloat = Annotated[float | None, BeforeValidator(_finite_float)]
 OptionalFloatList = Annotated[list[float] | None, BeforeValidator(_float_list)]
-AwareDatetime = Annotated[datetime, BeforeValidator(_aware_datetime)]
+UtcTimestampUs = Annotated[int, BeforeValidator(_utc_timestamp_us)]
+XtTimestampUs = Annotated[int, BeforeValidator(_xt_timestamp_us)]
 
 
 class ProtocolModel(BaseModel):
@@ -98,7 +110,8 @@ class TickQuote(QuoteModel):
     并不完全相同；已出现的字段仍会严格校验其值类型。
     """
 
-    time: int | None = None
+    # XtData 原始值常为毫秒；模型边界统一成 Unix Epoch 微秒整数。
+    time: XtTimestampUs | None = None
     stime: str | None = None
     timetag: str | None = None
     lastPrice: OptionalFiniteFloat = None
@@ -127,7 +140,8 @@ class TickQuote(QuoteModel):
 class BarQuote(QuoteModel):
     """XtData 分钟线、日线等 K 线字段。"""
 
-    time: int | None = None
+    # XtData 原始值常为毫秒；模型边界统一成 Unix Epoch 微秒整数。
+    time: XtTimestampUs | None = None
     open: OptionalFiniteFloat = None
     high: OptionalFiniteFloat = None
     low: OptionalFiniteFloat = None
@@ -242,7 +256,7 @@ class SnapshotResponse(ProtocolModel):
 
 class LatestQuotesResponse(ProtocolModel):
     data: dict[str, QuotePayload]
-    updated_at: dict[str, AwareDatetime]
+    updated_at: dict[str, UtcTimestampUs]
     periods: dict[str, XtDataPeriod]
     missing: list[str]
     not_subscribed: list[str]
@@ -278,7 +292,8 @@ class SequencedQuote(ProtocolModel):
     period: XtDataPeriod
     source: QuoteSource
     subscription: str
-    received_at: AwareDatetime
+    received_at: UtcTimestampUs
+    event_at: UtcTimestampUs | None = None
     quote: QuotePayload
 
     @model_validator(mode="before")
@@ -287,7 +302,9 @@ class SequencedQuote(ProtocolModel):
         if not isinstance(value, dict) or "period" not in value or "quote" not in value:
             return value
         converted = dict(value)
-        converted["quote"] = validate_quote(converted["period"], converted["quote"])
+        quote = validate_quote(converted["period"], converted["quote"])
+        converted["quote"] = quote
+        converted["event_at"] = quote.time
         return converted
 
 

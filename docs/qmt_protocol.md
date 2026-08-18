@@ -58,7 +58,7 @@ XtData object
 
 | 字段 | Python / JSON 类型 | 来源 |
 | --- | --- | --- |
-| `time` | `int`，毫秒时间戳 | 官方、实测 |
+| `time` | `int64`，Unix Epoch 微秒；XtData 原始值在边界转换 | 官方、实测 |
 | `stime` | `str` | 新版官方结构 |
 | `timetag` | `str` | 本机 `get_full_tick` 实测 |
 | `lastPrice`, `open`, `high`, `low`, `lastClose` | `float` | 官方、实测 |
@@ -81,7 +81,7 @@ XtData object
 
 | 字段 | Python / JSON 类型 | 来源 |
 | --- | --- | --- |
-| `time` | `int`，毫秒时间戳 | 官方、实测 |
+| `time` | `int64`，Unix Epoch 微秒；XtData 原始值在边界转换 | 官方、实测 |
 | `open`, `high`, `low`, `close` | `float` | 官方、实测 |
 | `volume` | `int` | 本机实测 |
 | `amount` | `float` | 官方、实测 |
@@ -152,7 +152,7 @@ XtData object
 | 字段 | 类型 |
 | --- | --- |
 | `data` | `dict[str, TickQuote | BarQuote]` |
-| `updated_at` | `dict[str, datetime]` |
+| `updated_at` | `dict[str, int]`，Unix Epoch 微秒 |
 | `periods` | `dict[str, XtDataPeriod]` |
 | `missing`, `not_subscribed` | `list[str]` |
 
@@ -168,8 +168,13 @@ XtData object
 | `period` | `XtDataPeriod` |
 | `source` | `Literal["market", "stock"]` |
 | `subscription` | `str` |
-| `received_at` | 有时区的 `datetime`；JSON 为 ISO 8601 字符串 |
+| `received_at` | `int64`，Unix Epoch 微秒 |
+| `event_at` | `int64 | None`，与规范化后的 `quote.time` 相同 |
 | `quote` | 按 `period` 确定的 `TickQuote | BarQuote` |
+
+协议入口只接受 `int64` 范围内的微秒整数，不接受 ISO 字符串、浮点数、布尔值或 `datetime`。
+`event_at` 表示行情发生时间，`received_at` 表示系统收到回调的时间，不能互相替代。XtData
+可能返回秒、毫秒、微秒或纳秒整数，接入模型会识别并统一成微秒；对外协议中不再传原始单位。
 
 `QuoteSequenceResponse`：`data: list[SequencedQuote]`，`count`、`requested_seq`、
 `next_seq` 为 `int`，`oldest_seq`、`latest_seq` 为 `int | None`。模型校验数量和序号边界。
@@ -209,7 +214,8 @@ XtData object
 因此 platform 应创建 `Queue[QuoteEvent]`，消费者使用属性访问，例如
 `event.seq`、`event.quote.lastPrice`。Parquet 分为 `ticks`、`bars` 两张按交易日分区的表；
 固定信封字段落入顶层列，行情主体保存在具有确定 schema 的 `quote` struct 中；
-`received_at` 使用带 UTC 时区的 timestamp。未知的客户端扩展字段保存在
+`event_at` 和 `received_at` 使用 Unix Epoch 微秒 `int64`；`trading_date` 只用于按中国市场
+交易日分区。未知的客户端扩展字段保存在
 `quote.extra_json`，不会因动态字段未建列而丢失。
 
 ## 字段丢弃和日志规则
@@ -222,3 +228,7 @@ XtData object
 - 反订阅后的延迟回调或订阅失败前暂存回调：按竞态规则丢弃并打印 DEBUG。
 
 生产环境可通过 `QMT_AGENT_LOG_LEVEL=debug` 查看这些记录。
+
+所有业务时刻在协议、JSON 和 Parquet 中统一为 Unix Epoch 微秒 `int64`。XtData 的无时区
+查询字符串只用于调用外部接口，`stime`/`timetag` 只作为原始审计字段；项目自带命令行日志
+的记录时间使用带 `+08:00` 的北京时间。

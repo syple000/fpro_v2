@@ -36,8 +36,9 @@ with (
 
 客户端方法返回 `qmt_protocol` 中定义的 Pydantic 模型，而不是裸字典。receiver 会在 HTTP
 边界严格校验整个响应；字段缺失、类型错误或未知信封字段都会抛出 `QmtAgentError`。
-最终写入队列的是 `QuoteEvent`，可通过 `event.seq`、`event.period`、`event.quote` 和
-`event.trading_date` 等属性访问。完整协议见 [QMT 行情数据协议](qmt_protocol.md)。
+最终写入队列的是 `QuoteEvent`，可通过 `event.seq`、`event.event_at`、`event.period`、
+`event.quote` 和 `event.trading_date` 等属性访问。完整协议见
+[QMT 行情数据协议](qmt_protocol.md)。
 
 ## qmt-agent 方法
 
@@ -57,10 +58,10 @@ with (
 - `ticks`：只保存 `period="tick"` 的行情；
 - `bars`：保存 `1m`、`5m`、`1d` 等所有 K 线周期，通过 `period` 列区分周期。
 
-两张表都按 `trading_date` 分区，并按 `seq` 排序。日期优先使用 quote 的毫秒时间戳
-`time`，无法解析时使用 agent 的 `received_at`，默认交易时区为 `Asia/Shanghai`。目录结构
-示意为 `ticks/trading_date=.../` 和 `bars/trading_date=.../`（实际分区值由
-`parquet_store` 做 URL 编码）。
+两张表都按 `trading_date` 分区，并按 `seq` 排序。业务时间 `event_at` 和 `received_at`
+始终是 Unix Epoch 微秒 `int64`；仅计算分区时把 `event_at` 转成 `Asia/Shanghai` 后取交易日期，无法解析上游
+`time` 时使用 `received_at` 计算分区。目录结构示意为 `ticks/trading_date=.../` 和
+`bars/trading_date=.../`（实际分区值由 `parquet_store` 做 URL 编码）。
 
 两张表都有以下固定信封列：
 
@@ -69,8 +70,13 @@ with (
 | `trading_date` | `date32` | 否 |
 | `seq` | `int64` | 否 |
 | `code`, `period`, `source`, `subscription` | `string` | 否 |
-| `received_at` | `timestamp[us, tz=UTC]` | 否 |
+| `received_at` | `int64`，Unix Epoch 微秒 | 否 |
+| `event_at` | `int64`，Unix Epoch 微秒 | 是 |
 | `quote` | `struct` | 否 |
+
+`event_at` 是行情发生时间；`received_at` 是 qmt-agent 实际收到回调的时间。XtData 原始
+`quote.time` 会在接入边界识别秒/毫秒/微秒/纳秒并转成微秒，所以落盘的 `quote.time` 与
+`event_at` 使用相同单位。两者的事件语义不同。
 
 行情主体不在顶层铺平，而是保存在 `quote` struct 中。`ticks.quote` 使用 `TickQuote` 的
 schema：时间和计数类子字段为 `int64`，价格、金额和比率子字段为 `float64`，`stime`、
@@ -82,8 +88,7 @@ OHLC、金额、结算价、持仓量及复权子字段为 `float64`。完整字
 行情字段在不同接口和客户端版本中可能缺失，因此已知行情列允许为空，但类型固定。未知的
 券商扩展字段不会丢弃，而是只保存在 `quote.extra_json`；已知字段不再存成 JSON。
 
-旧版 `quotes` 表不会被新 writer 继续写入或自动迁移；复用已有数据目录时，可以在确认不再
-需要旧格式后单独归档该目录。
+新时间 Schema 不兼容旧数据目录，不做自动迁移；切换版本时应删除旧数据并重新接收。
 
 `append()` 不会为每个接收批次强制 `flush`。数据进入 `ParquetStore` 缓冲区后即可写入队列并
 推进 receiver 的内存 `next_seq`；达到 store 的行数或内存阈值时自动提交，writer
