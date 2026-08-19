@@ -289,6 +289,7 @@ qmt-receiver = [
 tushare-data = [
     { name = "pandas" },
     { name = "pyarrow" },
+    { name = "requests" },
     { name = "tushare" },
     { name = "tzdata" },
 ]
@@ -321,6 +322,7 @@ qmt-receiver = [
 tushare-data = [
     { name = "pandas", specifier = ">=2.2,<3.0" },
     { name = "pyarrow", specifier = ">=18.0,<24.0" },
+    { name = "requests", specifier = ">=2.32,<3.0" },
     { name = "tushare", specifier = ">=1.4,<2.0" },
     { name = "tzdata", specifier = ">=2025.2" },
 ]

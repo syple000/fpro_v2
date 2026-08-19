@@ -7,7 +7,7 @@ from pathlib import Path
 import pyarrow.parquet as pq
 
 
-def read_parquet_file(path: str | Path, limit: int = 5) -> list[dict]:
+def read_parquet_file(path: str | Path, limit: int = 5) -> list[dict[str, object]]:
     table = pq.ParquetFile(path).read().slice(0, limit)
     rows = table.to_pylist()
     return rows

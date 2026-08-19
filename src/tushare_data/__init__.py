@@ -1,10 +1,12 @@
-"""Tushare 历史数据增量拉取与 Parquet 存储。"""
+"""Tushare 历史区间拉取、滚动刷新与 Parquet 存储。"""
 
 from tushare_data.client import (
     DEFAULT_MAX_CONCURRENCY,
+    DEFAULT_MAX_RETRIES,
     DEFAULT_REQUESTS_PER_MINUTE,
-    RateLimitedProClient,
+    DEFAULT_RETRY_BACKOFF_SECONDS,
     RequestLimiter,
+    TushareProClient,
 )
 from tushare_data.schemas import SOURCE_FIELDS, TABLE_SCHEMAS
 from tushare_data.storage import TushareDataStore
@@ -23,6 +25,7 @@ from tushare_data.sync import (
     sync_fina_audit,
     sync_fina_indicator,
     sync_forecast,
+    sync_inc,
     sync_income,
     sync_moneyflow,
     sync_stk_limit,
@@ -35,11 +38,13 @@ from tushare_data.sync import (
 __all__ = [
     "DEFAULT_API_URL",
     "DEFAULT_MAX_CONCURRENCY",
+    "DEFAULT_MAX_RETRIES",
     "DEFAULT_REQUESTS_PER_MINUTE",
-    "RateLimitedProClient",
+    "DEFAULT_RETRY_BACKOFF_SECONDS",
     "RequestLimiter",
     "SOURCE_FIELDS",
     "TABLE_SCHEMAS",
+    "TushareProClient",
     "TushareDataStore",
     "create_pro_client",
     "exchange_for_ts_code",
@@ -55,6 +60,7 @@ __all__ = [
     "sync_fina_indicator",
     "sync_forecast",
     "sync_income",
+    "sync_inc",
     "sync_moneyflow",
     "sync_stk_limit",
     "sync_stock_st",
