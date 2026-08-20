@@ -9,6 +9,7 @@ from time import monotonic, sleep
 from typing import ParamSpec, Protocol, TypeVar, runtime_checkable
 
 import pandas as pd
+from requests.exceptions import ChunkedEncodingError
 from requests.exceptions import ConnectionError as RequestsConnectionError
 from requests.exceptions import Timeout as RequestsTimeout
 
@@ -121,7 +122,12 @@ class TushareProClient:
                     offset=offset,
                     **parameters,
                 )
-            except (RequestsConnectionError, RequestsTimeout, TimeoutError):
+            except (
+                RequestsConnectionError,
+                RequestsTimeout,
+                ChunkedEncodingError,
+                TimeoutError,
+            ):
                 if retry_index == self.max_retries:
                     raise
                 delay = self.retry_backoff_seconds * (2**retry_index)

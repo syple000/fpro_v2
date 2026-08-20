@@ -9,6 +9,7 @@ from typing import ParamSpec, TypeVar
 
 import pandas as pd
 import pytest
+from requests.exceptions import ChunkedEncodingError
 
 from tushare_data.client import (
     DEFAULT_MAX_CONCURRENCY,
@@ -68,6 +69,23 @@ class OneTimeoutDataApi(FakeDataApi):
         self.attempts += 1
         if self.attempts == 1:
             raise TimeoutError("temporary timeout")
+        return super().query(api_name, fields, **kwargs)
+
+
+class OneTruncatedResponseDataApi(FakeDataApi):
+    def __init__(self) -> None:
+        super().__init__()
+        self.attempts = 0
+
+    def query(
+        self,
+        api_name: str,
+        fields: str = "",
+        **kwargs: object,
+    ) -> pd.DataFrame:
+        self.attempts += 1
+        if self.attempts == 1:
+            raise ChunkedEncodingError("response body was truncated")
         return super().query(api_name, fields, **kwargs)
 
 
@@ -154,6 +172,27 @@ def test_business_methods_have_only_explicit_parameters(
 def test_client_retries_transient_network_failure_through_limiter() -> None:
     limiter = RecordingLimiter()
     api = OneTimeoutDataApi()
+    client = TushareProClient(
+        api,
+        limiter,
+        max_retries=1,
+        retry_backoff_seconds=0,
+    )
+
+    result = client.daily(
+        trade_date="20240102",
+        fields="ts_code,trade_date",
+        limit=5_000,
+        offset=0,
+    )
+
+    assert result.iloc[0]["trade_date"] == "20240102"
+    assert api.attempts == len(limiter.calls) == 2
+
+
+def test_client_retries_truncated_http_response_through_limiter() -> None:
+    limiter = RecordingLimiter()
+    api = OneTruncatedResponseDataApi()
     client = TushareProClient(
         api,
         limiter,

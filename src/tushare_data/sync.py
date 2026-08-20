@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable, Iterable
 from datetime import date, datetime, time, timedelta
 from math import isnan
@@ -23,6 +24,8 @@ from tushare_data.client import (
 )
 from tushare_data.schemas import DATE_FIELDS, SOURCE_FIELDS, TABLE_SCHEMAS
 from tushare_data.storage import TushareDataStore
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_API_URL = "http://api.quicksync.cn"
 SHANGHAI = ZoneInfo("Asia/Shanghai")
@@ -568,30 +571,70 @@ def sync_all(
     start_date: str | date,
     end_date: str | date,
 ) -> dict[str, int]:
-    """依次同步全市场常用量化分析数据。"""
+    """按日期升序完成一次性历史回填，并跳过已经成功提交的区间。"""
+    requested_start = _parse_date(start_date)
+    requested_end = _parse_date(end_date)
+    if requested_start > requested_end:
+        raise ValueError("start_date 不能晚于 end_date")
+
+    functions: tuple[tuple[str, MarketSyncFunction, int], ...] = (
+        ("trade_cal", sync_trade_cal, CALENDAR_REQUEST_DAYS),
+        ("daily", sync_daily, MARKET_WRITE_CHUNK_DAYS),
+        ("daily_basic", sync_daily_basic, MARKET_WRITE_CHUNK_DAYS),
+        ("stk_limit", sync_stk_limit, MARKET_WRITE_CHUNK_DAYS),
+        ("stock_st", sync_stock_st, MARKET_WRITE_CHUNK_DAYS),
+        ("adj_factor", sync_adj_factor, MARKET_WRITE_CHUNK_DAYS),
+        ("suspend_d", sync_suspend_d, MARKET_WRITE_CHUNK_DAYS),
+        ("moneyflow", sync_moneyflow, MARKET_WRITE_CHUNK_DAYS),
+        ("dividend", sync_dividend, MARKET_WRITE_CHUNK_DAYS),
+        ("forecast", sync_forecast, 366),
+        ("express", sync_express, 366),
+        ("income", sync_income, 366),
+        ("balancesheet", sync_balancesheet, 366),
+        ("cashflow", sync_cashflow, 366),
+        ("fina_indicator", sync_fina_indicator, 366),
+        ("sw_industry", sync_sw_industry, CALENDAR_REQUEST_DAYS),
+        ("fina_audit", sync_fina_audit, 366),
+    )
+
     result: dict[str, int] = {}
-    result["trade_cal"] = sync_trade_cal(pro, store, start_date, end_date)
-    functions: tuple[tuple[str, MarketSyncFunction], ...] = (
-        ("daily", sync_daily),
-        ("daily_basic", sync_daily_basic),
-        ("stk_limit", sync_stk_limit),
-        ("stock_st", sync_stock_st),
-        ("adj_factor", sync_adj_factor),
-        ("suspend_d", sync_suspend_d),
-        ("moneyflow", sync_moneyflow),
-        ("dividend", sync_dividend),
-        ("forecast", sync_forecast),
-        ("express", sync_express),
-        ("income", sync_income),
-        ("balancesheet", sync_balancesheet),
-        ("cashflow", sync_cashflow),
-        ("fina_indicator", sync_fina_indicator),
-        ("sw_industry", sync_sw_industry),
-        ("fina_audit", sync_fina_audit),
-    )
-    result.update(
-        {dataset: function(pro, store, start_date, end_date) for dataset, function in functions}
-    )
+    for dataset, function, checkpoint_days in functions:
+        completed = store._sync_all_completed_ranges(dataset)
+        missing = _missing_date_ranges(requested_start, requested_end, completed)
+        total = 0
+
+        # 申万接口始终返回完整成员快照，一次调用即可覆盖全部缺失历史区间。
+        if dataset == "sw_industry" and missing:
+            total = function(pro, store, requested_start, requested_end)
+            for range_start, range_end in missing:
+                store._mark_sync_all_completed(dataset, range_start, range_end)
+            logger.info(
+                "sync_all %s 已完成 %s 至 %s，写入 %d 行",
+                dataset,
+                requested_start,
+                requested_end,
+                total,
+            )
+            result[dataset] = total
+            continue
+
+        for range_start, range_end in missing:
+            for chunk_start, chunk_end in _split_range(
+                range_start,
+                range_end,
+                checkpoint_days,
+            ):
+                written = function(pro, store, chunk_start, chunk_end)
+                total += written
+                store._mark_sync_all_completed(dataset, chunk_start, chunk_end)
+                logger.info(
+                    "sync_all %s 已完成 %s 至 %s，写入 %d 行",
+                    dataset,
+                    chunk_start,
+                    chunk_end,
+                    written,
+                )
+        result[dataset] = total
     return result
 
 
@@ -931,6 +974,29 @@ def _split_range(start_date: date, end_date: date, max_days: int) -> list[tuple[
         result.append((cursor, part_end))
         cursor = part_end + timedelta(days=1)
     return result
+
+
+def _missing_date_ranges(
+    requested_start: date,
+    requested_end: date,
+    completed: list[tuple[date, date]],
+) -> list[tuple[date, date]]:
+    """返回请求区间中尚未完成的日期闭区间，并保持日期升序。"""
+    missing: list[tuple[date, date]] = []
+    cursor = requested_start
+    for completed_start, completed_end in completed:
+        if completed_end < cursor:
+            continue
+        if completed_start > requested_end:
+            break
+        if completed_start > cursor:
+            missing.append((cursor, min(requested_end, completed_start - timedelta(days=1))))
+        cursor = max(cursor, completed_end + timedelta(days=1))
+        if cursor > requested_end:
+            break
+    if cursor <= requested_end:
+        missing.append((cursor, requested_end))
+    return missing
 
 
 def _contiguous_ranges(values: list[date]) -> list[tuple[date, date]]:

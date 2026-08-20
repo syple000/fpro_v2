@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from collections.abc import Callable
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -202,7 +203,7 @@ def test_requested_range_is_refetched_and_partitions_are_not_duplicated(
     assert [row["trade_date"] for row in rows] == [date(2024, 1, day) for day in range(1, 8)]
 
 
-def test_sync_inc_uses_planned_lookback_windows(
+def test_sync_inc_uses_planned_windows_and_ignores_sync_all_progress(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -247,6 +248,12 @@ def test_sync_inc_uses_planned_lookback_windows(
 
     pro, api = _client(_market_responder)
     with TushareDataStore(tmp_path) as store:
+        for dataset in TABLE_SCHEMAS:
+            store._mark_sync_all_completed(
+                dataset,
+                date(2000, 1, 1),
+                date(2030, 12, 31),
+            )
         result = sync_module.sync_inc(pro, store, current)
 
     assert calls["daily"] == (date(2024, 6, 27), current)
@@ -278,6 +285,128 @@ def test_sync_inc_uses_planned_lookback_windows(
     assert "sw_industry" not in calls
     assert ordinary_result["fina_audit"] == 0
     assert ordinary_result["sw_industry"] == 0
+
+
+def test_sync_all_resumes_failed_chunk_and_then_skips_completed_range(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    datasets = (
+        "trade_cal",
+        "daily",
+        "daily_basic",
+        "stk_limit",
+        "stock_st",
+        "adj_factor",
+        "suspend_d",
+        "moneyflow",
+        "dividend",
+        "forecast",
+        "express",
+        "income",
+        "balancesheet",
+        "cashflow",
+        "fina_indicator",
+        "sw_industry",
+        "fina_audit",
+    )
+    calls: dict[str, list[tuple[date, date]]] = {dataset: [] for dataset in datasets}
+    daily_failed = False
+
+    def record(dataset: str) -> Callable[..., int]:
+        def sync_dataset(
+            _pro: TushareProClient,
+            _store: TushareDataStore,
+            start_date: str | date,
+            end_date: str | date,
+        ) -> int:
+            nonlocal daily_failed
+            requested = (
+                sync_module._parse_date(start_date),
+                sync_module._parse_date(end_date),
+            )
+            calls[dataset].append(requested)
+            if dataset == "daily" and len(calls[dataset]) == 2 and not daily_failed:
+                daily_failed = True
+                raise RuntimeError("simulated interruption")
+            return 1
+
+        return sync_dataset
+
+    for dataset in datasets:
+        monkeypatch.setattr(sync_module, f"sync_{dataset}", record(dataset))
+
+    pro, _ = _client(_market_responder)
+    requested_start = date(2024, 1, 1)
+    requested_end = date(2024, 3, 10)
+    with TushareDataStore(tmp_path) as store:
+        with pytest.raises(RuntimeError, match="simulated interruption"):
+            sync_module.sync_all(pro, store, requested_start, requested_end)
+
+        assert store._sync_all_completed_ranges("daily") == [(date(2024, 1, 1), date(2024, 1, 31))]
+        resumed = sync_module.sync_all(pro, store, requested_start, requested_end)
+        calls_after_resume = {dataset: len(values) for dataset, values in calls.items()}
+        repeated = sync_module.sync_all(pro, store, requested_start, requested_end)
+
+    assert calls["trade_cal"] == [(requested_start, requested_end)]
+    assert calls["daily"] == [
+        (date(2024, 1, 1), date(2024, 1, 31)),
+        (date(2024, 2, 1), date(2024, 3, 2)),
+        (date(2024, 2, 1), date(2024, 3, 2)),
+        (date(2024, 3, 3), date(2024, 3, 10)),
+    ]
+    assert resumed["trade_cal"] == 0
+    assert resumed["daily"] == 2
+    assert all(value == 0 for value in repeated.values())
+    assert calls_after_resume == {dataset: len(values) for dataset, values in calls.items()}
+
+    document = json.loads(
+        (tmp_path / "_meta" / "sync_all" / "daily.json").read_text(encoding="utf-8")
+    )
+    assert document["dataset"] == "daily"
+    assert document["completed_ranges"] == [{"start_date": "2024-01-01", "end_date": "2024-03-10"}]
+    assert isinstance(document["updated_at"], int)
+
+
+def test_sync_all_expands_both_sides_in_date_order(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    datasets = tuple(TABLE_SCHEMAS)
+    calls: dict[str, list[tuple[date, date]]] = {dataset: [] for dataset in datasets}
+
+    def record(dataset: str) -> Callable[..., int]:
+        def sync_dataset(
+            _pro: TushareProClient,
+            _store: TushareDataStore,
+            start_date: str | date,
+            end_date: str | date,
+        ) -> int:
+            calls[dataset].append(
+                (
+                    sync_module._parse_date(start_date),
+                    sync_module._parse_date(end_date),
+                )
+            )
+            return 1
+
+        return sync_dataset
+
+    for dataset in datasets:
+        monkeypatch.setattr(sync_module, f"sync_{dataset}", record(dataset))
+
+    pro, _ = _client(_market_responder)
+    with TushareDataStore(tmp_path) as store:
+        sync_module.sync_all(pro, store, "20240110", "20240120")
+        sync_module.sync_all(pro, store, "20240101", "20240131")
+        completed = store._sync_all_completed_ranges("daily")
+
+    assert calls["daily"] == [
+        (date(2024, 1, 10), date(2024, 1, 20)),
+        (date(2024, 1, 1), date(2024, 1, 9)),
+        (date(2024, 1, 21), date(2024, 1, 31)),
+    ]
+    assert completed == [(date(2024, 1, 1), date(2024, 1, 31))]
 
 
 def test_daily_refresh_replaces_old_market_partition(tmp_path: Path) -> None:
@@ -572,13 +701,15 @@ def test_read_accepts_only_int64_microsecond_filter(tmp_path: Path) -> None:
     pro, _ = _client(_market_responder)
     with TushareDataStore(tmp_path) as store:
         sync_daily(pro, store, "20240101", "20240101")
-        as_of = datetime_to_utc_us(datetime(2024, 1, 1, 16, tzinfo=ZoneInfo("Asia/Shanghai")))
+        visible_end = datetime_to_utc_us(
+            datetime(2024, 1, 1, 16, tzinfo=ZoneInfo("Asia/Shanghai"))
+        )
         assert (
             store.read(
                 "daily",
                 date(2024, 1, 1),
                 ts_code="000001.SZ",
-                as_of=as_of,
+                visible_end=visible_end,
             ).num_rows
             == 1
         )
@@ -587,5 +718,5 @@ def test_read_accepts_only_int64_microsecond_filter(tmp_path: Path) -> None:
                 "daily",
                 date(2024, 1, 1),
                 ts_code="000001.SZ",
-                as_of=cast(int, datetime(2024, 1, 1, 8)),
+                visible_end=cast(int, datetime(2024, 1, 1, 8)),
             )
