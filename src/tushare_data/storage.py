@@ -9,23 +9,22 @@ from datetime import date
 from pathlib import Path
 from threading import RLock
 from uuid import uuid4
-from zoneinfo import ZoneInfo
 
 import pyarrow as pa
 
-from fpro_common import require_utc_us, utc_now_us, utc_us_to_datetime
+from fpro_common import utc_now_us
 from parquet_store import ParquetStore, TableConfig
 from tushare_data.schemas import (
+    TABLE_DEDUPLICATE_PREFER_BY,
     TABLE_PARTITION_BY,
+    TABLE_PRIMARY_KEY,
     TABLE_SCHEMAS,
     TABLE_SORT_BY,
 )
 
-SHANGHAI = ZoneInfo("Asia/Shanghai")
-
 
 class TushareDataStore:
-    """注册固定表，并按可见日期写入 Tushare 数据。"""
+    """注册固定表，并按原始业务日期写入 Tushare 数据。"""
 
     def __init__(self, root: str | Path) -> None:
         root_path = Path(root).expanduser().resolve()
@@ -39,38 +38,33 @@ class TushareDataStore:
                     schema=schema,
                     partition_by=TABLE_PARTITION_BY[table_name],
                     sort_by=TABLE_SORT_BY[table_name],
+                    primary_key=TABLE_PRIMARY_KEY[table_name],
+                    deduplicate_prefer_by=(
+                        TABLE_DEDUPLICATE_PREFER_BY[table_name] or None
+                    ),
                 )
             )
 
     def write(self, dataset: str, data: pa.Table) -> int:
-        """把完整的每日截面按日期拆分，并覆盖对应的非空日期分区。"""
+        """按业务日期追加数据，落盘后立即整理所有受影响分区。"""
+        if dataset not in TABLE_SCHEMAS:
+            raise ValueError(f"未知数据表: {dataset}")
         schema = TABLE_SCHEMAS[dataset]
         if not data.schema.equals(schema, check_metadata=True):
             raise ValueError(f"{dataset} 输入 Schema 不匹配")
 
         partition_by = TABLE_PARTITION_BY[dataset]
-        indices: dict[date, list[int]] = {}
+        partitions: set[date] = set()
         partition_values = data.column(partition_by).to_pylist()
-        visible_values = data.column("visible_at").to_pylist()
-        for index, (partition_value, visible_value) in enumerate(
-            zip(partition_values, visible_values, strict=True)
-        ):
+        for partition_value in partition_values:
             if not isinstance(partition_value, date):
-                raise ValueError(
-                    f"{dataset} 返回了无效 {partition_by}: {partition_value!r}"
-                )
-            visible_at = require_utc_us(visible_value, f"{dataset}.visible_at")
-            visible_date = utc_us_to_datetime(visible_at).astimezone(SHANGHAI).date()
-            if partition_value != visible_date:
-                raise ValueError(
-                    f"{dataset} 的 {partition_by}={partition_value} 与 visible_at "
-                    f"对应的北京时间日期 {visible_date} 不一致"
-                )
-            indices.setdefault(partition_value, []).append(index)
+                raise ValueError(f"{dataset} 返回了无效 {partition_by}: {partition_value!r}")
+            partitions.add(partition_value)
 
-        for partition_value, positions in indices.items():
-            partition_data = data.take(pa.array(positions, type=pa.int64()))
-            self._store.replace_partition(dataset, partition_value, partition_data)
+        self._store.append(dataset, data)
+        self._store.flush(dataset)
+        for partition_value in sorted(partitions):
+            self._store.compact_partition(dataset, partition_value)
         return data.num_rows
 
     def read(
@@ -79,21 +73,15 @@ class TushareDataStore:
         partition: date | Sequence[date],
         *,
         ts_code: str | None = None,
-        visible_start: int | None = None,
-        visible_end: int | None = None,
     ) -> pa.Table:
-        """读取一个或多个日期分区，并可继续过滤股票和可见时间。"""
+        """读取一个或多个业务日期分区，并可继续过滤股票。"""
         filters: list[tuple[str, str, object]] = []
         if ts_code is not None:
             if "ts_code" not in TABLE_SCHEMAS[dataset].names:
                 raise ValueError(f"{dataset} 没有 ts_code 字段")
             filters.append(("ts_code", "=", ts_code))
-        if visible_start is not None:
-            filters.append(("visible_at", ">=", require_utc_us(visible_start, "visible_start")))
-        if visible_end is not None:
-            filters.append(("visible_at", "<=", require_utc_us(visible_end, "visible_end")))
         result = self._store.read(dataset, partitions=partition, filter=filters or None)
-        return result.sort_by([(TABLE_SORT_BY[dataset], "ascending")])
+        return result.sort_by([(name, "ascending") for name in TABLE_SORT_BY[dataset]])
 
     def _sync_all_completed_ranges(self, dataset: str) -> list[tuple[date, date]]:
         """读取 sync_all 已完整拉取的日期闭区间。"""

@@ -10,11 +10,9 @@ from __future__ import annotations
 
 import pyarrow as pa
 
-# 下方注释中的钟点是北京时间发布时间；落盘为 Unix Epoch 微秒 int64。
-# partition_date：visible_at 对应的北京时间日历日期，仅用于物理分区。
-VISIBLE_TIME_TYPE = pa.int64()
+# PIT 可见性由独立的 DuckDB 读取层根据下列原始日期字段推导；本模块不落盘派生字段。
 
-# visible_at：使用 trade_date，当日 16:00（收盘后）可见。
+# PIT 日期：trade_date。
 DAILY_FIELDS = (
     # 股票代码
     "ts_code",
@@ -44,7 +42,7 @@ DAILY_FIELDS = (
     "ah_amount",
 )
 
-# visible_at：使用 trade_date，当日 17:00（每日指标发布后）可见。
+# PIT 日期：trade_date。
 # 官方新增 limit_status，但 quicksync 实测仍会省略该列，因此暂不纳入固定 Schema。
 DAILY_BASIC_FIELDS = (
     # TS股票代码
@@ -85,7 +83,7 @@ DAILY_BASIC_FIELDS = (
     "circ_mv",
 )
 
-# visible_at：使用 trade_date，当日 09:20 可见。
+# PIT 日期：trade_date。
 ADJ_FACTOR_FIELDS = (
     # 股票代码
     "ts_code",
@@ -95,7 +93,7 @@ ADJ_FACTOR_FIELDS = (
     "adj_factor",
 )
 
-# visible_at：使用 trade_date，当日 09:30 可见。
+# PIT 日期：trade_date。
 SUSPEND_D_FIELDS = (
     # TS代码
     "ts_code",
@@ -107,7 +105,7 @@ SUSPEND_D_FIELDS = (
     "suspend_type",
 )
 
-# visible_at：使用 trade_date，当日 08:45（开盘前涨跌停价发布后）可见。
+# PIT 日期：trade_date。
 STK_LIMIT_FIELDS = (
     # 交易日期
     "trade_date",
@@ -121,7 +119,7 @@ STK_LIMIT_FIELDS = (
     "down_limit",
 )
 
-# visible_at：使用 trade_date，当日 09:20（开盘前风险警示名单发布后）可见。
+# PIT 日期：trade_date。
 STOCK_ST_FIELDS = (
     # 股票代码
     "ts_code",
@@ -135,7 +133,7 @@ STOCK_ST_FIELDS = (
     "type_name",
 )
 
-# visible_at：使用 trade_date，当日 19:00（盘后资金流数据发布后）可见。
+# PIT 日期：trade_date。
 MONEYFLOW_FIELDS = (
     # TS代码
     "ts_code",
@@ -179,7 +177,7 @@ MONEYFLOW_FIELDS = (
     "net_mf_amount",
 )
 
-# visible_at：优先使用实施公告日 imp_ann_date；未实施时使用 ann_date，避免提前看到实施字段。
+# PIT 日期：实施记录优先使用 imp_ann_date，其余使用 ann_date。
 DIVIDEND_FIELDS = (
     # TS代码
     "ts_code",
@@ -215,7 +213,7 @@ DIVIDEND_FIELDS = (
     "base_share",
 )
 
-# visible_at：使用 ann_date，公告日结束时可见。
+# PIT 日期：ann_date。
 FORECAST_FIELDS = (
     # TS股票代码
     "ts_code",
@@ -245,7 +243,7 @@ FORECAST_FIELDS = (
     "update_flag",
 )
 
-# visible_at：使用 ann_date，公告日结束时可见。
+# PIT 日期：ann_date。
 EXPRESS_FIELDS = (
     # TS股票代码
     "ts_code",
@@ -315,7 +313,7 @@ EXPRESS_FIELDS = (
     "update_flag",
 )
 
-# visible_at：使用 ann_date，公告日结束时可见。
+# PIT 日期：ann_date。
 FINA_AUDIT_FIELDS = (
     # TS股票代码
     "ts_code",
@@ -333,7 +331,7 @@ FINA_AUDIT_FIELDS = (
     "audit_sign",
 )
 
-# visible_at：使用 cal_date，当日 00:00；交易日历属于预先公布信息。
+# PIT 日期：cal_date。
 TRADE_CAL_FIELDS = (
     # 交易所 SSE上交所 SZSE深交所
     "exchange",
@@ -345,7 +343,7 @@ TRADE_CAL_FIELDS = (
     "pretrade_date",
 )
 
-# visible_at：优先使用 f_ann_date（实际公告日），缺失时使用 ann_date，公告日结束时可见。
+# PIT 日期：优先使用 f_ann_date，缺失时使用 ann_date。
 # 官方新增的 9 个利润表字段目前会被 quicksync 省略，待代理实际返回后再扩展固定 Schema。
 INCOME_FIELDS = (
     # TS代码
@@ -520,7 +518,7 @@ INCOME_FIELDS = (
     "update_flag",
 )
 
-# visible_at：优先使用 f_ann_date（实际公告日），缺失时使用 ann_date，公告日结束时可见。
+# PIT 日期：优先使用 f_ann_date，缺失时使用 ann_date。
 # 官方新增的 6 个资产负债表字段目前会被 quicksync 省略，待代理实际返回后再扩展固定 Schema。
 BALANCESHEET_FIELDS = (
     # TS股票代码
@@ -829,7 +827,7 @@ BALANCESHEET_FIELDS = (
     "update_flag",
 )
 
-# visible_at：优先使用 f_ann_date（实际公告日），缺失时使用 ann_date，公告日结束时可见。
+# PIT 日期：优先使用 f_ann_date，缺失时使用 ann_date。
 CASHFLOW_FIELDS = (
     # TS股票代码
     "ts_code",
@@ -1027,7 +1025,7 @@ CASHFLOW_FIELDS = (
     "update_flag",
 )
 
-# visible_at：使用 ann_date，公告日结束时可见；end_date 只表示报告期，不能用于可见时间。
+# PIT 日期：ann_date；end_date 只表示报告期。
 FINA_INDICATOR_FIELDS = (
     # TS代码
     "ts_code",
@@ -1365,7 +1363,7 @@ FINA_INDICATOR_FIELDS = (
     "update_flag",
 )
 
-# visible_at：原始 in_date/out_date 分别生成 IN/OUT 事件，使用对应事件日的 09:00。
+# PIT 区间：in_date 含、out_date 不含；读取层临时计算有效成员。
 INDEX_MEMBER_ALL_FIELDS = (
     # 一级行业代码
     "l1_code",
@@ -1393,6 +1391,8 @@ INDEX_MEMBER_ALL_FIELDS = (
 
 DATE_FIELDS = {
     "trade_date",
+    "cal_date",
+    "pretrade_date",
     "end_date",
     "ann_date",
     "f_ann_date",
@@ -1403,6 +1403,8 @@ DATE_FIELDS = {
     "imp_ann_date",
     "base_date",
     "first_ann_date",
+    "in_date",
+    "out_date",
 }
 
 STRING_FIELDS = {
@@ -1424,6 +1426,14 @@ STRING_FIELDS = {
     "audit_result",
     "audit_agency",
     "audit_sign",
+    "exchange",
+    "l1_code",
+    "l1_name",
+    "l2_code",
+    "l2_name",
+    "l3_code",
+    "l3_name",
+    "is_new",
 }
 
 INTEGER_FIELDS = {
@@ -1442,17 +1452,8 @@ INTEGER_FIELDS = {
 
 def _source_schema(fields: tuple[str, ...]) -> pa.Schema:
     """把固定的 Tushare 字段表转换为固定 Arrow Schema。"""
-    arrow_fields: list[pa.Field[pa.DataType]] = [
-        # visible_at 对应的北京时间日期，只用于物理分区。
-        pa.field("partition_date", pa.date32(), nullable=False),
-        # Tushare 股票代码。
-        pa.field("ts_code", pa.string(), nullable=False),
-        # 数据可安全用于研究的 UTC Unix Epoch 微秒时间戳。
-        pa.field("visible_at", VISIBLE_TIME_TYPE, nullable=False),
-    ]
+    arrow_fields: list[pa.Field[pa.DataType]] = []
     for name in fields:
-        if name == "ts_code":
-            continue
         if name in DATE_FIELDS:
             data_type = pa.date32()
         elif name in STRING_FIELDS:
@@ -1461,7 +1462,7 @@ def _source_schema(fields: tuple[str, ...]) -> pa.Schema:
             data_type = pa.int64()
         else:
             data_type = pa.float64()
-        arrow_fields.append(pa.field(name, data_type))
+        arrow_fields.append(pa.field(name, data_type, nullable=name != "ts_code"))
     return pa.schema(arrow_fields)
 
 
@@ -1481,45 +1482,13 @@ BALANCESHEET_SCHEMA = _source_schema(BALANCESHEET_FIELDS)
 CASHFLOW_SCHEMA = _source_schema(CASHFLOW_FIELDS)
 FINA_INDICATOR_SCHEMA = _source_schema(FINA_INDICATOR_FIELDS)
 
-# 申万行业成员数据拆成 IN/OUT 事件。若把当前接口返回的未来 out_date 直接放在
-# in_date 那一行，历史回测会提前知道股票将在哪一天被移出行业。
-SW_INDUSTRY_SCHEMA = pa.schema(
-    [
-        # 事件可见时间对应的北京时间日期，只用于物理分区。
-        pa.field("partition_date", pa.date32(), nullable=False),
-        # 成分股票的 Tushare 代码。
-        pa.field("ts_code", pa.string(), nullable=False),
-        # 事件可安全用于研究的 UTC Unix Epoch 微秒时间戳。
-        pa.field("visible_at", VISIBLE_TIME_TYPE, nullable=False),
-        # 股票纳入或移出申万行业的事件日期。
-        pa.field("event_date", pa.date32(), nullable=False),
-        # IN 表示纳入，OUT 表示移出。
-        pa.field("event_type", pa.string(), nullable=False),
-        # 申万一级行业代码。
-        pa.field("l1_code", pa.string()),
-        # 申万一级行业名称。
-        pa.field("l1_name", pa.string()),
-        # 申万二级行业代码。
-        pa.field("l2_code", pa.string()),
-        # 申万二级行业名称。
-        pa.field("l2_name", pa.string()),
-        # 申万三级行业代码。
-        pa.field("l3_code", pa.string()),
-        # 申万三级行业名称。
-        pa.field("l3_name", pa.string()),
-        # 成分股票名称。
-        pa.field("stock_name", pa.string()),
-    ]
-)
+# 保留 index_member_all 原始区间，不在存储层拆成 IN/OUT 事件。
+SW_INDUSTRY_SCHEMA = _source_schema(INDEX_MEMBER_ALL_FIELDS)
 
 TRADE_CAL_SCHEMA = pa.schema(
     [
-        # visible_at 对应的北京时间日期，只用于物理分区。
-        pa.field("partition_date", pa.date32(), nullable=False),
         # 交易所代码：SSE、SZSE 或 BSE。
         pa.field("exchange", pa.string(), nullable=False),
-        # 日历信息可见的 UTC Unix Epoch 微秒时间戳。
-        pa.field("visible_at", VISIBLE_TIME_TYPE, nullable=False),
         # 日历日期。
         pa.field("cal_date", pa.date32(), nullable=False),
         # 是否开市：1 开市，0 休市。
@@ -1569,8 +1538,50 @@ SOURCE_FIELDS = {
     "trade_cal": TRADE_CAL_FIELDS,
 }
 
-TABLE_PARTITION_BY = {dataset: "partition_date" for dataset in TABLE_SCHEMAS}
-
-TABLE_SORT_BY = {
-    dataset: "exchange" if dataset == "trade_cal" else "ts_code" for dataset in TABLE_SCHEMAS
+TABLE_PARTITION_BY = {
+    "daily": "trade_date",
+    "daily_basic": "trade_date",
+    "adj_factor": "trade_date",
+    "suspend_d": "trade_date",
+    "stk_limit": "trade_date",
+    "stock_st": "trade_date",
+    "moneyflow": "trade_date",
+    "dividend": "end_date",
+    "forecast": "end_date",
+    "express": "end_date",
+    "fina_audit": "end_date",
+    "income": "end_date",
+    "balancesheet": "end_date",
+    "cashflow": "end_date",
+    "fina_indicator": "end_date",
+    "sw_industry": "in_date",
+    "trade_cal": "cal_date",
 }
+
+# 下列为分区内的“源数据版本键”，分区字段不重复写入。
+TABLE_PRIMARY_KEY = {
+    "daily": ("ts_code",),
+    "daily_basic": ("ts_code",),
+    "adj_factor": ("ts_code",),
+    "suspend_d": ("ts_code", "suspend_type", "suspend_timing"),
+    "stk_limit": ("ts_code",),
+    "stock_st": ("ts_code", "type"),
+    "moneyflow": ("ts_code",),
+    "dividend": ("ts_code", "ann_date", "div_proc", "imp_ann_date"),
+    "forecast": ("ts_code", "ann_date"),
+    "express": ("ts_code", "ann_date"),
+    "fina_audit": ("ts_code", "ann_date"),
+    "income": ("ts_code", "report_type", "comp_type", "ann_date", "f_ann_date"),
+    "balancesheet": ("ts_code", "report_type", "comp_type", "ann_date", "f_ann_date"),
+    "cashflow": ("ts_code", "report_type", "comp_type", "ann_date", "f_ann_date"),
+    "fina_indicator": ("ts_code", "ann_date"),
+    "sw_industry": ("ts_code",),
+    "trade_cal": ("exchange",),
+}
+
+TABLE_DEDUPLICATE_PREFER_BY = {
+    dataset: (("update_flag",) if "update_flag" in schema.names else ())
+    for dataset, schema in TABLE_SCHEMAS.items()
+}
+
+TABLE_SORT_BY = {dataset: TABLE_PRIMARY_KEY[dataset] for dataset in TABLE_SCHEMAS}

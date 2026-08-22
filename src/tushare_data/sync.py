@@ -1,18 +1,16 @@
-"""按全市场截面拉取 Tushare 历史数据，再由存储层按可见日期分区。"""
+"""按全市场截面拉取 Tushare 历史数据，再由存储层按业务日期分区。"""
 
 from __future__ import annotations
 
 import logging
 from collections.abc import Callable, Iterable
-from datetime import date, datetime, time, timedelta
+from datetime import date, datetime, timedelta
 from math import isnan
 from numbers import Real
-from zoneinfo import ZoneInfo
 
 import pandas as pd
 import pyarrow as pa
 
-from fpro_common import datetime_to_utc_us, utc_us_to_datetime
 from tushare_data.client import (
     DEFAULT_MAX_CONCURRENCY,
     DEFAULT_MAX_RETRIES,
@@ -28,8 +26,6 @@ from tushare_data.storage import TushareDataStore
 logger = logging.getLogger(__name__)
 
 DEFAULT_API_URL = "http://api.quicksync.cn"
-SHANGHAI = ZoneInfo("Asia/Shanghai")
-ANNOUNCEMENT_VISIBLE_TIME = time.max
 MARKET_EXCHANGES = ("SSE", "SZSE", "BSE")
 PAGE_SIZE = 5_000
 INDEX_MEMBER_PAGE_SIZE = 2_000
@@ -46,27 +42,6 @@ INC_CALENDAR_PAST_DAYS = 60
 INC_CALENDAR_FUTURE_DAYS = 366
 INC_WEEKLY_REFRESH_WEEKDAY = 0
 INC_MONTHLY_REFRESH_DAY = 1
-
-# 时间均取数据可以安全用于交易/研究的时刻。财务公告没有时分秒，保守地到公告日结束可见。
-VISIBILITY_RULES: dict[str, tuple[tuple[str, ...], time]] = {
-    "daily": (("trade_date",), time(16, 0)),
-    "daily_basic": (("trade_date",), time(17, 0)),
-    "adj_factor": (("trade_date",), time(9, 20)),
-    "suspend_d": (("trade_date",), time(9, 30)),
-    "stk_limit": (("trade_date",), time(8, 45)),
-    "stock_st": (("trade_date",), time(9, 20)),
-    "moneyflow": (("trade_date",), time(19, 0)),
-    # 实施记录包含登记日、除权日等后续信息，必须等实施公告后才整体可见。
-    "dividend": (("imp_ann_date", "ann_date"), ANNOUNCEMENT_VISIBLE_TIME),
-    "forecast": (("ann_date",), ANNOUNCEMENT_VISIBLE_TIME),
-    "express": (("ann_date",), ANNOUNCEMENT_VISIBLE_TIME),
-    "fina_audit": (("ann_date",), ANNOUNCEMENT_VISIBLE_TIME),
-    "income": (("f_ann_date", "ann_date"), ANNOUNCEMENT_VISIBLE_TIME),
-    "balancesheet": (("f_ann_date", "ann_date"), ANNOUNCEMENT_VISIBLE_TIME),
-    "cashflow": (("f_ann_date", "ann_date"), ANNOUNCEMENT_VISIBLE_TIME),
-    "fina_indicator": (("ann_date",), ANNOUNCEMENT_VISIBLE_TIME),
-    "trade_cal": (("cal_date",), time(0, 0)),
-}
 
 PagedRequest = Callable[[int, int], pd.DataFrame]
 TradeDateRequest = Callable[[str, int, int], pd.DataFrame]
@@ -417,7 +392,6 @@ def sync_dividend(
                 frame = _fetch_pages(request_dividend)
                 tables.append(_normalise_frame("dividend", frame))
         data = _deduplicate_table(_concat_tables(tables, TABLE_SCHEMAS["dividend"]))
-        data = _filter_visible_dates(data, chunk_start, chunk_end)
         total += store.write("dividend", data)
     return total
 
@@ -458,7 +432,6 @@ def sync_fina_audit(
 
             frame = _fetch_pages(request_audit)
             data = _normalise_frame("fina_audit", frame)
-            data = _filter_visible_dates(data, range_start, range_end)
             tables.append(data)
         combined = _concat_tables(tables, TABLE_SCHEMAS["fina_audit"])
         total += store.write("fina_audit", combined)
@@ -471,7 +444,7 @@ def sync_sw_industry(
     start_date: str | date,
     end_date: str | date,
 ) -> int:
-    """分页获取全部申万三级行业成员，并拆成 IN/OUT 可见事件。"""
+    """分页获取全部申万三级行业成员原始区间。"""
     requested_start = _parse_date(start_date)
     requested_end = _parse_date(end_date)
     if requested_start > requested_end:
@@ -491,38 +464,7 @@ def sync_sw_industry(
     ]
     source = pd.concat(frames, ignore_index=True)
     _validate_columns(source, SOURCE_FIELDS["sw_industry"], "index_member_all")
-
-    rows: list[dict[str, object]] = []
-    seen: set[tuple[object, ...]] = set()
-    for raw_row in source.to_dict("records"):
-        cleaned = {name: _clean_scalar(raw_row.get(name)) for name in source.columns}
-        raw_key = tuple(cleaned[name] for name in SOURCE_FIELDS["sw_industry"])
-        if raw_key in seen:
-            continue
-        seen.add(raw_key)
-        out_date = _parse_date(cleaned["out_date"]) if cleaned["out_date"] is not None else None
-        for event_type, source_date in (("IN", cleaned["in_date"]), ("OUT", out_date)):
-            if source_date is None:
-                continue
-            event_date = _parse_date(source_date)
-            rows.append(
-                {
-                    "partition_date": event_date,
-                    "ts_code": str(cleaned["ts_code"]),
-                    "visible_at": _at_time(event_date, time(9, 0)),
-                    "event_date": event_date,
-                    "event_type": event_type,
-                    "l1_code": cleaned["l1_code"],
-                    "l1_name": cleaned["l1_name"],
-                    "l2_code": cleaned["l2_code"],
-                    "l2_name": cleaned["l2_name"],
-                    "l3_code": cleaned["l3_code"],
-                    "l3_name": cleaned["l3_name"],
-                    "stock_name": cleaned["name"],
-                }
-            )
-
-    data = _deduplicate_table(pa.Table.from_pylist(rows, schema=TABLE_SCHEMAS["sw_industry"]))
+    data = _deduplicate_table(_normalise_frame("sw_industry", source))
     return store.write("sw_industry", data)
 
 
@@ -768,7 +710,6 @@ def _sync_announcement_range_dataset(
             )
         )
         data = _normalise_frame(dataset, frame)
-        data = _filter_visible_dates(data, chunk_start, chunk_end)
         total += store.write(dataset, data)
     return total
 
@@ -850,23 +791,13 @@ def _normalise_frame(dataset: str, frame: pd.DataFrame) -> pa.Table:
     if frame.empty and not len(frame.columns):
         frame = pd.DataFrame(columns=pd.Index(source_fields))
     _validate_columns(frame, source_fields, dataset)
-    visible_fields, visible_time = VISIBILITY_RULES[dataset]
     schema = TABLE_SCHEMAS[dataset]
     rows: list[dict[str, object]] = []
     for raw_row in frame.to_dict("records"):
         cleaned = {name: _clean_scalar(raw_row.get(name)) for name in source_fields}
-        visible_date = _first_date(cleaned, visible_fields)
-        if visible_date is None:
-            raise ValueError(f"{dataset} 返回记录缺少可用的可见日期: {cleaned}")
-        row: dict[str, object] = {
-            "partition_date": visible_date,
-            "ts_code": str(cleaned["ts_code"]),
-            "visible_at": _at_time(visible_date, visible_time),
-        }
+        row: dict[str, object] = {}
         for field in schema:
             name = field.name
-            if name in row:
-                continue
             value = cleaned.get(name)
             if name in DATE_FIELDS and value is not None:
                 value = _parse_date(value)
@@ -876,6 +807,8 @@ def _normalise_frame(dataset: str, frame: pd.DataFrame) -> pa.Table:
                 value = int(float(str(value)))
             elif pa.types.is_string(field.type) and value is not None:
                 value = str(value)
+            if not field.nullable and value is None:
+                raise ValueError(f"{dataset} 返回记录缺少必填字段 {name}")
             row[name] = value
         rows.append(row)
     return pa.Table.from_pylist(rows, schema=schema)
@@ -896,9 +829,7 @@ def _normalise_trade_cal(frame: pd.DataFrame) -> pa.Table:
         pretrade_date = cleaned["pretrade_date"]
         rows.append(
             {
-                "partition_date": cal_date,
                 "exchange": str(cleaned["exchange"]),
-                "visible_at": _at_time(cal_date, time(0, 0)),
                 "cal_date": cal_date,
                 "is_open": int(str(is_open)),
                 "pretrade_date": (
@@ -925,14 +856,6 @@ def _deduplicate_table(data: pa.Table) -> pa.Table:
     for row in data.to_pylist():
         unique[tuple(row[name] for name in data.schema.names)] = row
     return pa.Table.from_pylist(list(unique.values()), schema=data.schema)
-
-
-def _first_date(row: dict[str, object], names: tuple[str, ...]) -> date | None:
-    for name in names:
-        value = row.get(name)
-        if value is not None:
-            return _parse_date(value)
-    return None
 
 
 def _clean_scalar(value: object) -> object | None:
@@ -1021,21 +944,6 @@ def _dates(start_date: date, end_date: date) -> list[date]:
     ]
 
 
-def _filter_visible_dates(data: pa.Table, start_date: date, end_date: date) -> pa.Table:
-    rows = [
-        row for row in data.to_pylist() if start_date <= _market_date(row["visible_at"]) <= end_date
-    ]
-    return pa.Table.from_pylist(rows, schema=data.schema)
-
-
-def _at_time(value: date, value_time: time) -> int:
-    return datetime_to_utc_us(datetime.combine(value, value_time, tzinfo=SHANGHAI))
-
-
-def _market_date(value: int) -> date:
-    return utc_us_to_datetime(value).astimezone(SHANGHAI).date()
-
-
 def exchange_for_ts_code(ts_code: str) -> str:
     """把股票代码后缀映射为 Tushare 交易日历的交易所代码。"""
     suffix = ts_code.rsplit(".", maxsplit=1)[-1].upper()
@@ -1043,23 +951,3 @@ def exchange_for_ts_code(ts_code: str) -> str:
         return {"SH": "SSE", "SZ": "SZSE", "BJ": "BSE"}[suffix]
     except KeyError:
         raise ValueError(f"无法从股票代码识别交易所: {ts_code!r}") from None
-
-
-if __name__ == '__main__':
-    import sys
-
-    token = sys.argv[1]
-    client = create_pro_client(token=token)
-    fields = ",".join(SOURCE_FIELDS["cashflow"])
-
-    df = _fetch_pages(
-        lambda limit, offset: client.cashflow_vip(
-            start_date="20240101",
-            end_date="20251231",
-            fields="",
-            limit=limit,
-            offset=offset,
-        )
-    )
-
-    print(df)

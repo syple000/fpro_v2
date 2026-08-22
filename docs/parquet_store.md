@@ -40,6 +40,7 @@ with ParquetStore(Path("data")) as store:
             partition_by="day",
             sort_by="id",
             primary_key=("id",),
+            deduplicate_prefer_by=None,
             max_buffer_rows=100_000,
             max_buffer_bytes=64 * 1024 * 1024,
             target_rows_per_file=1_000_000,
@@ -56,7 +57,7 @@ with ParquetStore(Path("data")) as store:
     )
 ```
 
-`partition_by`、`sort_by` 和 `primary_key` 可传单个字段名或字段名序列。`primary_key` 默认
+`partition_by`、`sort_by`、`primary_key` 和 `deduplicate_prefer_by` 可传单个字段名或字段名序列。`primary_key` 默认
 为 `None`，表示分区没有逻辑主键。主键只在单个分区内生效；表级唯一键等价于
 `partition_by + primary_key`。分区参数推荐使用字段到值的映射；
 单字段分区也可以直接传值。`read(partitions=...)` 接受分区映射序列，传 `None` 时读取所有
@@ -65,9 +66,31 @@ with ParquetStore(Path("data")) as store:
 
 `append` 只追加新文件；缓冲数据在 `flush` 或 `close` 前不可见。`replace_partition` 会完整
 替换一个分区并丢弃该分区此前尚未刷新的缓存，空 Table 表示清空。`compact_partition` 只
-处理当前 Manifest 内的物理文件：没有主键时仅重排文件，不去重；配置主键时按 Manifest 文件
-顺序和文件内行顺序保留最后一个物理版本，再排序和切分文件。主键字段包含 null 时拒绝压缩。
-配置主键后，即使分区只有一个文件，也会检查并清理文件内部的重复键。
+处理当前 Manifest 内的物理文件：没有主键时仅重排文件，不去重；配置主键时按文件提交时间、
+同次提交的文件顺序和文件内行顺序保留最后一个物理版本，再排序和切分文件。主键按
+null-safe 语义分组，多行中相同位置的 null 视为同一键值。配置主键后，即使分区只有一个文件，
+也会检查并清理文件内部的重复键。
+
+`deduplicate_prefer_by` 是可选冲突优先字段：按字段升序比较，较大值胜出；完全相同时仍由
+后提交的行胜出。该配置不会在 Parquet 中增加字段。
+
+Manifest 同时保存本次更新时间和每个文件的提交时间（UTC Unix Epoch 微秒）：
+
+```json
+{
+  "version": 2,
+  "updated_at": 1787155200000001,
+  "files": ["part-old.parquet", "part-new.parquet"],
+  "file_committed_at": {
+    "part-old.parquet": 1787155200000000,
+    "part-new.parquet": 1787155200000001
+  }
+}
+```
+
+读取和整理都会按 `file_committed_at` 排序，而不依赖文件名或 JSON 中对象键的顺序。即使系统时钟
+回拨，新的提交时间也至少比当前 Manifest 大 1 微秒。没有时间字段的旧版 Manifest 仍可读取；
+它原有的 `files` 数组顺序会被保留，并在下一次提交时自动补齐每文件时间。
 
 Schema 可以在末尾追加可空字段：
 

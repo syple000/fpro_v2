@@ -49,6 +49,7 @@ class TableConfig:
     max_buffer_bytes: int = 64 * 1024 * 1024
     target_rows_per_file: int = 1_000_000
     primary_key: str | Sequence[str] | None = None
+    deduplicate_prefer_by: str | Sequence[str] | None = None
 
     def __post_init__(self) -> None:
         if not self.name or Path(self.name).name != self.name or self.name in {".", ".."}:
@@ -63,20 +64,29 @@ class TableConfig:
         primary_key = (
             () if self.primary_key is None else _column_tuple(self.primary_key, "primary_key")
         )
+        deduplicate_prefer_by = (
+            ()
+            if self.deduplicate_prefer_by is None
+            else _column_tuple(self.deduplicate_prefer_by, "deduplicate_prefer_by")
+        )
         if not partition_by:
             raise ValueError("partition_by 至少需要一个字段")
         if self.primary_key is not None and not primary_key:
             raise ValueError("primary_key 至少需要一个字段")
+        if deduplicate_prefer_by and not primary_key:
+            raise ValueError("deduplicate_prefer_by 需要同时配置 primary_key")
         if len(set(partition_by)) != len(partition_by):
             raise ValueError("partition_by 不能包含重复字段")
         if len(set(sort_by)) != len(sort_by):
             raise ValueError("sort_by 不能包含重复字段")
         if len(set(primary_key)) != len(primary_key):
             raise ValueError("primary_key 不能包含重复字段")
+        if len(set(deduplicate_prefer_by)) != len(deduplicate_prefer_by):
+            raise ValueError("deduplicate_prefer_by 不能包含重复字段")
 
         missing = [
             name
-            for name in (*partition_by, *sort_by, *primary_key)
+            for name in (*partition_by, *sort_by, *primary_key, *deduplicate_prefer_by)
             if name not in self.schema.names
         ]
         if missing:
@@ -94,6 +104,11 @@ class TableConfig:
             self,
             "primary_key",
             None if self.primary_key is None else primary_key,
+        )
+        object.__setattr__(
+            self,
+            "deduplicate_prefer_by",
+            None if self.deduplicate_prefer_by is None else deduplicate_prefer_by,
         )
 
 
@@ -372,9 +387,6 @@ class ParquetStore:
         primary_key = tuple(config.primary_key or ())
         if not primary_key:
             return data
-        invalid = [name for name in primary_key if data.column(name).null_count]
-        if invalid:
-            raise ValueError(f"主键字段不能包含 null: {invalid}")
         if data.num_rows <= 1:
             return data
 
@@ -382,15 +394,41 @@ class ParquetStore:
         while position_name in data.schema.names:
             position_name = f"_{position_name}"
         positions = pa.array(range(data.num_rows), type=pa.int64())
-        keyed = data.select(primary_key).append_column(position_name, positions)
+        prefer_by = tuple(config.deduplicate_prefer_by or ())
+        if prefer_by:
+            preferred = data.select(prefer_by).append_column(position_name, positions)
+            priority_order = cast(
+                pa.Int64Array,
+                pc.sort_indices(
+                    preferred,
+                    sort_keys=[
+                        *((name, "ascending") for name in prefer_by),
+                        (position_name, "ascending"),
+                    ],
+                    null_placement="at_start",
+                ).cast(pa.int64()),
+            )
+        else:
+            priority_order = positions
+
+        ranked_keys = data.select(primary_key).take(priority_order)
+        ranks = pa.array(range(data.num_rows), type=pa.int64())
+        keyed = ranked_keys.append_column(position_name, ranks)
         grouped = keyed.group_by(list(primary_key), use_threads=False).aggregate(
             [(position_name, "max")]
         )
-        selected = grouped.column(grouped.num_columns - 1).combine_chunks()
-        if len(selected) == data.num_rows:
+        selected_ranks = cast(
+            pa.Int64Array,
+            grouped.column(grouped.num_columns - 1).combine_chunks(),
+        )
+        if len(selected_ranks) == data.num_rows:
             return data
-        selected_order = cast(pa.Int64Array, pc.sort_indices(selected).cast(pa.int64()))
-        selected_positions = cast(pa.Int64Array, pc.take(selected, selected_order))
+        selected_positions = cast(pa.Int64Array, pc.take(priority_order, selected_ranks))
+        selected_order = cast(
+            pa.Int64Array,
+            pc.sort_indices(selected_positions).cast(pa.int64()),
+        )
+        selected_positions = cast(pa.Int64Array, pc.take(selected_positions, selected_order))
         return data.take(selected_positions)
 
     def _commit(

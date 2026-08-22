@@ -2,17 +2,15 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable
-from datetime import date, datetime, timedelta
+from datetime import date, timedelta
 from pathlib import Path
-from typing import ParamSpec, TypeVar, cast
-from zoneinfo import ZoneInfo
+from typing import ParamSpec, TypeVar
 
 import pandas as pd
 import pyarrow as pa
 import pytest
 
 import tushare_data.sync as sync_module
-from fpro_common import datetime_to_utc_us, utc_us_to_datetime
 from tushare_data import (
     SOURCE_FIELDS,
     TABLE_SCHEMAS,
@@ -26,7 +24,13 @@ from tushare_data import (
     sync_suspend_d,
     sync_sw_industry,
 )
-from tushare_data.schemas import DATE_FIELDS, TABLE_PARTITION_BY, TABLE_SORT_BY
+from tushare_data.schemas import (
+    DATE_FIELDS,
+    TABLE_DEDUPLICATE_PREFER_BY,
+    TABLE_PARTITION_BY,
+    TABLE_PRIMARY_KEY,
+    TABLE_SORT_BY,
+)
 
 _P = ParamSpec("_P")
 _R = TypeVar("_R")
@@ -84,7 +88,7 @@ def _calendar_frame(fields: str, arguments: dict[str, object]) -> pd.DataFrame:
     return pd.DataFrame(rows, columns=pd.Index(fields.split(",")))
 
 
-def _record(dataset: str, ts_code: str, visible_date: str) -> dict[str, object]:
+def _record(dataset: str, ts_code: str, partition_date: str) -> dict[str, object]:
     schema = TABLE_SCHEMAS[dataset]
     result: dict[str, object] = {}
     for name in SOURCE_FIELDS[dataset]:
@@ -97,8 +101,7 @@ def _record(dataset: str, ts_code: str, visible_date: str) -> dict[str, object]:
         else:
             result[name] = 1.0
 
-    visible_fields = sync_module.VISIBILITY_RULES[dataset][0]
-    result[visible_fields[0]] = visible_date
+    result[TABLE_PARTITION_BY[dataset]] = partition_date
     return result
 
 
@@ -119,7 +122,7 @@ def _market_responder(
     return _empty(fields)
 
 
-def test_daily_fetches_full_market_and_partitions_by_visible_date(
+def test_daily_fetches_full_market_and_partitions_by_trade_date(
     tmp_path: Path,
 ) -> None:
     pro, api = _client(_market_responder)
@@ -140,7 +143,7 @@ def test_daily_fetches_full_market_and_partitions_by_visible_date(
     assert all("ts_code" not in call for call in daily_calls)
     assert [row["ts_code"] for row in first_day] == ["000001.SZ", "600000.SH"]
     assert len(first_stock) == 2
-    assert {row["partition_date"] for row in first_stock} == {
+    assert {row["trade_date"] for row in first_stock} == {
         date(2024, 1, 2),
         date(2024, 1, 3),
     }
@@ -149,18 +152,17 @@ def test_daily_fetches_full_market_and_partitions_by_visible_date(
         for manifest in (tmp_path / "daily").rglob("_manifest.json")
     ]
     assert len(partition_directories) == 2
-    assert all(path.startswith("partition_date=") for path in partition_directories)
+    assert all(path.startswith("trade_date=") for path in partition_directories)
     assert all("ts_code=" not in path for path in partition_directories)
-    assert {utc_us_to_datetime(row["visible_at"]).hour for row in first_stock} == {8}
     assert {row["exchange"] for row in calendar} == {"SSE", "SZSE", "BSE"}
-    assert {row["partition_date"] for row in calendar} == {date(2024, 1, 2)}
-    calendar_partition_directories = [
+    assert {row["cal_date"] for row in calendar} == {date(2024, 1, 2)}
+    calendar_partition_directories = sorted(
         manifest.parent.relative_to(tmp_path / "trade_cal").as_posix()
         for manifest in (tmp_path / "trade_cal").rglob("_manifest.json")
-    ]
+    )
     assert calendar_partition_directories == [
-        "partition_date=value%3A2024-01-02",
-        "partition_date=value%3A2024-01-03",
+        "cal_date=value%3A2024-01-02",
+        "cal_date=value%3A2024-01-03",
     ]
 
 
@@ -446,19 +448,19 @@ def test_daily_refresh_replaces_old_market_partition(tmp_path: Path) -> None:
     assert rows[0]["close"] == 2.0
 
 
-def test_store_rejects_partition_date_that_disagrees_with_visible_at(tmp_path: Path) -> None:
+def test_store_rejects_missing_natural_partition_date(tmp_path: Path) -> None:
     row = _record("daily", "000001.SZ", "20240102")
     frame = pd.DataFrame([row], columns=pd.Index(SOURCE_FIELDS["daily"]))
     data = sync_module._normalise_frame("daily", frame)
     invalid = data.set_column(
-        0,
-        data.schema.field("partition_date"),
-        pa.array([date(2024, 1, 3)], type=pa.date32()),
+        data.schema.get_field_index("trade_date"),
+        data.schema.field("trade_date"),
+        pa.array([None], type=pa.date32()),
     )
 
     with (
         TushareDataStore(tmp_path) as store,
-        pytest.raises(ValueError, match="与 visible_at 对应的北京时间日期"),
+        pytest.raises(ValueError, match="无效 trade_date"),
     ):
         store.write("daily", invalid)
 
@@ -478,7 +480,7 @@ def test_empty_cross_section_is_requested_again_on_the_next_refresh(
     assert len([call for call in api.calls if call[0] == "suspend_d"]) == 4
 
 
-def test_statement_uses_full_market_vip_api_and_actual_announcement_time(
+def test_statement_uses_full_market_vip_api_and_report_period_partition(
     tmp_path: Path,
 ) -> None:
     def responder(
@@ -505,9 +507,100 @@ def test_statement_uses_full_market_vip_api_and_actual_announcement_time(
     assert call[2]["start_date"] == "20240502"
     assert call[2]["end_date"] == "20240502"
     assert "ts_code" not in call[2]
-    assert row["visible_at"] == datetime_to_utc_us(
-        datetime(2024, 5, 2, 23, 59, 59, 999999, tzinfo=ZoneInfo("Asia/Shanghai"))
-    )
+    assert row["end_date"] == date(2024, 5, 2)
+    assert "visible_at" not in row
+
+
+def test_financial_revision_outside_request_window_is_kept_in_report_partition(
+    tmp_path: Path,
+) -> None:
+    def responder(
+        api_name: str,
+        fields: str,
+        _arguments: dict[str, object],
+    ) -> pd.DataFrame:
+        if api_name != "cashflow_vip":
+            return _empty(fields)
+        original = _record("cashflow", "000001.SZ", "20240418")
+        original["ann_date"] = "20240418"
+        original["f_ann_date"] = "20240418"
+        original["end_date"] = "20231231"
+        original["update_flag"] = "0"
+        original["free_cashflow"] = 1.0
+        revision = dict(original)
+        revision["f_ann_date"] = "20250429"
+        revision["update_flag"] = "1"
+        revision["free_cashflow"] = 2.0
+        return pd.DataFrame([original, revision], columns=pd.Index(fields.split(",")))
+
+    pro, _ = _client(responder)
+    with TushareDataStore(tmp_path) as store:
+        assert sync_module.sync_cashflow(pro, store, "20240418", "20240418") == 2
+        rows = store.read("cashflow", date(2023, 12, 31)).to_pylist()
+
+    assert [
+        (row["f_ann_date"], row["update_flag"], row["free_cashflow"])
+        for row in rows
+    ] == [
+        (date(2024, 4, 18), "0", 1.0),
+        (date(2025, 4, 29), "1", 2.0),
+    ]
+
+
+def test_financial_primary_key_prefers_latest_update_flag_in_one_dump(
+    tmp_path: Path,
+) -> None:
+    def responder(
+        api_name: str,
+        fields: str,
+        _arguments: dict[str, object],
+    ) -> pd.DataFrame:
+        if api_name != "cashflow_vip":
+            return _empty(fields)
+        latest = _record("cashflow", "000001.SZ", "20240418")
+        latest["ann_date"] = "20240418"
+        latest["end_date"] = "20231231"
+        latest["update_flag"] = "1"
+        latest["free_cashflow"] = 2.0
+        previous = dict(latest)
+        previous["update_flag"] = "0"
+        previous["free_cashflow"] = 1.0
+        # 故意让最新版本排在接口返回的前面，存储排序仍应让 update_flag=1 最后胜出。
+        return pd.DataFrame([latest, previous], columns=pd.Index(fields.split(",")))
+
+    pro, _ = _client(responder)
+    with TushareDataStore(tmp_path) as store:
+        assert sync_module.sync_cashflow(pro, store, "20240418", "20240418") == 2
+        rows = store.read("cashflow", date(2023, 12, 31)).to_pylist()
+
+    assert [(row["update_flag"], row["free_cashflow"]) for row in rows] == [("1", 2.0)]
+
+
+def test_later_financial_dump_adds_rows_without_replacing_partition(tmp_path: Path) -> None:
+    request_count = 0
+
+    def responder(
+        api_name: str,
+        fields: str,
+        _arguments: dict[str, object],
+    ) -> pd.DataFrame:
+        nonlocal request_count
+        if api_name != "cashflow_vip":
+            return _empty(fields)
+        request_count += 1
+        ts_code = "000001.SZ" if request_count == 1 else "600000.SH"
+        row = _record("cashflow", ts_code, "20240418")
+        row["ann_date"] = "20240418"
+        row["end_date"] = "20231231"
+        return pd.DataFrame([row], columns=pd.Index(fields.split(",")))
+
+    pro, _ = _client(responder)
+    with TushareDataStore(tmp_path) as store:
+        assert sync_module.sync_cashflow(pro, store, "20240418", "20240418") == 1
+        assert sync_module.sync_cashflow(pro, store, "20240418", "20240418") == 1
+        rows = store.read("cashflow", date(2023, 12, 31)).to_pylist()
+
+    assert [row["ts_code"] for row in rows] == ["000001.SZ", "600000.SH"]
 
 
 def test_indicator_uses_full_market_vip_announcement_range(tmp_path: Path) -> None:
@@ -531,7 +624,7 @@ def test_indicator_uses_full_market_vip_announcement_range(tmp_path: Path) -> No
     assert "ts_code" not in api.calls[0][2]
 
 
-def test_dividend_waits_until_implementation_announcement_for_future_fields(
+def test_dividend_keeps_implementation_announcement_as_raw_field(
     tmp_path: Path,
 ) -> None:
     def responder(
@@ -556,20 +649,22 @@ def test_dividend_waits_until_implementation_announcement_for_future_fields(
         {"limit": 5_000, "offset": 0, "ann_date": "20240430"},
         {"limit": 5_000, "offset": 0, "imp_ann_date": "20240430"},
     ]
-    assert utc_us_to_datetime(row["visible_at"]).astimezone(
-        ZoneInfo("Asia/Shanghai")
-    ).date() == date(2024, 4, 30)
+    assert row["end_date"] == date(2024, 4, 30)
+    assert row["imp_ann_date"] == date(2024, 4, 30)
+    assert "visible_at" not in row
 
 
-def test_dividend_does_not_treat_ex_date_as_a_visibility_date() -> None:
+def test_dividend_normalisation_does_not_require_a_derived_visibility_date() -> None:
     row = _record("dividend", "000001.SZ", "20240430")
     row["imp_ann_date"] = None
     row["ann_date"] = None
     row["ex_date"] = "20240430"
     frame = pd.DataFrame([row], columns=pd.Index(SOURCE_FIELDS["dividend"]))
 
-    with pytest.raises(ValueError, match="缺少可用的可见日期"):
-        sync_module._normalise_frame("dividend", frame)
+    data = sync_module._normalise_frame("dividend", frame)
+
+    assert data.column("end_date").to_pylist() == [date(2024, 4, 30)]
+    assert data.column("ex_date").to_pylist() == [date(2024, 4, 30)]
 
 
 def test_sw_industry_full_market_api_is_paginated(tmp_path: Path) -> None:
@@ -620,9 +715,9 @@ def test_sw_industry_full_market_api_is_paginated(tmp_path: Path) -> None:
         ("Y", 2_000),
         ("N", 0),
     ]
-    assert [(row["event_date"], row["event_type"]) for row in rows] == [
-        (date(2020, 1, 1), "IN"),
-        (date(2021, 1, 1), "IN"),
+    assert [(row["in_date"], row["l3_code"], row["is_new"]) for row in rows] == [
+        (date(2020, 1, 1), "850001.SI", "Y"),
+        (date(2021, 1, 1), "850001.SI", "Y"),
     ]
 
 
@@ -700,19 +795,24 @@ def test_empty_requested_range_is_allowed(tmp_path: Path) -> None:
     assert requested == ["20990101", "20990102"]
 
 
-def test_every_data_table_has_date_partition_and_market_code_sort() -> None:
-    assert set(sync_module.VISIBILITY_RULES) == set(TABLE_SCHEMAS) - {"sw_industry"}
+def test_every_data_table_has_date_partition_primary_key_and_stable_sort() -> None:
+    assert set(TABLE_PRIMARY_KEY) == set(TABLE_SCHEMAS)
+    assert set(TABLE_SORT_BY) == set(TABLE_SCHEMAS)
+    assert set(TABLE_DEDUPLICATE_PREFER_BY) == set(TABLE_SCHEMAS)
     for dataset, schema in TABLE_SCHEMAS.items():
-        assert schema.names[0] == "partition_date"
-        assert schema.field("partition_date").type == pa.date32()
-        assert TABLE_PARTITION_BY[dataset] == "partition_date"
-        if dataset == "trade_cal":
-            assert schema.names[:3] == ["partition_date", "exchange", "visible_at"]
-            assert TABLE_SORT_BY[dataset] == "exchange"
+        partition_by = TABLE_PARTITION_BY[dataset]
+        assert partition_by in SOURCE_FIELDS[dataset]
+        assert schema.field(partition_by).type == pa.date32()
+        assert schema.names == list(SOURCE_FIELDS[dataset])
+        assert TABLE_SORT_BY[dataset] == TABLE_PRIMARY_KEY[dataset]
+        assert all(name in schema.names for name in TABLE_PRIMARY_KEY[dataset])
+        if "update_flag" in schema.names:
+            assert TABLE_DEDUPLICATE_PREFER_BY[dataset] == ("update_flag",)
         else:
-            assert schema.names[:3] == ["partition_date", "ts_code", "visible_at"]
-            assert TABLE_SORT_BY[dataset] == "ts_code"
-        assert schema.field("visible_at").type == pa.int64(), dataset
+            assert TABLE_DEDUPLICATE_PREFER_BY[dataset] == ()
+        assert "partition_date" not in schema.names
+        assert "visible_at" not in schema.names
+        assert "observed_at" not in schema.names
         assert SOURCE_FIELDS[dataset], dataset
 
 
@@ -720,20 +820,21 @@ def test_every_data_table_has_date_partition_and_market_code_sort() -> None:
     "dataset",
     sorted(set(TABLE_SCHEMAS) - {"sw_industry", "trade_cal"}),
 )
-def test_every_standard_dataset_derives_partition_from_visible_date(
+def test_every_standard_dataset_keeps_only_source_fields_and_uses_natural_partition(
     dataset: str,
     tmp_path: Path,
 ) -> None:
-    visible_date = date(2024, 1, 2)
+    partition_date = date(2024, 1, 2)
     row = _record(dataset, "000001.SZ", "20240102")
     frame = pd.DataFrame([row], columns=pd.Index(SOURCE_FIELDS[dataset]))
     data = sync_module._normalise_frame(dataset, frame)
 
-    assert data.column("partition_date").to_pylist() == [visible_date]
-    assert sync_module._market_date(data.column("visible_at")[0].as_py()) == visible_date
+    partition_by = TABLE_PARTITION_BY[dataset]
+    assert data.schema.names == list(SOURCE_FIELDS[dataset])
+    assert data.column(partition_by).to_pylist() == [partition_date]
     with TushareDataStore(tmp_path) as store:
         assert store.write(dataset, data) == 1
-        assert store.read(dataset, visible_date).num_rows == 1
+        assert store.read(dataset, partition_date).num_rows == 1
 
 
 def test_schema_contains_current_documented_and_proxy_supported_fields() -> None:
@@ -757,26 +858,15 @@ def test_official_integer_fields_use_int64() -> None:
     assert TABLE_SCHEMAS["express"].field("is_audit").type == pa.int64()
 
 
-def test_read_accepts_only_int64_microsecond_filter(tmp_path: Path) -> None:
+def test_storage_read_filters_only_source_fields(tmp_path: Path) -> None:
     pro, _ = _client(_market_responder)
     with TushareDataStore(tmp_path) as store:
         sync_daily(pro, store, "20240101", "20240101")
-        visible_end = datetime_to_utc_us(
-            datetime(2024, 1, 1, 16, tzinfo=ZoneInfo("Asia/Shanghai"))
-        )
-        assert (
-            store.read(
-                "daily",
-                date(2024, 1, 1),
-                ts_code="000001.SZ",
-                visible_end=visible_end,
-            ).num_rows
-            == 1
-        )
-        with pytest.raises(TypeError, match="Unix Epoch 微秒整数"):
-            store.read(
-                "daily",
-                date(2024, 1, 1),
-                ts_code="000001.SZ",
-                visible_end=cast(int, datetime(2024, 1, 1, 8)),
-            )
+        rows = store.read(
+            "daily",
+            date(2024, 1, 1),
+            ts_code="000001.SZ",
+        ).to_pylist()
+
+    assert len(rows) == 1
+    assert set(rows[0]) == set(SOURCE_FIELDS["daily"])

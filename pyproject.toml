@@ -7,6 +7,15 @@ requires-python = ">=3.11"
 dependencies = []
 
 [dependency-groups]
+data = [
+    "duckdb>=1.4,<2.0",
+    "httpx2>=2.0,<3.0",
+    "pandas>=2.2,<3.0",
+    "pydantic>=2.10,<3.0",
+    "pyarrow>=18.0,<24.0",
+    "requests>=2.32,<3.0",
+    "tzdata>=2025.2",
+]
 parquet-store = [
     "pyarrow>=18.0,<24.0",
 ]
@@ -31,6 +40,7 @@ tushare-data = [
     "tzdata>=2025.2",
 ]
 dev = [
+    "duckdb>=1.4,<2.0",
     "httpx2>=2.0,<3.0",
     "pandas>=2.2,<3.0",
     "pyright>=1.1,<2.0",
@@ -55,6 +65,7 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = [
     "src/fpro_common",
+    "src/data",
     "src/parquet_store",
     "src/qmt_agent",
     "src/qmt_protocol",

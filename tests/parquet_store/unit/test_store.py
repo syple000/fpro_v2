@@ -14,7 +14,9 @@ from parquet_store import ParquetStore, SchemaMismatchError, TableConfig
 
 class ManifestPayload(TypedDict):
     version: int
+    updated_at: int
     files: list[str]
+    file_committed_at: dict[str, int]
 
 
 SCHEMA = pa.schema(
@@ -56,6 +58,7 @@ def make_store(
     root: Path,
     *,
     primary_key: str | tuple[str, ...] | None = None,
+    deduplicate_prefer_by: str | tuple[str, ...] | None = None,
     max_buffer_rows: int = 100,
     max_buffer_bytes: int = 1024 * 1024,
     target_rows_per_file: int = 100,
@@ -68,6 +71,7 @@ def make_store(
             partition_by="day",
             sort_by="id",
             primary_key=primary_key,
+            deduplicate_prefer_by=deduplicate_prefer_by,
             max_buffer_rows=max_buffer_rows,
             max_buffer_bytes=max_buffer_bytes,
             target_rows_per_file=target_rows_per_file,
@@ -117,6 +121,11 @@ def test_append_buffers_by_partition_and_flush_creates_immutable_files(tmp_path:
 
     assert second_manifest["version"] == 2
     assert len(second_manifest["files"]) == 2
+    assert second_manifest["updated_at"] == max(second_manifest["file_committed_at"].values())
+    assert (
+        second_manifest["file_committed_at"][first_file]
+        < second_manifest["file_committed_at"][second_manifest["files"][-1]]
+    )
     assert first_file in second_manifest["files"]
     assert (manifest_path.parent / first_file).exists()
     assert store.read("events").num_rows == 5
@@ -256,6 +265,36 @@ def test_compact_deduplicates_primary_key_and_keeps_last_physical_row(
     ]
 
 
+def test_compact_orders_files_by_manifest_commit_time(tmp_path: Path) -> None:
+    store = make_store(tmp_path, primary_key="id", max_buffer_rows=1)
+    store.append("events", make_table(("a", 1, 1.0)))
+    store.append("events", make_table(("a", 1, 2.0)))
+    manifest_path, manifest = only_manifest(tmp_path)
+    manifest["files"].reverse()
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    store.compact_partition("events", "a")
+
+    assert store.read("events", "a").to_pylist() == [{"day": "a", "id": 1, "value": 2.0}]
+
+
+def test_legacy_manifest_file_order_is_migrated_to_commit_times(tmp_path: Path) -> None:
+    store = make_store(tmp_path, primary_key="id", max_buffer_rows=1)
+    store.append("events", make_table(("a", 1, 1.0)))
+    manifest_path, manifest = only_manifest(tmp_path)
+    legacy: dict[str, object] = dict(manifest)
+    del legacy["updated_at"]
+    del legacy["file_committed_at"]
+    manifest_path.write_text(json.dumps(legacy), encoding="utf-8")
+
+    store.append("events", make_table(("a", 1, 2.0)))
+    migrated = read_manifest(manifest_path)
+    store.compact_partition("events", "a")
+
+    assert set(migrated["file_committed_at"]) == set(migrated["files"])
+    assert store.read("events", "a").to_pylist() == [{"day": "a", "id": 1, "value": 2.0}]
+
+
 def test_compact_deduplicates_primary_key_inside_single_file(tmp_path: Path) -> None:
     store = make_store(tmp_path, primary_key=("day", "id"))
     store.append("events", make_table(("a", 1, 1.0), ("a", 1, 1.0)))
@@ -265,9 +304,7 @@ def test_compact_deduplicates_primary_key_inside_single_file(tmp_path: Path) -> 
     store.compact_partition("events", "a")
 
     assert read_manifest(manifest_path)["version"] == old_manifest["version"] + 1
-    assert store.read("events", "a").to_pylist() == [
-        {"day": "a", "id": 1, "value": 1.0}
-    ]
+    assert store.read("events", "a").to_pylist() == [{"day": "a", "id": 1, "value": 1.0}]
 
 
 def test_compact_without_primary_key_keeps_duplicate_rows(tmp_path: Path) -> None:
@@ -283,7 +320,7 @@ def test_compact_without_primary_key_keeps_duplicate_rows(tmp_path: Path) -> Non
     ]
 
 
-def test_compact_rejects_null_primary_key_without_changing_manifest(tmp_path: Path) -> None:
+def test_compact_treats_null_primary_key_as_a_deduplicatable_value(tmp_path: Path) -> None:
     nullable_key_schema = pa.schema(
         [SCHEMA.field("day"), pa.field("id", pa.int64()), SCHEMA.field("value")],
         metadata={b"schema-version": b"1"},
@@ -297,20 +334,38 @@ def test_compact_rejects_null_primary_key_without_changing_manifest(tmp_path: Pa
             primary_key="id",
         )
     )
-    invalid = pa.Table.from_pylist(
-        [{"day": "a", "id": None, "value": 1.0}],
+    data = pa.Table.from_pylist(
+        [
+            {"day": "a", "id": None, "value": 1.0},
+            {"day": "a", "id": None, "value": 2.0},
+        ],
         schema=nullable_key_schema,
     )
-    store.append("events", invalid)
+    store.append("events", data)
     store.flush()
-    manifest_path, manifest = only_manifest(tmp_path)
-    original_bytes = manifest_path.read_bytes()
 
-    with pytest.raises(ValueError, match="主键字段不能包含 null"):
-        store.compact_partition("events", "a")
+    store.compact_partition("events", "a")
 
-    assert manifest_path.read_bytes() == original_bytes
-    assert read_manifest(manifest_path) == manifest
+    assert store.read("events", "a").to_pylist() == [
+        {"day": "a", "id": None, "value": 2.0}
+    ]
+
+
+def test_compact_prefers_larger_configured_value_before_commit_order(tmp_path: Path) -> None:
+    store = make_store(
+        tmp_path,
+        primary_key="id",
+        deduplicate_prefer_by="value",
+        max_buffer_rows=1,
+    )
+    store.append("events", make_table(("a", 1, 3.0)))
+    store.append("events", make_table(("a", 1, 1.0)))
+
+    store.compact_partition("events", "a")
+
+    assert store.read("events", "a").to_pylist() == [
+        {"day": "a", "id": 1, "value": 3.0}
+    ]
 
 
 def test_primary_key_configuration_is_validated() -> None:
@@ -337,6 +392,13 @@ def test_primary_key_configuration_is_validated() -> None:
             schema=SCHEMA,
             partition_by="day",
             primary_key="missing",
+        )
+    with pytest.raises(ValueError, match="需要同时配置 primary_key"):
+        TableConfig(
+            name="events",
+            schema=SCHEMA,
+            partition_by="day",
+            deduplicate_prefer_by="value",
         )
 
 
