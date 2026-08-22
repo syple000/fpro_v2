@@ -1514,11 +1514,13 @@ SW_INDUSTRY_SCHEMA = pa.schema(
 
 TRADE_CAL_SCHEMA = pa.schema(
     [
+        # visible_at 对应的北京时间日期，只用于物理分区。
+        pa.field("partition_date", pa.date32(), nullable=False),
         # 交易所代码：SSE、SZSE 或 BSE。
         pa.field("exchange", pa.string(), nullable=False),
         # 日历信息可见的 UTC Unix Epoch 微秒时间戳。
         pa.field("visible_at", VISIBLE_TIME_TYPE, nullable=False),
-        # 日历日期，也是该表的物理分区字段。
+        # 日历日期。
         pa.field("cal_date", pa.date32(), nullable=False),
         # 是否开市：1 开市，0 休市。
         pa.field("is_open", pa.int8(), nullable=False),
@@ -1567,9 +1569,7 @@ SOURCE_FIELDS = {
     "trade_cal": TRADE_CAL_FIELDS,
 }
 
-TABLE_PARTITION_BY = {
-    dataset: "cal_date" if dataset == "trade_cal" else "partition_date" for dataset in TABLE_SCHEMAS
-}
+TABLE_PARTITION_BY = {dataset: "partition_date" for dataset in TABLE_SCHEMAS}
 
 TABLE_SORT_BY = {
     dataset: "exchange" if dataset == "trade_cal" else "ts_code" for dataset in TABLE_SCHEMAS

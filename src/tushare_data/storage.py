@@ -9,16 +9,19 @@ from datetime import date
 from pathlib import Path
 from threading import RLock
 from uuid import uuid4
+from zoneinfo import ZoneInfo
 
 import pyarrow as pa
 
-from fpro_common import require_utc_us, utc_now_us
+from fpro_common import require_utc_us, utc_now_us, utc_us_to_datetime
 from parquet_store import ParquetStore, TableConfig
 from tushare_data.schemas import (
     TABLE_PARTITION_BY,
     TABLE_SCHEMAS,
     TABLE_SORT_BY,
 )
+
+SHANGHAI = ZoneInfo("Asia/Shanghai")
 
 
 class TushareDataStore:
@@ -47,10 +50,23 @@ class TushareDataStore:
 
         partition_by = TABLE_PARTITION_BY[dataset]
         indices: dict[date, list[int]] = {}
-        for index, value in enumerate(data.column(partition_by).to_pylist()):
-            if not isinstance(value, date):
-                raise ValueError(f"{dataset} 返回了无效 {partition_by}: {value!r}")
-            indices.setdefault(value, []).append(index)
+        partition_values = data.column(partition_by).to_pylist()
+        visible_values = data.column("visible_at").to_pylist()
+        for index, (partition_value, visible_value) in enumerate(
+            zip(partition_values, visible_values, strict=True)
+        ):
+            if not isinstance(partition_value, date):
+                raise ValueError(
+                    f"{dataset} 返回了无效 {partition_by}: {partition_value!r}"
+                )
+            visible_at = require_utc_us(visible_value, f"{dataset}.visible_at")
+            visible_date = utc_us_to_datetime(visible_at).astimezone(SHANGHAI).date()
+            if partition_value != visible_date:
+                raise ValueError(
+                    f"{dataset} 的 {partition_by}={partition_value} 与 visible_at "
+                    f"对应的北京时间日期 {visible_date} 不一致"
+                )
+            indices.setdefault(partition_value, []).append(index)
 
         for partition_value, positions in indices.items():
             partition_data = data.take(pa.array(positions, type=pa.int64()))

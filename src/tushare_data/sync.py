@@ -57,7 +57,7 @@ VISIBILITY_RULES: dict[str, tuple[tuple[str, ...], time]] = {
     "stock_st": (("trade_date",), time(9, 20)),
     "moneyflow": (("trade_date",), time(19, 0)),
     # 实施记录包含登记日、除权日等后续信息，必须等实施公告后才整体可见。
-    "dividend": (("imp_ann_date", "ann_date", "ex_date"), ANNOUNCEMENT_VISIBLE_TIME),
+    "dividend": (("imp_ann_date", "ann_date"), ANNOUNCEMENT_VISIBLE_TIME),
     "forecast": (("ann_date",), ANNOUNCEMENT_VISIBLE_TIME),
     "express": (("ann_date",), ANNOUNCEMENT_VISIBLE_TIME),
     "fina_audit": (("ann_date",), ANNOUNCEMENT_VISIBLE_TIME),
@@ -896,6 +896,7 @@ def _normalise_trade_cal(frame: pd.DataFrame) -> pa.Table:
         pretrade_date = cleaned["pretrade_date"]
         rows.append(
             {
+                "partition_date": cal_date,
                 "exchange": str(cleaned["exchange"]),
                 "visible_at": _at_time(cal_date, time(0, 0)),
                 "cal_date": cal_date,
@@ -1045,7 +1046,8 @@ def exchange_for_ts_code(ts_code: str) -> str:
 
 
 if __name__ == '__main__':
-    import sys 
+    import sys
+
     token = sys.argv[1]
     client = create_pro_client(token=token)
     fields = ",".join(SOURCE_FIELDS["cashflow"])

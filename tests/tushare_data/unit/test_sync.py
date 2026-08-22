@@ -153,6 +153,15 @@ def test_daily_fetches_full_market_and_partitions_by_visible_date(
     assert all("ts_code=" not in path for path in partition_directories)
     assert {utc_us_to_datetime(row["visible_at"]).hour for row in first_stock} == {8}
     assert {row["exchange"] for row in calendar} == {"SSE", "SZSE", "BSE"}
+    assert {row["partition_date"] for row in calendar} == {date(2024, 1, 2)}
+    calendar_partition_directories = [
+        manifest.parent.relative_to(tmp_path / "trade_cal").as_posix()
+        for manifest in (tmp_path / "trade_cal").rglob("_manifest.json")
+    ]
+    assert calendar_partition_directories == [
+        "partition_date=value%3A2024-01-02",
+        "partition_date=value%3A2024-01-03",
+    ]
 
 
 def test_data_store_public_business_methods_are_only_read_and_write() -> None:
@@ -437,6 +446,25 @@ def test_daily_refresh_replaces_old_market_partition(tmp_path: Path) -> None:
     assert rows[0]["close"] == 2.0
 
 
+def test_store_rejects_partition_date_that_disagrees_with_visible_at(tmp_path: Path) -> None:
+    row = _record("daily", "000001.SZ", "20240102")
+    frame = pd.DataFrame([row], columns=pd.Index(SOURCE_FIELDS["daily"]))
+    data = sync_module._normalise_frame("daily", frame)
+    invalid = data.set_column(
+        0,
+        data.schema.field("partition_date"),
+        pa.array([date(2024, 1, 3)], type=pa.date32()),
+    )
+
+    with (
+        TushareDataStore(tmp_path) as store,
+        pytest.raises(ValueError, match="与 visible_at 对应的北京时间日期"),
+    ):
+        store.write("daily", invalid)
+
+    assert not list((tmp_path / "daily").rglob("_manifest.json"))
+
+
 def test_empty_cross_section_is_requested_again_on_the_next_refresh(
     tmp_path: Path,
 ) -> None:
@@ -531,6 +559,17 @@ def test_dividend_waits_until_implementation_announcement_for_future_fields(
     assert utc_us_to_datetime(row["visible_at"]).astimezone(
         ZoneInfo("Asia/Shanghai")
     ).date() == date(2024, 4, 30)
+
+
+def test_dividend_does_not_treat_ex_date_as_a_visibility_date() -> None:
+    row = _record("dividend", "000001.SZ", "20240430")
+    row["imp_ann_date"] = None
+    row["ann_date"] = None
+    row["ex_date"] = "20240430"
+    frame = pd.DataFrame([row], columns=pd.Index(SOURCE_FIELDS["dividend"]))
+
+    with pytest.raises(ValueError, match="缺少可用的可见日期"):
+        sync_module._normalise_frame("dividend", frame)
 
 
 def test_sw_industry_full_market_api_is_paginated(tmp_path: Path) -> None:
@@ -662,18 +701,39 @@ def test_empty_requested_range_is_allowed(tmp_path: Path) -> None:
 
 
 def test_every_data_table_has_date_partition_and_market_code_sort() -> None:
+    assert set(sync_module.VISIBILITY_RULES) == set(TABLE_SCHEMAS) - {"sw_industry"}
     for dataset, schema in TABLE_SCHEMAS.items():
+        assert schema.names[0] == "partition_date"
+        assert schema.field("partition_date").type == pa.date32()
+        assert TABLE_PARTITION_BY[dataset] == "partition_date"
         if dataset == "trade_cal":
-            assert schema.names[:2] == ["exchange", "visible_at"]
-            assert TABLE_PARTITION_BY[dataset] == "cal_date"
+            assert schema.names[:3] == ["partition_date", "exchange", "visible_at"]
             assert TABLE_SORT_BY[dataset] == "exchange"
         else:
             assert schema.names[:3] == ["partition_date", "ts_code", "visible_at"]
-            assert schema.field("partition_date").type == pa.date32()
-            assert TABLE_PARTITION_BY[dataset] == "partition_date"
             assert TABLE_SORT_BY[dataset] == "ts_code"
         assert schema.field("visible_at").type == pa.int64(), dataset
         assert SOURCE_FIELDS[dataset], dataset
+
+
+@pytest.mark.parametrize(
+    "dataset",
+    sorted(set(TABLE_SCHEMAS) - {"sw_industry", "trade_cal"}),
+)
+def test_every_standard_dataset_derives_partition_from_visible_date(
+    dataset: str,
+    tmp_path: Path,
+) -> None:
+    visible_date = date(2024, 1, 2)
+    row = _record(dataset, "000001.SZ", "20240102")
+    frame = pd.DataFrame([row], columns=pd.Index(SOURCE_FIELDS[dataset]))
+    data = sync_module._normalise_frame(dataset, frame)
+
+    assert data.column("partition_date").to_pylist() == [visible_date]
+    assert sync_module._market_date(data.column("visible_at")[0].as_py()) == visible_date
+    with TushareDataStore(tmp_path) as store:
+        assert store.write(dataset, data) == 1
+        assert store.read(dataset, visible_date).num_rows == 1
 
 
 def test_schema_contains_current_documented_and_proxy_supported_fields() -> None:

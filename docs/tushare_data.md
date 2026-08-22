@@ -1,8 +1,8 @@
 # tushare_data
 
 `tushare_data` 通过 quicksync 代理调用 Tushare SDK，按全市场粒度获取指定历史区间，再写入现有
-`parquet_store`。股票数据以 `partition_date` 分区、分区内按 `ts_code` 排序；交易日历以
-`cal_date` 分区、分区内按 `exchange` 排序。
+`parquet_store`。所有数据都以 `visible_at` 对应的北京时间日期 `partition_date` 分区；
+股票数据在分区内按 `ts_code` 排序，交易日历在分区内按 `exchange` 排序。
 
 目录层级固定为“数据类别 → 日期分区”。例如 `daily`、`income`、`dividend` 各自拥有独立
 表目录，目录下面才是对应的 `partition_date` 分区；不同类别的数据不会写入同一个日期目录。
@@ -49,6 +49,10 @@
 `partition_date` 是 `visible_at` 对应的北京时间日历日期，使用 `date32`，只负责物理分区。
 行情数据中它等于 `trade_date`；财报、分红和行业事件没有统一交易日字段，因此分别等于实际
 公告日、实施公告日或事件日。这样不会把周末公告错误挪到相邻交易日。
+
+这一约束也适用于 `trade_cal`：它保留业务字段 `cal_date`，但物理目录统一使用
+`partition_date`。存储层在每次写入前都会从 `visible_at` 重新计算北京时间日期并核对
+`partition_date`，两者不一致时拒绝落盘，避免同步层错误把记录写入其他日期分区。
 
 `trade_date`、`ann_date`、`end_date` 等也是市场日历标签，使用 `date32`；它们不是某一时区的
 零点时间戳。每张表的完整字段定义和 `visible_at` 来源都直接写在
@@ -171,7 +175,7 @@ pro = create_pro_client(
 到哪一天；尚未产生数据时接口通常返回空表，本次写入 0 行即可。`visible_at` 只约束已经返回的
 记录何时可用于研究，不参与决定是否发起请求。
 
-本版本不兼容旧的股票分区 Schema，也不做迁移；按约定直接删除旧 Tushare 数据目录后重拉。
+本版本不兼容旧的分区 Schema，也不做迁移；按约定直接删除旧 Tushare 数据目录后重拉。
 
 ## 运行验证
 
