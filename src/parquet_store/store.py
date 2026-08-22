@@ -9,6 +9,7 @@ from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from threading import RLock
+from time import time_ns
 from typing import Any, TypeAlias, TypeGuard, cast
 from urllib.parse import quote
 from uuid import uuid4
@@ -112,6 +113,8 @@ class _Buffer:
 class _Manifest:
     version: int = 0
     files: tuple[str, ...] = ()
+    file_committed_at: tuple[int, ...] = ()
+    updated_at: int = 0
 
 
 class ParquetStore:
@@ -208,7 +211,7 @@ class ParquetStore:
             with self._partition_lock(table, partition_id):
                 directory = self._partition_path(table, partition_id)
                 manifest = self._load_manifest(directory)
-                paths = [directory / name for name in manifest.files]
+                paths = [directory / name for name in _ordered_manifest_files(manifest)]
                 results.extend(
                     _read_parquet_files(paths, config.schema, selected_columns, expression)
                 )
@@ -248,7 +251,7 @@ class ParquetStore:
             manifest = self._load_manifest(directory)
             if not manifest.files or (len(manifest.files) == 1 and not config.primary_key):
                 return
-            paths = [directory / name for name in manifest.files]
+            paths = [directory / name for name in _ordered_manifest_files(manifest)]
             tables = _read_parquet_files(paths, config.schema, None, None)
             data = pa.concat_tables(tables) if tables else _empty_table(config.schema)
             deduplicated = self._deduplicate_primary_key(config, data)
@@ -402,8 +405,26 @@ class ParquetStore:
         directory.mkdir(parents=True, exist_ok=True)
         current = self._load_manifest(directory)
         created = self._write_files(directory, chunks)
-        files = (*current.files, *created) if keep_current else tuple(created)
-        manifest = _Manifest(version=current.version + 1, files=tuple(files))
+        committed_at = max(
+            time_ns() // 1_000,
+            current.updated_at + 1,
+            max(current.file_committed_at, default=0) + 1,
+        )
+        if keep_current:
+            files = (*current.files, *created)
+            file_committed_at = (
+                *current.file_committed_at,
+                *(committed_at for _ in created),
+            )
+        else:
+            files = tuple(created)
+            file_committed_at = tuple(committed_at for _ in created)
+        manifest = _Manifest(
+            version=current.version + 1,
+            files=tuple(files),
+            file_committed_at=tuple(file_committed_at),
+            updated_at=committed_at,
+        )
         try:
             self._write_manifest(directory, manifest)
         except BaseException:
@@ -435,7 +456,12 @@ class ParquetStore:
 
     def _write_manifest(self, directory: Path, manifest: _Manifest) -> None:
         temporary = directory / f".{MANIFEST_NAME}.{uuid4().hex}.tmp"
-        payload = {"version": manifest.version, "files": list(manifest.files)}
+        payload = {
+            "version": manifest.version,
+            "updated_at": manifest.updated_at,
+            "files": list(manifest.files),
+            "file_committed_at": dict(zip(manifest.files, manifest.file_committed_at, strict=True)),
+        }
         try:
             with temporary.open("x", encoding="utf-8") as file:
                 json.dump(payload, file, ensure_ascii=False, indent=2, sort_keys=True)
@@ -468,7 +494,36 @@ class ParquetStore:
             or len(files) != len(set(files))
         ):
             raise ValueError(f"Manifest 格式无效: {path}")
-        return _Manifest(version=version, files=tuple(files))
+
+        raw_file_committed_at = payload.get("file_committed_at")
+        if raw_file_committed_at is None:
+            # 第一版 Manifest 仅用 files 数组表达提交顺序；保留该顺序并让后续文件排在其后。
+            file_committed_at = tuple(range(1, len(files) + 1))
+        elif (
+            not isinstance(raw_file_committed_at, dict)
+            or set(raw_file_committed_at) != set(files)
+            or any(
+                not isinstance(value, int) or isinstance(value, bool) or value < 1
+                for value in raw_file_committed_at.values()
+            )
+        ):
+            raise ValueError(f"Manifest 格式无效: {path}")
+        else:
+            file_committed_at = tuple(raw_file_committed_at[name] for name in files)
+
+        updated_at = payload.get("updated_at", max(file_committed_at, default=0))
+        if (
+            not isinstance(updated_at, int)
+            or isinstance(updated_at, bool)
+            or updated_at < max(file_committed_at, default=0)
+        ):
+            raise ValueError(f"Manifest 格式无效: {path}")
+        return _Manifest(
+            version=version,
+            files=tuple(files),
+            file_committed_at=file_committed_at,
+            updated_at=updated_at,
+        )
 
     def _cleanup_unreferenced_files(self, directory: Path, active: set[str]) -> None:
         try:
@@ -486,6 +541,12 @@ class ParquetStore:
 
     def _partition_path(self, table: str, partition_id: str) -> Path:
         return self._table_path(table) / partition_id
+
+
+def _ordered_manifest_files(manifest: _Manifest) -> tuple[str, ...]:
+    """按提交时间排序文件；同一次提交的多个文件保持 Manifest 内原顺序。"""
+    indexed = enumerate(zip(manifest.files, manifest.file_committed_at, strict=True))
+    return tuple(name for _, (name, _) in sorted(indexed, key=lambda item: (item[1][1], item[0])))
 
 
 def _column_tuple(value: str | Sequence[str], name: str) -> tuple[str, ...]:
