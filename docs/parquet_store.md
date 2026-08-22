@@ -39,6 +39,7 @@ with ParquetStore(Path("data")) as store:
             schema=schema,
             partition_by="day",
             sort_by="id",
+            primary_key=("id",),
             max_buffer_rows=100_000,
             max_buffer_bytes=64 * 1024 * 1024,
             target_rows_per_file=1_000_000,
@@ -55,14 +56,18 @@ with ParquetStore(Path("data")) as store:
     )
 ```
 
-`partition_by` 和 `sort_by` 可传单个字段名或字段名序列。分区参数推荐使用字段到值的映射；
+`partition_by`、`sort_by` 和 `primary_key` 可传单个字段名或字段名序列。`primary_key` 默认
+为 `None`，表示分区没有逻辑主键。主键只在单个分区内生效；表级唯一键等价于
+`partition_by + primary_key`。分区参数推荐使用字段到值的映射；
 单字段分区也可以直接传值。`read(partitions=...)` 接受分区映射序列，传 `None` 时读取所有
 已有 Manifest 的分区。`filter` 接受 `pyarrow.dataset.Expression`，也接受 Parquet 风格的
 单个三元组、合取三元组列表或析取范式列表。
 
 `append` 只追加新文件；缓冲数据在 `flush` 或 `close` 前不可见。`replace_partition` 会完整
 替换一个分区并丢弃该分区此前尚未刷新的缓存，空 Table 表示清空。`compact_partition` 只
-重排当前 Manifest 内的物理文件，零或单文件分区不会产生新版本。
+处理当前 Manifest 内的物理文件：没有主键时仅重排文件，不去重；配置主键时按 Manifest 文件
+顺序和文件内行顺序保留最后一个物理版本，再排序和切分文件。主键字段包含 null 时拒绝压缩。
+配置主键后，即使分区只有一个文件，也会检查并清理文件内部的重复键。
 
 Schema 可以在末尾追加可空字段：
 
@@ -74,5 +79,5 @@ store.update_schema("events", new_schema)
 旧文件不重写，读取时新增字段自动补 `null`；之后写入必须使用新 Schema。Schema 配置只保存
 在当前实例中，程序重启后需要用新 Schema 重新 `register`。
 
-第一版不提供行级更新、去重、WAL、多进程协调、后台任务、字段删除/改名/改类型或对象存储
-支持。
+第一版不提供写入时唯一性约束、行级更新、WAL、多进程协调、后台任务、字段删除/改名/改类型
+或对象存储支持；主键去重是显式调用 `compact_partition` 时发生的延迟整理。

@@ -9,11 +9,12 @@ from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from threading import RLock
-from typing import Any, TypeAlias, TypeGuard
+from typing import Any, TypeAlias, TypeGuard, cast
 from urllib.parse import quote
 from uuid import uuid4
 
 import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.dataset as ds
 import pyarrow.parquet as pq
 
@@ -46,6 +47,7 @@ class TableConfig:
     max_buffer_rows: int = 100_000
     max_buffer_bytes: int = 64 * 1024 * 1024
     target_rows_per_file: int = 1_000_000
+    primary_key: str | Sequence[str] | None = None
 
     def __post_init__(self) -> None:
         if not self.name or Path(self.name).name != self.name or self.name in {".", ".."}:
@@ -57,14 +59,25 @@ class TableConfig:
 
         partition_by = _column_tuple(self.partition_by, "partition_by")
         sort_by = () if self.sort_by is None else _column_tuple(self.sort_by, "sort_by")
+        primary_key = (
+            () if self.primary_key is None else _column_tuple(self.primary_key, "primary_key")
+        )
         if not partition_by:
             raise ValueError("partition_by 至少需要一个字段")
+        if self.primary_key is not None and not primary_key:
+            raise ValueError("primary_key 至少需要一个字段")
         if len(set(partition_by)) != len(partition_by):
             raise ValueError("partition_by 不能包含重复字段")
         if len(set(sort_by)) != len(sort_by):
             raise ValueError("sort_by 不能包含重复字段")
+        if len(set(primary_key)) != len(primary_key):
+            raise ValueError("primary_key 不能包含重复字段")
 
-        missing = [name for name in (*partition_by, *sort_by) if name not in self.schema.names]
+        missing = [
+            name
+            for name in (*partition_by, *sort_by, *primary_key)
+            if name not in self.schema.names
+        ]
         if missing:
             raise ValueError(f"Schema 中不存在配置字段: {missing}")
         if self.max_buffer_rows < 1:
@@ -76,6 +89,11 @@ class TableConfig:
 
         object.__setattr__(self, "partition_by", partition_by)
         object.__setattr__(self, "sort_by", sort_by)
+        object.__setattr__(
+            self,
+            "primary_key",
+            None if self.primary_key is None else primary_key,
+        )
 
 
 @dataclass(slots=True)
@@ -222,18 +240,21 @@ class ParquetStore:
                 self._buffers.pop((table, partition_id), None)
 
     def compact_partition(self, table: str, partition: PartitionSelector) -> None:
-        """按目标文件行数重新组织分区；零或单文件时不执行提交。"""
+        """重新组织分区；配置主键时先按主键保留最后一个物理版本。"""
         config = self._config(table)
         partition_id = self._partition_id_from_selector(config, partition)
         with self._partition_lock(table, partition_id):
             directory = self._partition_path(table, partition_id)
             manifest = self._load_manifest(directory)
-            if len(manifest.files) <= 1:
+            if not manifest.files or (len(manifest.files) == 1 and not config.primary_key):
                 return
             paths = [directory / name for name in manifest.files]
             tables = _read_parquet_files(paths, config.schema, None, None)
             data = pa.concat_tables(tables) if tables else _empty_table(config.schema)
-            prepared = self._sort(config, data)
+            deduplicated = self._deduplicate_primary_key(config, data)
+            if len(manifest.files) == 1 and deduplicated.num_rows == data.num_rows:
+                return
+            prepared = self._sort(config, deduplicated)
             chunks = _split_table(prepared, config.target_rows_per_file)
             self._commit(config, partition_id, chunks, keep_current=False)
 
@@ -343,6 +364,31 @@ class ParquetStore:
         if data.num_rows <= 1 or not sort_by:
             return data
         return data.sort_by([(name, "ascending") for name in sort_by])
+
+    def _deduplicate_primary_key(self, config: TableConfig, data: pa.Table) -> pa.Table:
+        primary_key = tuple(config.primary_key or ())
+        if not primary_key:
+            return data
+        invalid = [name for name in primary_key if data.column(name).null_count]
+        if invalid:
+            raise ValueError(f"主键字段不能包含 null: {invalid}")
+        if data.num_rows <= 1:
+            return data
+
+        position_name = "__parquet_store_row_position__"
+        while position_name in data.schema.names:
+            position_name = f"_{position_name}"
+        positions = pa.array(range(data.num_rows), type=pa.int64())
+        keyed = data.select(primary_key).append_column(position_name, positions)
+        grouped = keyed.group_by(list(primary_key), use_threads=False).aggregate(
+            [(position_name, "max")]
+        )
+        selected = grouped.column(grouped.num_columns - 1).combine_chunks()
+        if len(selected) == data.num_rows:
+            return data
+        selected_order = cast(pa.Int64Array, pc.sort_indices(selected).cast(pa.int64()))
+        selected_positions = cast(pa.Int64Array, pc.take(selected, selected_order))
+        return data.take(selected_positions)
 
     def _commit(
         self,

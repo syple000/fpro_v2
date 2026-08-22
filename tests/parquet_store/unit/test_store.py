@@ -55,6 +55,7 @@ def make_extended_table(*rows: tuple[str, int, float, str | None]) -> pa.Table:
 def make_store(
     root: Path,
     *,
+    primary_key: str | tuple[str, ...] | None = None,
     max_buffer_rows: int = 100,
     max_buffer_bytes: int = 1024 * 1024,
     target_rows_per_file: int = 100,
@@ -66,6 +67,7 @@ def make_store(
             schema=SCHEMA,
             partition_by="day",
             sort_by="id",
+            primary_key=primary_key,
             max_buffer_rows=max_buffer_rows,
             max_buffer_bytes=max_buffer_bytes,
             target_rows_per_file=target_rows_per_file,
@@ -234,6 +236,108 @@ def test_compact_single_file_is_no_op(tmp_path: Path) -> None:
 
     assert manifest_path.read_bytes() == original_bytes
     assert read_manifest(manifest_path) == manifest
+
+
+def test_compact_deduplicates_primary_key_and_keeps_last_physical_row(
+    tmp_path: Path,
+) -> None:
+    store = make_store(tmp_path, primary_key="id", max_buffer_rows=1)
+    store.append("events", make_table(("a", 1, 1.0)))
+    store.append("events", make_table(("a", 2, 2.0)))
+    store.append("events", make_table(("a", 1, 3.0)))
+    manifest_path, old_manifest = only_manifest(tmp_path)
+
+    store.compact_partition("events", "a")
+
+    assert read_manifest(manifest_path)["version"] == old_manifest["version"] + 1
+    assert store.read("events", "a").to_pylist() == [
+        {"day": "a", "id": 1, "value": 3.0},
+        {"day": "a", "id": 2, "value": 2.0},
+    ]
+
+
+def test_compact_deduplicates_primary_key_inside_single_file(tmp_path: Path) -> None:
+    store = make_store(tmp_path, primary_key=("day", "id"))
+    store.append("events", make_table(("a", 1, 1.0), ("a", 1, 1.0)))
+    store.flush()
+    manifest_path, old_manifest = only_manifest(tmp_path)
+
+    store.compact_partition("events", "a")
+
+    assert read_manifest(manifest_path)["version"] == old_manifest["version"] + 1
+    assert store.read("events", "a").to_pylist() == [
+        {"day": "a", "id": 1, "value": 1.0}
+    ]
+
+
+def test_compact_without_primary_key_keeps_duplicate_rows(tmp_path: Path) -> None:
+    store = make_store(tmp_path, max_buffer_rows=1)
+    store.append("events", make_table(("a", 1, 1.0)))
+    store.append("events", make_table(("a", 1, 2.0)))
+
+    store.compact_partition("events", "a")
+
+    assert store.read("events", "a").to_pylist() == [
+        {"day": "a", "id": 1, "value": 1.0},
+        {"day": "a", "id": 1, "value": 2.0},
+    ]
+
+
+def test_compact_rejects_null_primary_key_without_changing_manifest(tmp_path: Path) -> None:
+    nullable_key_schema = pa.schema(
+        [SCHEMA.field("day"), pa.field("id", pa.int64()), SCHEMA.field("value")],
+        metadata={b"schema-version": b"1"},
+    )
+    store = ParquetStore(tmp_path)
+    store.register(
+        TableConfig(
+            name="events",
+            schema=nullable_key_schema,
+            partition_by="day",
+            primary_key="id",
+        )
+    )
+    invalid = pa.Table.from_pylist(
+        [{"day": "a", "id": None, "value": 1.0}],
+        schema=nullable_key_schema,
+    )
+    store.append("events", invalid)
+    store.flush()
+    manifest_path, manifest = only_manifest(tmp_path)
+    original_bytes = manifest_path.read_bytes()
+
+    with pytest.raises(ValueError, match="主键字段不能包含 null"):
+        store.compact_partition("events", "a")
+
+    assert manifest_path.read_bytes() == original_bytes
+    assert read_manifest(manifest_path) == manifest
+
+
+def test_primary_key_configuration_is_validated() -> None:
+    config = TableConfig(
+        name="events",
+        schema=SCHEMA,
+        partition_by="day",
+        primary_key="id",
+    )
+
+    assert config.primary_key == ("id",)
+    with pytest.raises(ValueError, match="primary_key 至少需要一个字段"):
+        TableConfig(name="events", schema=SCHEMA, partition_by="day", primary_key=())
+    with pytest.raises(ValueError, match="primary_key 不能包含重复字段"):
+        TableConfig(
+            name="events",
+            schema=SCHEMA,
+            partition_by="day",
+            primary_key=("id", "id"),
+        )
+    with pytest.raises(ValueError, match="Schema 中不存在配置字段"):
+        TableConfig(
+            name="events",
+            schema=SCHEMA,
+            partition_by="day",
+            primary_key="missing",
+        )
 
 
 def test_schema_must_match_fields_order_nullability_and_metadata(tmp_path: Path) -> None:
