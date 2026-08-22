@@ -43,3 +43,16 @@ SELECT * FROM qmt.ticks_as_of(1714464000000000);
 
 同步任务写入或整理文件后，对已存在的 `DataCatalog` 调用 `refresh()`。
 新建对象会自动执行一次刷新。目录中未被 Manifest 引用的 Parquet 文件不会对外可见。
+
+可以直接运行内置的 `test_main` 查看指定股票的财务 PIT 和 QMT Tick：
+
+```bash
+uv run --group data data-test \
+  --tushare-dir data/tushare \
+  --qmt-dir data/qmt \
+  --as-of 2024-04-30 \
+  --ts-code 000001.SZ \
+  --limit 10
+```
+
+也可以使用 `python -m data.test_main` 传入同样的参数。

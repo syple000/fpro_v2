@@ -14,7 +14,7 @@ from requests.exceptions import ConnectionError as RequestsConnectionError
 from requests.exceptions import Timeout as RequestsTimeout
 
 DEFAULT_REQUESTS_PER_MINUTE = 120
-DEFAULT_MAX_CONCURRENCY = 1
+DEFAULT_MAX_CONCURRENCY = 3
 DEFAULT_MAX_RETRIES = 3
 DEFAULT_RETRY_BACKOFF_SECONDS = 1.0
 

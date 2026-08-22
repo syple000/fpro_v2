@@ -53,6 +53,7 @@ dev = [
 qmt-agent = { requires-python = ">=3.11,<3.12" }
 
 [project.scripts]
+data-test = "data.test_main:main"
 qmt-agent = "qmt_agent.__main__:main"
 qmt-agent-start = "qmt_agent.windows_launcher:main"
 qmt-receiver-test = "qmt_receiver.test_main:main"
