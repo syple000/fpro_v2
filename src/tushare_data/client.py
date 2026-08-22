@@ -15,7 +15,7 @@ from requests.exceptions import Timeout as RequestsTimeout
 
 DEFAULT_REQUESTS_PER_MINUTE = 120
 DEFAULT_MAX_CONCURRENCY = 3
-DEFAULT_MAX_RETRIES = 3
+DEFAULT_MAX_RETRIES = 10
 DEFAULT_RETRY_BACKOFF_SECONDS = 1.0
 
 logger = logging.getLogger(__name__)
