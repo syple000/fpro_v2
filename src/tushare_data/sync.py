@@ -1042,3 +1042,22 @@ def exchange_for_ts_code(ts_code: str) -> str:
         return {"SH": "SSE", "SZ": "SZSE", "BJ": "BSE"}[suffix]
     except KeyError:
         raise ValueError(f"无法从股票代码识别交易所: {ts_code!r}") from None
+
+
+if __name__ == '__main__':
+    import sys 
+    token = sys.argv[1]
+    client = create_pro_client(token=token)
+    fields = ",".join(SOURCE_FIELDS["cashflow"])
+
+    df = _fetch_pages(
+        lambda limit, offset: client.cashflow_vip(
+            start_date="20240101",
+            end_date="20251231",
+            fields="",
+            limit=limit,
+            offset=offset,
+        )
+    )
+
+    print(df)
