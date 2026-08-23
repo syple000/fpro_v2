@@ -262,19 +262,21 @@ class ParquetStore:
         config = self._config(table)
         partition_id = self._partition_id_from_selector(config, partition)
         with self._partition_lock(table, partition_id):
-            directory = self._partition_path(table, partition_id)
-            manifest = self._load_manifest(directory)
-            if not manifest.files or (len(manifest.files) == 1 and not config.primary_key):
-                return
-            paths = [directory / name for name in _ordered_manifest_files(manifest)]
-            tables = _read_parquet_files(paths, config.schema, None, None)
-            data = pa.concat_tables(tables) if tables else _empty_table(config.schema)
-            deduplicated = self._deduplicate_primary_key(config, data)
-            if len(manifest.files) == 1 and deduplicated.num_rows == data.num_rows:
-                return
-            prepared = self._sort(config, deduplicated)
-            chunks = _split_table(prepared, config.target_rows_per_file)
-            self._commit(config, partition_id, chunks, keep_current=False)
+            self._compact_partition(config, partition_id)
+
+    def compact_table(self, table: str) -> int:
+        """扫描并整理存在多个活动文件的分区，返回实际整理的分区数。"""
+        self.flush(table)
+        config = self._config(table)
+        compacted = 0
+        for partition_id in self._read_partition_ids(config, None):
+            with self._partition_lock(table, partition_id):
+                manifest = self._load_manifest(self._partition_path(table, partition_id))
+                if len(manifest.files) <= 1:
+                    continue
+                self._compact_partition(config, partition_id)
+                compacted += 1
+        return compacted
 
     def close(self) -> None:
         """刷新全部缓存并关闭实例；可重复调用。"""
@@ -430,6 +432,21 @@ class ParquetStore:
         )
         selected_positions = cast(pa.Int64Array, pc.take(selected_positions, selected_order))
         return data.take(selected_positions)
+
+    def _compact_partition(self, config: TableConfig, partition_id: str) -> None:
+        directory = self._partition_path(config.name, partition_id)
+        manifest = self._load_manifest(directory)
+        if not manifest.files or (len(manifest.files) == 1 and not config.primary_key):
+            return
+        paths = [directory / name for name in _ordered_manifest_files(manifest)]
+        tables = _read_parquet_files(paths, config.schema, None, None)
+        data = pa.concat_tables(tables) if tables else _empty_table(config.schema)
+        deduplicated = self._deduplicate_primary_key(config, data)
+        if len(manifest.files) == 1 and deduplicated.num_rows == data.num_rows:
+            return
+        prepared = self._sort(config, deduplicated)
+        chunks = _split_table(prepared, config.target_rows_per_file)
+        self._commit(config, partition_id, chunks, keep_current=False)
 
     def _commit(
         self,
