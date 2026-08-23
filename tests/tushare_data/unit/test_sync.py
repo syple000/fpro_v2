@@ -9,6 +9,7 @@ from typing import ParamSpec, TypeVar
 import pandas as pd
 import pyarrow as pa
 import pytest
+import tushare.pro.client as tushare_client_module
 
 import tushare_data.sync as sync_module
 from tushare_data import (
@@ -103,6 +104,60 @@ def _record(dataset: str, ts_code: str, partition_date: str) -> dict[str, object
 
     result[TABLE_PARTITION_BY[dataset]] = partition_date
     return result
+
+
+def test_create_pro_client_uses_direct_http_session(monkeypatch) -> None:
+    sessions: list[object] = []
+
+    class FakeResponse:
+        text = json.dumps(
+            {
+                "code": 0,
+                "data": {
+                    "fields": ["ts_code", "trade_date"],
+                    "items": [["000001.SZ", "20240102"]],
+                },
+            }
+        )
+
+        def __bool__(self) -> bool:
+            return True
+
+    class RecordingSession:
+        def __init__(self) -> None:
+            self.trust_env = True
+            sessions.append(self)
+
+        def __enter__(self) -> RecordingSession:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            pass
+
+        def post(self, url: str, **kwargs: object) -> FakeResponse:
+            assert self.trust_env is False
+            assert url == "http://api.example.test/daily"
+            assert kwargs["timeout"] == 30
+            return FakeResponse()
+
+    original_requests = tushare_client_module.requests
+    monkeypatch.setattr(sync_module.requests, "Session", RecordingSession)
+    try:
+        pro = sync_module.create_pro_client(
+            "test-token",
+            "http://api.example.test/",
+            requests_per_minute=120,
+            max_concurrency=1,
+            max_retries=0,
+        )
+        result = pro.daily("20240102", "ts_code,trade_date", 5_000, 0)
+    finally:
+        tushare_client_module.requests = original_requests
+
+    assert sessions
+    assert result.to_dict("records") == [
+        {"ts_code": "000001.SZ", "trade_date": "20240102"}
+    ]
 
 
 def _market_responder(

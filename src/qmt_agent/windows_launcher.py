@@ -13,6 +13,8 @@ from pathlib import Path
 
 import psutil
 
+from fpro_common import disable_environment_proxies
+
 AGENT_COMMAND_MARKERS = (
     "start_qmt_agent.cmd",
     "qmt-agent-start",
@@ -184,6 +186,8 @@ def run(args: argparse.Namespace) -> None:
     if args.client_wait_seconds < 0:
         raise RuntimeError("--client-wait-seconds 不能小于 0")
 
+    # miniQMT 由当前进程启动，会继承这里清理后的环境。
+    disable_environment_proxies()
     qmt_bin, shortcut = qmt_paths(args.qmt_bin, args.qmt_shortcut)
     stop_running_instances(qmt_bin)
 

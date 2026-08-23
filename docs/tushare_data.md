@@ -76,6 +76,10 @@ uv run --group tushare-data tushare-data-test \
   --data-dir data/tushare
 ```
 
+`create_pro_client` 为 Tushare SDK 安装独立的直连 HTTP 传输；它不读取
+`HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY` 或 Windows 系统代理，也不会清除进程环境，
+因此不影响同一进程中的其他网络客户端。
+
 ## 迁移
 
 新 Schema 与旧的 `partition_date/visible_at` 目录不兼容。不在原目录内混写：

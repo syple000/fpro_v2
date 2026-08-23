@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from collections.abc import Sequence
 from pathlib import Path
 from typing import cast
@@ -32,6 +33,29 @@ def test_qmt_paths_rejects_missing_bin(tmp_path: Path) -> None:
 
     with pytest.raises(RuntimeError, match="bin.x64 目录不存在"):
         launcher.qmt_paths(str(tmp_path / "missing"), str(shortcut))
+
+
+def test_run_removes_proxy_environment_before_path_validation(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setattr(launcher.sys, "platform", "win32")
+    monkeypatch.setenv("HTTP_PROXY", "http://127.0.0.1:7890")
+    monkeypatch.setenv("https_proxy", "http://127.0.0.1:7890")
+    arguments = launcher.build_parser().parse_args(
+        [
+            "--qmt-bin",
+            str(tmp_path / "missing"),
+            "--qmt-shortcut",
+            str(tmp_path / "missing.lnk"),
+        ]
+    )
+
+    with pytest.raises(RuntimeError, match="bin.x64 目录不存在"):
+        launcher.run(arguments)
+
+    assert not any(
+        name.casefold() in {"http_proxy", "https_proxy"} for name in os.environ
+    )
 
 
 def test_process_matching_is_limited_to_agent_and_installation(tmp_path: Path) -> None:

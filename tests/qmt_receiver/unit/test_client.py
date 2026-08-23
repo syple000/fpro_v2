@@ -79,6 +79,22 @@ def response_payload(request: httpx2.Request) -> dict[str, object]:
     raise AssertionError(f"未处理的测试路径：{request.method} {path}")
 
 
+def test_default_client_does_not_read_proxy_environment(monkeypatch) -> None:
+    options: dict[str, object] = {}
+    sentinel = object()
+
+    def create_http_client(**kwargs: object) -> object:
+        options.update(kwargs)
+        return sentinel
+
+    monkeypatch.setattr(httpx2, "Client", create_http_client)
+
+    client = QmtAgentClient()
+
+    assert client._client is sentinel
+    assert options["trust_env"] is False
+
+
 def test_client_exposes_all_qmt_agent_business_interfaces() -> None:
     requests: list[tuple[str, str]] = []
 

@@ -7,9 +7,11 @@ from collections.abc import Callable, Iterable
 from datetime import date, datetime, timedelta
 from math import isnan
 from numbers import Real
+from typing import Any
 
 import pandas as pd
 import pyarrow as pa
+import requests
 
 from tushare_data.client import (
     DEFAULT_MAX_CONCURRENCY,
@@ -52,6 +54,17 @@ MarketSyncFunction = Callable[
 ]
 
 
+class _DirectRequests:
+    """为 Tushare SDK 提供不读取系统和环境代理的 requests 接口。"""
+
+    @staticmethod
+    def post(url: str, **kwargs: Any) -> requests.Response:
+        # Tushare 原本调用 requests.post，本身也是每次创建一个临时 Session。
+        with requests.Session() as session:
+            session.trust_env = False
+            return session.post(url, **kwargs)
+
+
 def create_pro_client(
     token: str,
     api_url: str = DEFAULT_API_URL,
@@ -68,6 +81,9 @@ def create_pro_client(
     import tushare.pro.client as client
 
     client.DataApi._DataApi__http_url = api_url.rstrip("/")  # pyright: ignore[reportAttributeAccessIssue]
+    # DataApi.query 固定调用其模块级 requests.post；替换成相同窄接口，避免
+    # HTTP_PROXY/HTTPS_PROXY/ALL_PROXY 以及 Windows 系统代理影响 Tushare。
+    client.requests = _DirectRequests()  # pyright: ignore[reportAttributeAccessIssue]
     raw_pro: object = ts.pro_api(token)
     limiter = RequestLimiter(requests_per_minute, max_concurrency)
     return TushareProClient(

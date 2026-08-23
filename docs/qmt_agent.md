@@ -33,6 +33,12 @@ DLL 目录；不要直接用普通 Python 环境启动。
 系统默认电源行为。该设置不会强制点亮显示器，也不会阻止用户通过合盖、电源按钮或系统
 菜单主动休眠。
 
+Python 启动器会在启动 miniQMT 前统一移除 `HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY`、
+`FTP_PROXY`（环境变量名不区分大小写），并设置 `NO_PROXY=*`；miniQMT 和 qmt-agent
+继承同一份直连环境。支持 `NO_PROXY` 的依赖即使能发现 Windows 系统代理也会直连。
+qmt-receiver 自建的 HTTP 客户端同样不读取系统或环境代理。调用方若向
+`QmtAgentClient` 注入自建 HTTP 客户端，则由调用方负责该客户端的代理配置。
+
 默认路径为：
 
 - `QMT bin.x64`：`C:\Program Files\东北证券NET专业版\bin.x64`
