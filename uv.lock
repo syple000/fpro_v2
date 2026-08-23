@@ -379,7 +379,7 @@ tushare-data = [
     { name = "pandas", specifier = ">=2.2,<3.0" },
     { name = "pyarrow", specifier = ">=18.0,<24.0" },
     { name = "requests", specifier = ">=2.32,<3.0" },
-    { name = "tushare", specifier = ">=1.4,<2.0" },
+    { name = "tushare", url = "https://run.quicksync.cn/whl/tushare-1.4.24+instruct-py3-none-any.whl" },
     { name = "tzdata", specifier = ">=2025.2" },
 ]
 
@@ -1080,8 +1080,8 @@ wheels = [
 
 [[package]]
 name = "tushare"
-version = "1.4.29"
-source = { registry = "https://pypi.org/simple" }
+version = "1.4.24"
+source = { url = "https://run.quicksync.cn/whl/tushare-1.4.24+instruct-py3-none-any.whl" }
 dependencies = [
     { name = "bs4" },
     { name = "lxml" },
@@ -1091,9 +1091,19 @@ dependencies = [
     { name = "tqdm" },
     { name = "websocket-client" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/91/a4/5ce99585209410463e4b203d13c73d356c6ac92daea48af182932af7cb61/tushare-1.4.29.tar.gz", hash = "sha256:f578fb778868c0b744ac9173a837b695fd82e8d1b1e0d39c1f882b0e4fef7ecb", size = 128623, upload-time = "2026-03-25T06:33:44.722Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/33/3e/d426a56e5feac9b0aaada1c6b0745ed03422d4a713295e0bbb44c8ea86fe/tushare-1.4.29-py3-none-any.whl", hash = "sha256:82554af953ea5ac3d8771d42330493181031c7e68dccce03a491c7356e9ba4b2", size = 142920, upload-time = "2026-03-25T06:33:43.111Z" },
+    { url = "https://run.quicksync.cn/whl/tushare-1.4.24+instruct-py3-none-any.whl", hash = "sha256:5b9c286b694987b777aa603b812402f3752f1541eb6ce58f7e5f01490bfe9eca" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "bs4" },
+    { name = "lxml" },
+    { name = "pandas" },
+    { name = "requests" },
+    { name = "simplejson" },
+    { name = "tqdm" },
+    { name = "websocket-client", specifier = ">=0.57.0" },
 ]
 
 [[package]]

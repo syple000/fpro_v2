@@ -11,7 +11,6 @@ from tushare_data.client import (
 from tushare_data.schemas import SOURCE_FIELDS, TABLE_SCHEMAS
 from tushare_data.storage import TushareDataStore
 from tushare_data.sync import (
-    DEFAULT_API_URL,
     create_pro_client,
     exchange_for_ts_code,
     sync_adj_factor,
@@ -36,7 +35,6 @@ from tushare_data.sync import (
 )
 
 __all__ = [
-    "DEFAULT_API_URL",
     "DEFAULT_MAX_CONCURRENCY",
     "DEFAULT_MAX_RETRIES",
     "DEFAULT_REQUESTS_PER_MINUTE",

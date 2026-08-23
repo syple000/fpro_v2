@@ -76,7 +76,8 @@ uv run --group tushare-data tushare-data-test \
   --data-dir data/tushare
 ```
 
-`create_pro_client` 为 Tushare SDK 安装独立的直连 HTTP 传输；它不读取
+项目固定使用 quicksync 提供的 `tushare 1.4.24+instruct` SDK，不再修改普通 Tushare
+SDK 的私有 API 地址。`create_pro_client` 为该 SDK 安装独立的直连 HTTP 传输；它不读取
 `HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY` 或 Windows 系统代理，也不会清除进程环境，
 因此不影响同一进程中的其他网络客户端。单次请求读取超时为 120 秒。
 
