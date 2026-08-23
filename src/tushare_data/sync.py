@@ -34,6 +34,7 @@ _REQUEST_TIMEOUT_SECONDS = 120
 MARKET_EXCHANGES = ("SSE", "SZSE", "BSE")
 PAGE_SIZE = 5_000
 INDEX_MEMBER_PAGE_SIZE = 2_000
+FINA_AUDIT_STOCK_BATCH_SIZE = 30
 CALENDAR_REQUEST_DAYS = 3_650
 MARKET_WRITE_CHUNK_DAYS = 31
 INC_STABLE_TRADING_DAYS = 5
@@ -55,6 +56,7 @@ MarketSyncFunction = Callable[
     [TushareProClient, TushareDataStore, str | date, str | date],
     int,
 ]
+MarketSyncSpec = tuple[str, MarketSyncFunction, int | None]
 
 
 class _DirectRequests:
@@ -433,32 +435,30 @@ def sync_fina_audit(
     if requested[0] > requested[1]:
         raise ValueError("start_date 不能晚于 end_date")
     fields = ",".join(SOURCE_FIELDS["fina_audit"])
-    total = 0
     stock_codes = _stock_codes(pro)
-    for range_start, range_end in _split_range(*requested, 366):
+    total = 0
+    for batch_start in range(0, len(stock_codes), FINA_AUDIT_STOCK_BATCH_SIZE):
         tables: list[pa.Table] = []
-        for ts_code in stock_codes:
+        stock_batch = stock_codes[batch_start : batch_start + FINA_AUDIT_STOCK_BATCH_SIZE]
+        for ts_code in stock_batch:
 
             def request_audit(
                 limit: int,
                 offset: int,
                 *,
                 ts_code: str = ts_code,
-                range_start: date = range_start,
-                range_end: date = range_end,
             ) -> pd.DataFrame:
                 return pro.fina_audit(
                     ts_code=ts_code,
-                    start_date=_format_date(range_start),
-                    end_date=_format_date(range_end),
+                    start_date=_format_date(requested[0]),
+                    end_date=_format_date(requested[1]),
                     fields=fields,
                     limit=limit,
                     offset=offset,
                 )
 
             frame = _fetch_pages(request_audit)
-            data = _normalise_frame("fina_audit", frame)
-            tables.append(data)
+            tables.append(_normalise_frame("fina_audit", frame))
         combined = _concat_tables(tables, TABLE_SCHEMAS["fina_audit"])
         total += store.write("fina_audit", combined)
     return total
@@ -545,7 +545,7 @@ def sync_all(
     if requested_start > requested_end:
         raise ValueError("start_date 不能晚于 end_date")
 
-    functions: tuple[tuple[str, MarketSyncFunction, int], ...] = (
+    functions: tuple[MarketSyncSpec, ...] = (
         ("trade_cal", sync_trade_cal, CALENDAR_REQUEST_DAYS),
         ("daily", sync_daily, MARKET_WRITE_CHUNK_DAYS),
         ("daily_basic", sync_daily_basic, MARKET_WRITE_CHUNK_DAYS),
@@ -562,7 +562,8 @@ def sync_all(
         ("cashflow", sync_cashflow, 366),
         ("fina_indicator", sync_fina_indicator, 366),
         ("sw_industry", sync_sw_industry, CALENDAR_REQUEST_DAYS),
-        ("fina_audit", sync_fina_audit, 366),
+        # 审计意见只能逐只股票查询；不切日期，避免每个分块重复遍历股票清单。
+        ("fina_audit", sync_fina_audit, None),
     )
 
     # 交易日历是日频接口的共同依赖，先完整提交；其余数据集再并行回填。
@@ -601,7 +602,7 @@ def _sync_all_dataset(
     store: TushareDataStore,
     requested_start: date,
     requested_end: date,
-    spec: tuple[str, MarketSyncFunction, int],
+    spec: MarketSyncSpec,
 ) -> int:
     dataset, function, checkpoint_days = spec
     completed = store._sync_all_completed_ranges(dataset)
@@ -623,11 +624,12 @@ def _sync_all_dataset(
         return total
 
     for range_start, range_end in missing:
-        for chunk_start, chunk_end in _split_range(
-            range_start,
-            range_end,
-            checkpoint_days,
-        ):
+        chunks = (
+            [(range_start, range_end)]
+            if checkpoint_days is None
+            else _split_range(range_start, range_end, checkpoint_days)
+        )
+        for chunk_start, chunk_end in chunks:
             written = function(pro, store, chunk_start, chunk_end)
             total += written
             store._mark_sync_all_completed(dataset, chunk_start, chunk_end)

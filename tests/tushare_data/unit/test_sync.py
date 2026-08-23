@@ -848,7 +848,9 @@ def test_sw_industry_full_market_api_is_paginated(tmp_path: Path) -> None:
     ]
 
 
-def test_audit_is_the_only_per_stock_fallback(tmp_path: Path) -> None:
+def test_audit_is_the_only_per_stock_fallback_and_uses_full_requested_range(
+    tmp_path: Path,
+) -> None:
     def responder(
         api_name: str,
         fields: str,
@@ -868,10 +870,85 @@ def test_audit_is_the_only_per_stock_fallback(tmp_path: Path) -> None:
 
     pro, api = _client(responder)
     with TushareDataStore(tmp_path) as store:
-        assert sync_fina_audit(pro, store, "20240401", "20240430") == 2
+        assert sync_fina_audit(pro, store, "20170101", "20260822") == 2
 
     audit_calls = [arguments for name, _, arguments in api.calls if name == "fina_audit"]
     assert [call["ts_code"] for call in audit_calls] == ["000001.SZ", "600000.SH"]
+    assert {(call["start_date"], call["end_date"]) for call in audit_calls} == {
+        ("20170101", "20260822")
+    }
+
+
+def test_audit_writes_every_thirty_stocks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stock_codes = [f"{index:06d}.SZ" for index in range(1, 62)]
+
+    def responder(
+        api_name: str,
+        fields: str,
+        arguments: dict[str, object],
+    ) -> pd.DataFrame:
+        if api_name == "stock_basic":
+            rows = (
+                [{"ts_code": ts_code} for ts_code in stock_codes]
+                if arguments["list_status"] == "L"
+                else []
+            )
+            return pd.DataFrame(rows, columns=pd.Index(fields.split(",")))
+        if api_name == "fina_audit":
+            row = _record("fina_audit", str(arguments["ts_code"]), "20240430")
+            return pd.DataFrame([row], columns=pd.Index(fields.split(",")))
+        return _empty(fields)
+
+    pro, _ = _client(responder)
+    write_sizes: list[int] = []
+    with TushareDataStore(tmp_path) as store:
+        original_write = store.write
+
+        def record_write(dataset: str, data: pa.Table) -> int:
+            write_sizes.append(data.num_rows)
+            return original_write(dataset, data)
+
+        monkeypatch.setattr(store, "write", record_write)
+        assert sync_fina_audit(pro, store, "20170101", "20260822") == 61
+
+    assert write_sizes == [30, 30, 1]
+
+
+def test_sync_all_does_not_chunk_fina_audit_date_range(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requested_start = date(2017, 1, 1)
+    requested_end = date(2026, 8, 22)
+    calls: list[tuple[date, date]] = []
+
+    def record_audit(
+        _pro: TushareProClient,
+        _store: TushareDataStore,
+        start_date: str | date,
+        end_date: str | date,
+    ) -> int:
+        calls.append(
+            (
+                sync_module._parse_date(start_date),
+                sync_module._parse_date(end_date),
+            )
+        )
+        return 1
+
+    monkeypatch.setattr(sync_module, "sync_fina_audit", record_audit)
+    pro, _ = _client(_market_responder)
+    with TushareDataStore(tmp_path) as store:
+        for dataset in TABLE_SCHEMAS:
+            if dataset != "fina_audit":
+                store._mark_sync_all_completed(dataset, requested_start, requested_end)
+        result = sync_module.sync_all(pro, store, requested_start, requested_end)
+
+    assert calls == [(requested_start, requested_end)]
+    assert result["fina_audit"] == 1
 
 
 def test_pagination_continues_after_full_page_and_preserves_empty_columns() -> None:
