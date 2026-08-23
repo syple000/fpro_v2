@@ -20,6 +20,7 @@ def main() -> None:
     parser.add_argument("--end-date", required=True, type=date.fromisoformat)
     parser.add_argument("--sample-size", type=int, default=20)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--output", default="./data_validation.json")
     args = parser.parse_args()
 
     if args.start_date > args.end_date:
@@ -35,7 +36,8 @@ def main() -> None:
             sample_size=args.sample_size,
             seed=args.seed,
         )
-    print(json.dumps(asdict(report), ensure_ascii=False, indent=2))
+    with open(args.output) as f:
+        json.dump(asdict(report), f, ensure_ascii=False, indent=2)
     raise SystemExit(0 if report.passed else 1)
 
 
