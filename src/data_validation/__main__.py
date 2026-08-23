@@ -36,7 +36,7 @@ def main() -> None:
             sample_size=args.sample_size,
             seed=args.seed,
         )
-    with open(args.output) as f:
+    with open(args.output, 'w') as f:
         json.dump(asdict(report), f, ensure_ascii=False, indent=2)
     raise SystemExit(0 if report.passed else 1)
 
