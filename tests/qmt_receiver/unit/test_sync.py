@@ -5,9 +5,11 @@ from pathlib import Path
 
 from data import DataCatalog
 from qmt_protocol import (
+    DividendFactor,
     DividendFactorsResponse,
     DividendType,
     FinancialDownloadResponse,
+    FinancialFrame,
     FinancialQueryResponse,
     FinancialReportType,
     FinancialTable,
@@ -35,6 +37,8 @@ class FakeSyncClient:
         return HistoryDownloadResponse(
             stocks=list(stocks),
             period=period,
+            start_time=start_time,
+            end_time=end_time,
             mode=mode,
             completed=True,
         )
@@ -53,13 +57,14 @@ class FakeSyncClient:
         self.adjustments.append(dividend_type)
         close = 10.0 if dividend_type == "none" else 8.0
         return HistoryQueryResponse(
+            period=period,
             data={
                 stocks[0]: HistoryFrame(
                     index=[20240102],
                     columns=["time", "open", "high", "low", "close", "volume", "amount"],
                     data=[[1_704_153_600_000_000, close, close, close, close, 1000, 10000.0]],
                 )
-            }
+            },
         )
 
     def download_financial(
@@ -69,7 +74,13 @@ class FakeSyncClient:
         start_time: str = "",
         end_time: str = "",
     ) -> FinancialDownloadResponse:
-        return FinancialDownloadResponse(stocks=list(stocks), tables=list(tables), completed=True)
+        return FinancialDownloadResponse(
+            stocks=list(stocks),
+            tables=list(tables),
+            start_time=start_time,
+            end_time=end_time,
+            completed=True,
+        )
 
     def query_financial(
         self,
@@ -80,15 +91,16 @@ class FakeSyncClient:
         report_type: FinancialReportType = "report_time",
     ) -> FinancialQueryResponse:
         return FinancialQueryResponse(
+            report_type=report_type,
             data={
                 stocks[0]: {
-                    "Balance": HistoryFrame(
+                    "Balance": FinancialFrame(
                         index=[20231231],
                         columns=["m_anntime", "m_timetag", "tot_assets"],
                         data=[[20240430, 20231231, 100.0]],
                     )
                 }
-            }
+            },
         )
 
     def query_dividend_factors(
@@ -99,11 +111,15 @@ class FakeSyncClient:
     ) -> DividendFactorsResponse:
         return DividendFactorsResponse(
             data={
-                stocks[0]: HistoryFrame(
-                    index=[20240601],
-                    columns=["interest", "stockBonus", "stockGift", "dr"],
-                    data=[[0.1, 0.2, 0.3, 0.9]],
-                )
+                stocks[0]: [
+                    DividendFactor(
+                        event_time=1_717_200_000_000,
+                        interest=0.1,
+                        stockBonus=0.2,
+                        stockGift=0.3,
+                        dr=0.9,
+                    )
+                ]
             }
         )
 
@@ -119,7 +135,7 @@ def test_sync_all_downloads_and_writes_all_sources(tmp_path: Path) -> None:
             "SELECT adjustment, close FROM qmt.daily ORDER BY adjustment"
         ).fetchall()
         financial = catalog.connection.execute(
-            "SELECT code, dataset, report_date, announcement_date, data_json FROM qmt.financial"
+            "SELECT code, dataset, report_date, disclosure_date, data_json FROM qmt.financial"
         ).fetchone()
         dividend = catalog.connection.execute(
             "SELECT code, ex_date, interest, stockBonus, stockGift, dr FROM qmt.dividend_factors"

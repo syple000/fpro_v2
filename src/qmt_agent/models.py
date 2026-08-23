@@ -199,7 +199,7 @@ class HistoryQueryRequest(StockRequest):
         return self
 
 
-class FinancialRequest(StockRequest):
+class _FinancialRequest(StockRequest):
     tables: list[FinancialTable] = Field(default_factory=list)
     start_time: str = ""
     end_time: str = ""
@@ -220,11 +220,15 @@ class FinancialRequest(StockRequest):
         return self
 
 
-class FinancialQueryRequest(FinancialRequest):
+class FinancialDownloadRequest(_FinancialRequest):
+    """下载财务数据到 miniQMT 本地缓存。"""
+
+
+class FinancialQueryRequest(_FinancialRequest):
     report_type: FinancialReportType = "report_time"
 
 
-class DividendFactorsRequest(StockRequest):
+class DividendFactorsQueryRequest(StockRequest):
     start_time: str = ""
     end_time: str = ""
 

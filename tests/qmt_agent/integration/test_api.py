@@ -65,7 +65,9 @@ def test_openapi_exposes_explicit_response_and_quote_schemas() -> None:
         "QuoteSequenceResponse",
         "SubscriptionStatus",
         "HistoryQueryResponse",
+        "FinancialFrame",
         "FinancialQueryResponse",
+        "DividendFactor",
         "DividendFactorsResponse",
     } <= components.keys()
     response_schema = schema["paths"]["/v1/quotes/subscribed/sequence"]["post"]["responses"]["200"][
@@ -163,6 +165,9 @@ def test_history_download_mode_is_forwarded() -> None:
         )
 
     assert response.status_code == 200
+    assert response.json()["start_time"] == "20250101"
+    assert response.json()["end_time"] == ""
+    assert response.json()["mode"] == "full"
     assert gateway.history_download is not None
     assert gateway.history_download["incrementally"] is False
 
@@ -194,12 +199,25 @@ def test_financial_and_dividend_factor_endpoints() -> None:
 
     assert downloaded.status_code == 200
     assert downloaded.json()["completed"] is True
+    assert downloaded.json()["start_time"] == "20240101"
+    assert downloaded.json()["end_time"] == "20251231"
     assert gateway.financial_download is not None
     assert gateway.financial_download["tables"] == ["Balance", "Income"]
-    assert financial.json()["data"]["000001.SZ"]["Balance"]["data"] == [
-        [20250331, 20241231, 100.0]
+    assert financial.json()["data"]["000001.SZ"]["Balance"]["data"] == [[20250331, 20241231, 100.0]]
+    assert financial.json()["report_type"] == "announce_time"
+    assert dividends.json()["data"]["000001.SZ"] == [
+        {
+            "event_time": 1_717_200_000_000_000,
+            "interest": 0.1,
+            "stockBonus": None,
+            "stockGift": None,
+            "allotNum": None,
+            "allotPrice": None,
+            "gugai": None,
+            "dr": 0.99,
+            "extra": {},
+        }
     ]
-    assert dividends.json()["data"]["000001.SZ"]["data"] == [[0.1, 0.99]]
 
 
 def test_market_endpoints_have_useful_defaults() -> None:
@@ -330,9 +348,11 @@ def test_market_and_stock_quote_endpoints_return_separate_caches() -> None:
         )
 
     assert market_quotes.status_code == 200
-    assert market_quotes.json()["data"] == {"600000.SH": {"lastPrice": 10.2, "kind": "tick"}}
+    assert market_quotes.json()["data"]["600000.SH"]["lastPrice"] == 10.2
+    assert market_quotes.json()["data"]["600000.SH"]["kind"] == "tick"
     assert market_quotes.json()["periods"] == {"600000.SH": "tick"}
     assert stock_quotes.status_code == 200
-    assert stock_quotes.json()["data"] == {"600000.SH": {"close": 10.1, "kind": "1m"}}
+    assert stock_quotes.json()["data"]["600000.SH"]["close"] == 10.1
+    assert stock_quotes.json()["data"]["600000.SH"]["kind"] == "1m"
     assert stock_quotes.json()["periods"] == {"600000.SH": "1m"}
     assert market_filter.json()["not_subscribed"] == ["000001.SZ"]

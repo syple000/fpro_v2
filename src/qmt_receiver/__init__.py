@@ -2,8 +2,10 @@
 
 from qmt_protocol import (
     BarQuote,
+    DividendFactor,
     DividendFactorsResponse,
     FinancialDownloadResponse,
+    FinancialFrame,
     FinancialQueryResponse,
     HealthResponse,
     HistoryDownloadResponse,
@@ -49,10 +51,12 @@ __all__ = [
     "BAR_TABLE",
     "DAILY_SCHEMA",
     "DAILY_TABLE",
+    "DividendFactor",
     "DividendFactorsResponse",
     "DIVIDEND_FACTOR_SCHEMA",
     "DIVIDEND_FACTOR_TABLE",
     "FinancialDownloadResponse",
+    "FinancialFrame",
     "FinancialQueryResponse",
     "FINANCIAL_SCHEMA",
     "FINANCIAL_TABLE",

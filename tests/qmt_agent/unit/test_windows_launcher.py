@@ -35,9 +35,7 @@ def test_qmt_paths_rejects_missing_bin(tmp_path: Path) -> None:
         launcher.qmt_paths(str(tmp_path / "missing"), str(shortcut))
 
 
-def test_run_removes_proxy_environment_before_path_validation(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_run_removes_proxy_environment_before_path_validation(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(launcher.sys, "platform", "win32")
     monkeypatch.setenv("HTTP_PROXY", "http://127.0.0.1:7890")
     monkeypatch.setenv("https_proxy", "http://127.0.0.1:7890")
@@ -53,9 +51,7 @@ def test_run_removes_proxy_environment_before_path_validation(
     with pytest.raises(RuntimeError, match="bin.x64 目录不存在"):
         launcher.run(arguments)
 
-    assert not any(
-        name.casefold() in {"http_proxy", "https_proxy"} for name in os.environ
-    )
+    assert not any(name.casefold() in {"http_proxy", "https_proxy"} for name in os.environ)
 
 
 def test_process_matching_is_limited_to_agent_and_installation(tmp_path: Path) -> None:

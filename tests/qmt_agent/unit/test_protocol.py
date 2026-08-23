@@ -5,6 +5,8 @@ from pydantic import ValidationError
 
 from qmt_protocol import (
     BarQuote,
+    DividendFactor,
+    FinancialFrame,
     HistoryFrame,
     QuoteSequenceResponse,
     SequencedQuote,
@@ -81,7 +83,7 @@ def test_sequence_selects_quote_model_from_period_without_guessing() -> None:
         source="stock",
         subscription="000001.SZ",
         received_at=1_786_838_400_000_000,
-        quote=BarQuote(close=11.08),
+        quote=BarQuote(time=1_786_838_400_000, close=11.08),
     )
 
     assert isinstance(record.quote, BarQuote)
@@ -90,6 +92,31 @@ def test_sequence_selects_quote_model_from_period_without_guessing() -> None:
 def test_history_frame_rejects_rows_that_do_not_match_columns() -> None:
     with pytest.raises(ValidationError, match="行宽"):
         HistoryFrame(index=[20260817], columns=["open", "close"], data=[[11.2]])
+
+
+def test_financial_and_dividend_have_distinct_business_structures() -> None:
+    financial = FinancialFrame(
+        index=[20241231],
+        columns=["m_anntime", "tot_assets"],
+        data=[[20250331, 100.0]],
+    )
+    factor = DividendFactor(event_time=1_717_200_000_000, interest=0.1, dr=0.99)
+
+    assert not isinstance(financial, HistoryFrame)
+    assert factor.event_time == 1_717_200_000_000_000
+
+
+def test_sequence_rejects_realtime_quote_without_business_time() -> None:
+    with pytest.raises(ValidationError, match="event_time"):
+        SequencedQuote(
+            seq=1,
+            code="000001.SZ",
+            period="tick",
+            source="market",
+            subscription="SH",
+            received_at=1_786_838_400_000_000,
+            quote=TickQuote(lastPrice=10.0),
+        )
 
 
 def test_sequence_response_rejects_inconsistent_count() -> None:
@@ -131,7 +158,7 @@ def test_sequence_accepts_only_int64_microseconds() -> None:
         "period": "tick",
         "source": "market",
         "subscription": "SZ",
-        "quote": TickQuote(lastPrice=10.0),
+        "quote": TickQuote(time=1_786_944_183_000, lastPrice=10.0),
     }
 
     parsed = SequencedQuote.model_validate(
@@ -143,7 +170,7 @@ def test_sequence_accepts_only_int64_microseconds() -> None:
     )
     assert parsed.received_at == 1_786_923_065_934_481
     assert parsed.quote.time == 1_786_944_183_000_000
-    assert parsed.event_at == 1_786_944_183_000_000
+    assert parsed.event_time == 1_786_944_183_000_000
 
     for invalid in (
         "2026-08-17T05:51:05+00:00",

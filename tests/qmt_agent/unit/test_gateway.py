@@ -13,7 +13,7 @@ from qmt_agent.gateway import (
     StockQuotePush,
     XtDataGateway,
 )
-from qmt_protocol import HistoryFrame
+from qmt_protocol import FinancialFrame, HistoryFrame
 
 
 class FakeXtData:
@@ -37,7 +37,7 @@ class FakeXtData:
             }
         }
         self.dividend_factors: dict[str, Any] = {
-            "index": [20240601],
+            "index": [1_717_200_000_000],
             "columns": ["interest", "dr"],
             "data": [[0.1, 0.99]],
         }
@@ -314,9 +314,7 @@ def test_financial_download_and_query_use_official_interfaces() -> None:
     xtdata = FakeXtData()
     gateway = make_gateway(xtdata)
 
-    gateway.download_financial(
-        ["000001.SZ"], ["Balance"], "20240101", "20251231"
-    )
+    gateway.download_financial(["000001.SZ"], ["Balance"], "20240101", "20251231")
     assert xtdata.method == "download_financial_data2"
     assert xtdata.arguments == {
         "stock_list": ["000001.SZ"],
@@ -329,6 +327,7 @@ def test_financial_download_and_query_use_official_interfaces() -> None:
     result = gateway.get_financial(
         ["000001.SZ"], ["Balance"], "20240101", "20251231", "announce_time"
     )
+    assert isinstance(result["000001.SZ"]["Balance"], FinancialFrame)
     assert result["000001.SZ"]["Balance"].data == [[20250331, 20241231, 100.0]]
     assert xtdata.method == "get_financial_data"
     assert xtdata.arguments["report_type"] == "announce_time"
@@ -340,7 +339,10 @@ def test_dividend_factor_query_reads_each_stock() -> None:
 
     result = gateway.get_dividend_factors(["000001.SZ"], "20240101", "20241231")
 
-    assert result["000001.SZ"].data == [[0.1, 0.99]]
+    assert len(result["000001.SZ"]) == 1
+    assert result["000001.SZ"][0].event_time == 1_717_200_000_000_000
+    assert result["000001.SZ"][0].interest == 0.1
+    assert result["000001.SZ"][0].dr == 0.99
     assert xtdata.method == "get_divid_factors"
     assert xtdata.arguments == {
         "stock_code": "000001.SZ",

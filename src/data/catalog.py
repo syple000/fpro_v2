@@ -97,7 +97,7 @@ class DataCatalog:
         schema: pa.Schema,
     ) -> None:
         files = _active_files(root / table)
-        qualified = f'{_quote_identifier(source)}.{_quote_identifier(table)}'
+        qualified = f"{_quote_identifier(source)}.{_quote_identifier(table)}"
         if files:
             paths = ", ".join(_quote_string(str(path)) for path in files)
             query = (
@@ -167,7 +167,7 @@ class DataCatalog:
             "tushare",
             "sw_industry_as_of",
             "as_of_date",
-            'SELECT * REPLACE (NULL::DATE AS out_date, NULL::VARCHAR AS is_new) '
+            "SELECT * REPLACE (NULL::DATE AS out_date, NULL::VARCHAR AS is_new) "
             'FROM "tushare"."sw_industry" '
             "WHERE in_date <= CAST(as_of_date AS DATE) "
             "AND (out_date IS NULL OR out_date > CAST(as_of_date AS DATE))",
@@ -176,8 +176,7 @@ class DataCatalog:
             "tushare",
             "trade_cal_as_of",
             "as_of_date",
-            'SELECT * FROM "tushare"."trade_cal" '
-            "WHERE cal_date <= CAST(as_of_date AS DATE)",
+            'SELECT * FROM "tushare"."trade_cal" WHERE cal_date <= CAST(as_of_date AS DATE)',
         )
 
         for table in (TICK_TABLE, BAR_TABLE):
@@ -207,12 +206,16 @@ def _active_files(table_root: Path) -> list[Path]:
         if not isinstance(payload, dict):
             raise ValueError(f"Parquet Manifest 格式无效: {manifest_path}")
         names = payload.get("files")
-        if not isinstance(names, list) or any(
-            not isinstance(name, str)
-            or Path(name).name != name
-            or not name.endswith(".parquet")
-            for name in names
-        ) or len(names) != len(set(names)):
+        if (
+            not isinstance(names, list)
+            or any(
+                not isinstance(name, str)
+                or Path(name).name != name
+                or not name.endswith(".parquet")
+                for name in names
+            )
+            or len(names) != len(set(names))
+        ):
             raise ValueError(f"Parquet Manifest 格式无效: {manifest_path}")
         committed = payload.get("file_committed_at")
         if committed is not None and (

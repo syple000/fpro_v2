@@ -6,9 +6,9 @@ import pytest
 from pydantic import BaseModel, ValidationError
 
 from qmt_agent.models import (
-    DividendFactorsRequest,
+    DividendFactorsQueryRequest,
+    FinancialDownloadRequest,
     FinancialQueryRequest,
-    FinancialRequest,
     HistoryDownloadRequest,
     HistoryQueryRequest,
     MarketRequest,
@@ -34,9 +34,9 @@ from qmt_agent.models import (
         (SequencedQuoteRequest, {"seq": 1, "limit": 100}),
         (HistoryDownloadRequest, {"stocks": ["000001.SZ"]}),
         (HistoryQueryRequest, {"stocks": ["000001.SZ"]}),
-        (FinancialRequest, {"stocks": ["000001.SZ"]}),
+        (FinancialDownloadRequest, {"stocks": ["000001.SZ"]}),
         (FinancialQueryRequest, {"stocks": ["000001.SZ"]}),
-        (DividendFactorsRequest, {"stocks": ["000001.SZ"]}),
+        (DividendFactorsQueryRequest, {"stocks": ["000001.SZ"]}),
     ],
 )
 def test_every_request_model_rejects_unknown_fields(
@@ -75,9 +75,9 @@ def test_request_models_do_not_coerce_wrong_types(
     [
         HistoryDownloadRequest,
         HistoryQueryRequest,
-        FinancialRequest,
+        FinancialDownloadRequest,
         FinancialQueryRequest,
-        DividendFactorsRequest,
+        DividendFactorsQueryRequest,
     ],
 )
 def test_history_models_reject_impossible_dates_and_reversed_ranges(
@@ -100,9 +100,9 @@ def test_history_models_reject_impossible_dates_and_reversed_ranges(
     [
         HistoryDownloadRequest,
         HistoryQueryRequest,
-        FinancialRequest,
+        FinancialDownloadRequest,
         FinancialQueryRequest,
-        DividendFactorsRequest,
+        DividendFactorsQueryRequest,
     ],
 )
 def test_date_only_end_time_includes_the_whole_day(model: type[BaseModel]) -> None:
@@ -118,7 +118,7 @@ def test_date_only_end_time_includes_the_whole_day(model: type[BaseModel]) -> No
 
 
 def test_financial_request_deduplicates_tables() -> None:
-    request = FinancialRequest.model_validate(
+    request = FinancialDownloadRequest.model_validate(
         {
             "stocks": ["000001.SZ"],
             "tables": ["Balance", "Income", "Balance"],

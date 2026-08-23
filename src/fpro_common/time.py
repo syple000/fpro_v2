@@ -21,10 +21,7 @@ def datetime_to_utc_us(value: datetime) -> int:
     if value.utcoffset() is None:
         raise ValueError("时间必须包含时区")
     delta = value.astimezone(UTC) - _EPOCH
-    result = (
-        (delta.days * 86_400 + delta.seconds) * MICROSECONDS_PER_SECOND
-        + delta.microseconds
-    )
+    result = (delta.days * 86_400 + delta.seconds) * MICROSECONDS_PER_SECOND + delta.microseconds
     return require_utc_us(result)
 
 

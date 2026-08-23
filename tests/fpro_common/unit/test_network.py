@@ -17,8 +17,7 @@ def test_disable_environment_proxies_forces_direct_connections(monkeypatch) -> N
     disable_environment_proxies()
 
     assert not any(
-        name != "NO_PROXY" and name.casefold() in PROXY_ENVIRONMENT_VARIABLES
-        for name in os.environ
+        name != "NO_PROXY" and name.casefold() in PROXY_ENVIRONMENT_VARIABLES for name in os.environ
     )
     assert os.environ["NO_PROXY"] == "*"
     assert os.environ["QMT_AGENT_PORT"] == "8765"

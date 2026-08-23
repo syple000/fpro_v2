@@ -233,7 +233,7 @@ Content-Type: application/json
       "source": "stock",
       "subscription": "000001.SZ",
       "received_at": 1786842123000000,
-      "event_at": 1786842120000000,
+      "event_time": 1786842120000000,
       "quote": {"close": 10.2}
     }
   ],
@@ -245,7 +245,7 @@ Content-Type: application/json
 }
 ```
 
-`received_at`、`event_at` 以及响应行情中的 `quote.time` 均为 Unix Epoch 微秒 `int64`；
+`received_at`、`event_time` 以及响应行情中的 `quote.time` 均为 Unix Epoch 微秒 `int64`；
 HTTP/JSON 不传 ISO 时间字符串。
 
 可选的 `stocks` 只筛选当前序号窗口中的返回项，不改变全局序号，也不改变窗口推进规则：
@@ -318,14 +318,16 @@ Content-Type: application/json
 }
 ```
 
-K 线中的 pandas DataFrame 会返回为 `{"index": [...], "columns": [...], "data": [...]}`，numpy 数值和数组会转换为普通 JSON；`NaN`、正负无穷会转换为 `null`。
+K 线使用独立的 `HistoryFrame` split 结构返回。numpy 数值和数组会转换为普通 JSON；
+`NaN`、正负无穷会转换为 `null`。
 
 ### 财务和除权数据
 
 财务数据使用 `/v1/financial/download` 下载，再通过 `/v1/financial/query` 查询。支持
 `Balance`、`Income`、`CashFlow`、`Capital`、`Holdernum`、`Top10holder`、
 `Top10flowholder` 和 `Pershareindex`。除权数据通过 `/v1/dividend-factors/query` 查询。
-三类查询中的 DataFrame 都使用与历史行情相同的 `HistoryFrame` split 编码。
+财务查询使用独立的 `FinancialFrame` split 结构；除权查询拆成显式的 `DividendFactor`
+列表，保留 XtData index 的时间戳语义，不再复用 `HistoryFrame`。
 
 ### 查看订阅状态
 

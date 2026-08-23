@@ -167,7 +167,7 @@ def test_qmt_as_of_uses_receiver_timestamp(tmp_path: Path) -> None:
                     source="market",
                     subscription="SZ",
                     received_at=first,
-                    quote=TickQuote(lastPrice=10.0),
+                    quote=TickQuote(time=first, lastPrice=10.0),
                 ),
                 SequencedQuote(
                     seq=2,
@@ -176,7 +176,7 @@ def test_qmt_as_of_uses_receiver_timestamp(tmp_path: Path) -> None:
                     source="market",
                     subscription="SZ",
                     received_at=first + 10,
-                    quote=TickQuote(lastPrice=11.0),
+                    quote=TickQuote(time=first + 10, lastPrice=11.0),
                 ),
             ]
         )

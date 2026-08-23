@@ -307,6 +307,14 @@ def test_compact_deduplicates_primary_key_inside_single_file(tmp_path: Path) -> 
     assert store.read("events", "a").to_pylist() == [{"day": "a", "id": 1, "value": 1.0}]
 
 
+def test_compact_table_deduplicates_primary_key_inside_single_file(tmp_path: Path) -> None:
+    store = make_store(tmp_path, primary_key=("day", "id"))
+    store.append("events", make_table(("a", 1, 1.0), ("a", 1, 2.0)))
+
+    assert store.compact_table("events") == 1
+    assert store.read("events", "a").to_pylist() == [{"day": "a", "id": 1, "value": 2.0}]
+
+
 def test_compact_without_primary_key_keeps_duplicate_rows(tmp_path: Path) -> None:
     store = make_store(tmp_path, max_buffer_rows=1)
     store.append("events", make_table(("a", 1, 1.0)))
@@ -346,9 +354,7 @@ def test_compact_treats_null_primary_key_as_a_deduplicatable_value(tmp_path: Pat
 
     store.compact_partition("events", "a")
 
-    assert store.read("events", "a").to_pylist() == [
-        {"day": "a", "id": None, "value": 2.0}
-    ]
+    assert store.read("events", "a").to_pylist() == [{"day": "a", "id": None, "value": 2.0}]
 
 
 def test_compact_prefers_larger_configured_value_before_commit_order(tmp_path: Path) -> None:
@@ -363,9 +369,7 @@ def test_compact_prefers_larger_configured_value_before_commit_order(tmp_path: P
 
     store.compact_partition("events", "a")
 
-    assert store.read("events", "a").to_pylist() == [
-        {"day": "a", "id": 1, "value": 3.0}
-    ]
+    assert store.read("events", "a").to_pylist() == [{"day": "a", "id": 1, "value": 3.0}]
 
 
 def test_primary_key_configuration_is_validated() -> None:

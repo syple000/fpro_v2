@@ -13,7 +13,13 @@ from qmt_protocol import QuoteSequenceResponse, TickQuote
 
 def append_values(buffer: QuoteSequenceBuffer, *values: int) -> None:
     buffer.append(
-        [(f"{value:06d}.SZ", TickQuote.model_validate({"value": value})) for value in values],
+        [
+            (
+                f"{value:06d}.SZ",
+                TickQuote.model_validate({"time": 1_735_689_600_000, "value": value}),
+            )
+            for value in values
+        ],
         source="stock",
         subscription="000001.SZ",
         period="tick",

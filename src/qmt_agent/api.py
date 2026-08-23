@@ -12,9 +12,9 @@ from qmt_agent import __version__
 from qmt_agent.config import Settings
 from qmt_agent.gateway import MarketDataGateway, QmtGatewayError, XtDataGateway
 from qmt_agent.models import (
-    DividendFactorsRequest,
+    DividendFactorsQueryRequest,
+    FinancialDownloadRequest,
     FinancialQueryRequest,
-    FinancialRequest,
     HistoryDownloadRequest,
     HistoryQueryRequest,
     MarketRequest,
@@ -212,11 +212,11 @@ def create_app(
             body.dividend_type,
             body.fill_data,
         )
-        return HistoryQueryResponse(data=data)
+        return HistoryQueryResponse(period=body.period, data=data)
 
     @app.post("/v1/financial/download", summary="按列表下载财务数据")
     def download_financial(
-        request: Request, body: FinancialRequest
+        request: Request, body: FinancialDownloadRequest
     ) -> FinancialDownloadResponse:
         return service(request).download_financial(
             body.stocks,
@@ -226,9 +226,7 @@ def create_app(
         )
 
     @app.post("/v1/financial/query", summary="按列表获取财务数据")
-    def query_financial(
-        request: Request, body: FinancialQueryRequest
-    ) -> FinancialQueryResponse:
+    def query_financial(request: Request, body: FinancialQueryRequest) -> FinancialQueryResponse:
         return service(request).get_financial(
             body.stocks,
             body.tables,
@@ -239,7 +237,7 @@ def create_app(
 
     @app.post("/v1/dividend-factors/query", summary="按列表获取除权数据")
     def query_dividend_factors(
-        request: Request, body: DividendFactorsRequest
+        request: Request, body: DividendFactorsQueryRequest
     ) -> DividendFactorsResponse:
         return service(request).get_dividend_factors(
             body.stocks,

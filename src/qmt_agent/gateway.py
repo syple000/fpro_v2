@@ -13,14 +13,17 @@ from pydantic import JsonValue, ValidationError
 from qmt_agent.serialization import to_jsonable
 from qmt_protocol import (
     BarQuote,
+    DividendFactor,
     DividendFactorsResponse,
     DividendType,
+    FinancialFrame,
     FinancialQueryResponse,
     FinancialReportType,
     FinancialTable,
     HistoryFrame,
     HistoryQueryResponse,
     QuotePayload,
+    TabularFrame,
     TickQuote,
     XtDataPeriod,
     quote_model_for_period,
@@ -35,6 +38,15 @@ MarketQuoteCallback: TypeAlias = Callable[[MarketQuotePush], None]
 StockQuoteCallback: TypeAlias = Callable[[StockQuotePush], None]
 # 仅保留给自定义网关实现做联合标注；生产协议方法使用上面两个精确回调类型。
 QuoteCallback: TypeAlias = Callable[[MarketQuotePush | StockQuotePush], None]
+_DIVIDEND_FACTOR_FIELDS = (
+    "interest",
+    "stockBonus",
+    "stockGift",
+    "allotNum",
+    "allotPrice",
+    "gugai",
+    "dr",
+)
 
 
 class QmtGatewayError(RuntimeError):
@@ -93,14 +105,14 @@ class MarketDataGateway(Protocol):
         start_time: str,
         end_time: str,
         report_type: FinancialReportType,
-    ) -> dict[str, dict[str, HistoryFrame]]: ...
+    ) -> dict[str, dict[FinancialTable, FinancialFrame]]: ...
 
     def get_dividend_factors(
         self,
         stocks: Sequence[str],
         start_time: str,
         end_time: str,
-    ) -> dict[str, HistoryFrame]: ...
+    ) -> dict[str, list[DividendFactor]]: ...
 
 
 class _XtDataModule(Protocol):
@@ -310,11 +322,8 @@ class XtDataGateway:
                     fill_data=fill_data,
                 )
             json_data = to_jsonable({} if raw is None else raw)
-            frames = HistoryQueryResponse.model_validate({"data": json_data}).data
-            return {
-                code: _normalise_history_time(frame, code)
-                for code, frame in frames.items()
-            }
+            frames = HistoryQueryResponse.model_validate({"period": period, "data": json_data}).data
+            return {code: _normalise_history_time(frame, code) for code, frame in frames.items()}
         except ValidationError as exc:
             logger.debug("被拒绝的 XtData 历史行情原始数据：%r", raw)
             raise QmtGatewayError(f"历史行情返回结构不合法：{exc}") from exc
@@ -349,7 +358,7 @@ class XtDataGateway:
         start_time: str,
         end_time: str,
         report_type: FinancialReportType,
-    ) -> dict[str, dict[str, HistoryFrame]]:
+    ) -> dict[str, dict[FinancialTable, FinancialFrame]]:
         raw: object = None
         try:
             with self._call_lock:
@@ -361,7 +370,9 @@ class XtDataGateway:
                     report_type=report_type,
                 )
             json_data = to_jsonable({} if raw is None else raw)
-            return FinancialQueryResponse.model_validate({"data": json_data}).data
+            return FinancialQueryResponse.model_validate(
+                {"report_type": report_type, "data": json_data}
+            ).data
         except ValidationError as exc:
             logger.debug("被拒绝的 XtData 财务数据原始返回：%r", raw)
             raise QmtGatewayError(f"财务数据返回结构不合法：{exc}") from exc
@@ -375,7 +386,7 @@ class XtDataGateway:
         stocks: Sequence[str],
         start_time: str,
         end_time: str,
-    ) -> dict[str, HistoryFrame]:
+    ) -> dict[str, list[DividendFactor]]:
         raw: dict[str, object] = {}
         try:
             with self._call_lock:
@@ -387,8 +398,8 @@ class XtDataGateway:
                     )
                     if frame is not None:
                         raw[stock] = frame
-            json_data = to_jsonable(raw)
-            return DividendFactorsResponse.model_validate({"data": json_data}).data
+            data = {stock: _dividend_factors(frame, stock) for stock, frame in raw.items()}
+            return DividendFactorsResponse(data=data).data
         except ValidationError as exc:
             logger.debug("被拒绝的 XtData 除权数据原始返回：%r", raw)
             raise QmtGatewayError(f"除权数据返回结构不合法：{exc}") from exc
@@ -412,12 +423,32 @@ def _normalise_history_time(frame: HistoryFrame, code: str) -> HistoryFrame:
         if value is not None:
             converted = unix_timestamp_to_utc_us(value)
             if converted is None:
-                raise QmtGatewayError(
-                    f"{code} 历史行情第 {row_index} 行 time 不是有效整数时间戳"
-                )
+                raise QmtGatewayError(f"{code} 历史行情第 {row_index} 行 time 不是有效整数时间戳")
             row[time_index] = converted
         rows.append(row)
     return frame.model_copy(update={"data": rows})
+
+
+def _dividend_factors(value: object, code: str) -> list[DividendFactor]:
+    """把 XtData 除权 DataFrame 拆成显式记录，保留 index 的时间戳语义。"""
+    frame = TabularFrame.model_validate(to_jsonable(value))
+    known = set(_DIVIDEND_FACTOR_FIELDS)
+    factors: list[DividendFactor] = []
+    for row_index, (event_time, source_row) in enumerate(zip(frame.index, frame.data, strict=True)):
+        values = dict(zip(frame.columns, source_row, strict=True))
+        try:
+            factors.append(
+                DividendFactor.model_validate(
+                    {
+                        "event_time": event_time,
+                        **{name: values.get(name) for name in _DIVIDEND_FACTOR_FIELDS},
+                        "extra": {name: item for name, item in values.items() if name not in known},
+                    }
+                )
+            )
+        except ValidationError as exc:
+            raise QmtGatewayError(f"{code} 除权数据第 {row_index} 行结构不合法：{exc}") from exc
+    return factors
 
 
 def _subscription_id(value: object, message: str) -> int:

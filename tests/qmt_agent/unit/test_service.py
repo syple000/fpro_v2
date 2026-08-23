@@ -25,7 +25,10 @@ from tests.qmt_agent.fakes import FakeGateway
 
 
 def quote_dict(result: LatestQuotesResponse) -> dict[str, dict[str, object]]:
-    return {code: quote.model_dump(exclude_none=True) for code, quote in result.data.items()}
+    return {
+        code: quote.model_dump(exclude_none=True, exclude={"time"})
+        for code, quote in result.data.items()
+    }
 
 
 def test_stock_subscriptions_are_added_and_removed_individually() -> None:
@@ -87,6 +90,20 @@ def test_callback_keeps_only_latest_quote() -> None:
     quotes = service.get_stock_quotes()
     assert quote_dict(quotes) == {"000001.SZ": {"lastPrice": 10.2}}
     assert quotes.missing == []
+
+
+def test_realtime_quote_without_time_never_enters_downstream_state() -> None:
+    gateway = FakeGateway()
+    service = QmtMarketService(gateway)
+    service.subscribe_markets(["SH"])
+
+    gateway.push(
+        gateway.active_subscription_ids()["SH"],
+        {"600000.SH": {"time": None, "lastPrice": 10.0}},
+    )
+
+    assert service.get_market_quotes().data == {}
+    assert service.quote_sequence_status().size == 0
 
 
 def test_single_subscription_callback_preserves_every_quote_in_sequence() -> None:
@@ -336,7 +353,7 @@ def test_callback_during_subscribe_is_delivered_after_subscription_succeeds() ->
             callback: StockQuoteCallback,
         ) -> int:
             subscription_id = super().subscribe_stock_quote(stock, period, callback)
-            callback({stock: [BarQuote(close=10.5)]})
+            callback({stock: [BarQuote(time=1_735_689_600_000, close=10.5)]})
             return subscription_id
 
     service = QmtMarketService(ImmediateCallbackGateway())

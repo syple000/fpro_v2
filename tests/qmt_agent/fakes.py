@@ -12,7 +12,9 @@ from qmt_agent.gateway import (
     StockQuoteCallback,
 )
 from qmt_protocol import (
+    DividendFactor,
     DividendType,
+    FinancialFrame,
     FinancialReportType,
     FinancialTable,
     HistoryFrame,
@@ -134,11 +136,11 @@ class FakeGateway:
         start_time: str,
         end_time: str,
         report_type: FinancialReportType,
-    ) -> dict[str, dict[str, HistoryFrame]]:
+    ) -> dict[str, dict[FinancialTable, FinancialFrame]]:
         selected = list(tables) or ["Balance"]
         return {
             stock: {
-                table: HistoryFrame(
+                table: FinancialFrame(
                     index=[20241231],
                     columns=["m_anntime", "m_timetag", "tot_assets"],
                     data=[[20250331, 20241231, 100.0]],
@@ -153,27 +155,34 @@ class FakeGateway:
         stocks: Sequence[str],
         start_time: str,
         end_time: str,
-    ) -> dict[str, HistoryFrame]:
+    ) -> dict[str, list[DividendFactor]]:
         return {
-            stock: HistoryFrame(
-                index=[20240601],
-                columns=["interest", "dr"],
-                data=[[0.1, 0.99]],
-            )
+            stock: [DividendFactor(event_time=1_717_200_000_000, interest=0.1, dr=0.99)]
             for stock in stocks
         }
 
     def push(self, subscription_id: int, data: dict[str, Any]) -> None:
         with self._lock:
             _, period, callback = self.active[subscription_id]
+        timed_data: dict[str, Any] = {}
+        for code, raw_rows in data.items():
+            source_rows = raw_rows if isinstance(raw_rows, (list, tuple)) else [raw_rows]
+            timed_rows = []
+            for raw_quote in source_rows:
+                quote = dict(raw_quote)
+                quote.setdefault("time", 1_735_689_600_000)
+                timed_rows.append(quote)
+            timed_data[code] = timed_rows if isinstance(raw_rows, (list, tuple)) else timed_rows[0]
         if period is None:
             market_callback = cast(MarketQuoteCallback, callback)
-            market_callback({code: TickQuote.model_validate(quote) for code, quote in data.items()})
+            market_callback(
+                {code: TickQuote.model_validate(quote) for code, quote in timed_data.items()}
+            )
             return
 
         stock_callback = cast(StockQuoteCallback, callback)
         rows: dict[str, list[QuotePayload]] = {}
-        for code, raw_rows in data.items():
+        for code, raw_rows in timed_data.items():
             source_rows = raw_rows if isinstance(raw_rows, (list, tuple)) else [raw_rows]
             rows[code] = [validate_quote(period, quote) for quote in source_rows]
         stock_callback(rows)

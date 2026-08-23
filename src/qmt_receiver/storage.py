@@ -3,10 +3,9 @@
 from __future__ import annotations
 
 import json
-import logging
 import math
 from collections.abc import Mapping, Sequence
-from datetime import UTC, date, datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -17,14 +16,17 @@ from fpro_common import normalise_unix_timestamp_us, utc_us_to_datetime
 from parquet_store import ParquetStore, TableConfig
 from qmt_protocol import (
     BarQuote,
+    DividendFactor,
     DividendType,
+    FinancialFrame,
+    FinancialTable,
     HistoryFrame,
     QuoteEvent,
     SequencedQuote,
     TickQuote,
 )
 
-logger = logging.getLogger(__name__)
+_QMT_TIMEZONE = ZoneInfo("Asia/Shanghai")
 
 TICK_TABLE = "ticks"
 BAR_TABLE = "bars"
@@ -54,7 +56,7 @@ _ENVELOPE_FIELDS = (
     pa.field("source", pa.string(), nullable=False),
     pa.field("subscription", pa.string(), nullable=False),
     pa.field("received_at", pa.int64(), nullable=False),
-    pa.field("event_at", pa.int64()),
+    pa.field("event_time", pa.int64(), nullable=False),
 )
 
 _TICK_QUOTE_FIELDS = (
@@ -131,13 +133,14 @@ FINANCIAL_SCHEMA = pa.schema(
         pa.field("report_date", pa.date32(), nullable=False),
         pa.field("code", pa.string(), nullable=False),
         pa.field("dataset", pa.string(), nullable=False),
-        pa.field("announcement_date", pa.date32()),
+        pa.field("disclosure_date", pa.date32()),
         pa.field("data_json", pa.large_string(), nullable=False),
     ]
 )
 DIVIDEND_FACTOR_SCHEMA = pa.schema(
     [
         pa.field("ex_date", pa.date32(), nullable=False),
+        pa.field("event_time", pa.int64(), nullable=False),
         pa.field("code", pa.string(), nullable=False),
         pa.field("interest", pa.float64()),
         pa.field("stockBonus", pa.float64()),
@@ -171,15 +174,17 @@ class QmtDataStore:
                 name=TICK_TABLE,
                 schema=TICK_SCHEMA,
                 partition_by="trading_date",
-                sort_by="seq",
-                primary_key=("received_at", "seq"),
+                sort_by="event_time",
+                primary_key=("code", "event_time"),
+                deduplicate_prefer_by="received_at",
             ),
             TableConfig(
                 name=BAR_TABLE,
                 schema=BAR_SCHEMA,
                 partition_by="trading_date",
-                sort_by="seq",
-                primary_key=("received_at", "seq"),
+                sort_by="event_time",
+                primary_key=("code", "period", "event_time"),
+                deduplicate_prefer_by="received_at",
             ),
             TableConfig(
                 name=DAILY_TABLE,
@@ -192,8 +197,9 @@ class QmtDataStore:
                 name=FINANCIAL_TABLE,
                 schema=FINANCIAL_SCHEMA,
                 partition_by="report_date",
-                sort_by=("code", "dataset", "announcement_date"),
-                primary_key=("code", "dataset", "announcement_date"),
+                sort_by=("code", "dataset"),
+                primary_key=("code", "dataset"),
+                deduplicate_prefer_by="disclosure_date",
             ),
             TableConfig(
                 name=DIVIDEND_FACTOR_TABLE,
@@ -211,8 +217,9 @@ class QmtDataStore:
         bar_rows: list[dict[str, Any]] = []
         events: list[QuoteEvent] = []
         for record in records:
-            trading_date = _trading_date(record.event_at, record.received_at, self._timezone)
-            common = _envelope_row(record, trading_date)
+            event_time = record.event_time
+            trading_date = _trading_date(event_time, self._timezone)
+            common = _envelope_row(record, trading_date, event_time)
             if record.period == "tick":
                 if not isinstance(record.quote, TickQuote):
                     raise TypeError("tick 行情必须使用 TickQuote")
@@ -262,7 +269,10 @@ class QmtDataStore:
             pa.Table.from_pylist(rows, schema=DAILY_SCHEMA),
         )
 
-    def write_financial(self, data: Mapping[str, Mapping[str, HistoryFrame]]) -> int:
+    def write_financial(
+        self,
+        data: Mapping[str, Mapping[FinancialTable, FinancialFrame]],
+    ) -> int:
         """写入下载财务数据。"""
         rows: list[dict[str, object]] = []
         for code, tables in data.items():
@@ -273,7 +283,7 @@ class QmtDataStore:
                             "report_date": _date_value(values.get("m_timetag", index)),
                             "code": code,
                             "dataset": table,
-                            "announcement_date": _optional_date(values.get("m_anntime")),
+                            "disclosure_date": _optional_date(values.get("m_anntime")),
                             "data_json": _json(values),
                         }
                     )
@@ -282,24 +292,29 @@ class QmtDataStore:
             pa.Table.from_pylist(rows, schema=FINANCIAL_SCHEMA),
         )
 
-    def write_dividend_factors(self, frames: Mapping[str, HistoryFrame]) -> int:
+    def write_dividend_factors(
+        self,
+        data: Mapping[str, Sequence[DividendFactor]],
+    ) -> int:
         """写入下载除权因子。"""
-        fields = (
-            "interest",
-            "stockBonus",
-            "stockGift",
-            "allotNum",
-            "allotPrice",
-            "gugai",
-            "dr",
-        )
         rows: list[dict[str, object]] = []
-        for code, frame in frames.items():
-            for index, values in _frame_rows(frame):
-                row: dict[str, object] = {"ex_date": _date_value(index), "code": code}
-                row.update({field: _number(values.get(field)) for field in fields})
-                row["extra_json"] = _extra_fields_json(values, fields)
-                rows.append(row)
+        for code, factors in data.items():
+            for factor in factors:
+                rows.append(
+                    {
+                        "ex_date": _trading_date(factor.event_time, self._timezone),
+                        "event_time": factor.event_time,
+                        "code": code,
+                        "interest": factor.interest,
+                        "stockBonus": factor.stockBonus,
+                        "stockGift": factor.stockGift,
+                        "allotNum": factor.allotNum,
+                        "allotPrice": factor.allotPrice,
+                        "gugai": factor.gugai,
+                        "dr": factor.dr,
+                        "extra_json": _json(factor.extra) if factor.extra else None,
+                    }
+                )
         return self._write(
             DIVIDEND_FACTOR_TABLE,
             pa.Table.from_pylist(rows, schema=DIVIDEND_FACTOR_SCHEMA),
@@ -320,7 +335,7 @@ class QmtDataStore:
         return data.num_rows
 
     def compact_realtime(self) -> dict[str, int]:
-        """扫描并整理实时表中存在多个活动文件的分区。"""
+        """扫描实时表，合并文件并按业务键去重。"""
         return {table: self._store.compact_table(table) for table in (TICK_TABLE, BAR_TABLE)}
 
     def close(self) -> None:
@@ -333,7 +348,11 @@ class QmtDataStore:
         self.close()
 
 
-def _envelope_row(record: SequencedQuote, trading_date: date) -> dict[str, Any]:
+def _envelope_row(
+    record: SequencedQuote,
+    trading_date: date,
+    event_time: int,
+) -> dict[str, Any]:
     return {
         "trading_date": trading_date,
         "seq": record.seq,
@@ -342,7 +361,7 @@ def _envelope_row(record: SequencedQuote, trading_date: date) -> dict[str, Any]:
         "source": record.source,
         "subscription": record.subscription,
         "received_at": record.received_at,
-        "event_at": record.event_at,
+        "event_time": event_time,
     }
 
 
@@ -370,21 +389,13 @@ def _quote_extra_json(quote: TickQuote | BarQuote) -> str | None:
     )
 
 
-def _trading_date(
-    event_at: int | None,
-    received_at: int,
-    timezone: ZoneInfo,
-) -> date:
-    if event_at is not None:
-        return utc_us_to_datetime(event_at).astimezone(timezone).date()
-    logger.debug(
-        "行情缺少可解析的 event_at，交易日期回退到 received_at：received_at=%s",
-        received_at,
-    )
-    return utc_us_to_datetime(received_at).astimezone(timezone).date()
+def _trading_date(event_time: int, timezone: ZoneInfo) -> date:
+    return utc_us_to_datetime(event_time).astimezone(timezone).date()
 
 
-def _frame_rows(frame: HistoryFrame) -> list[tuple[object, dict[str, object]]]:
+def _frame_rows(
+    frame: HistoryFrame | FinancialFrame,
+) -> list[tuple[object, dict[str, object]]]:
     return [
         (index, dict(zip(frame.columns, row, strict=True)))
         for index, row in zip(frame.index, frame.data, strict=True)
@@ -414,7 +425,7 @@ def _optional_date(value: object) -> date | None:
             return datetime.strptime(str(integer), "%Y%m%d").date()
         timestamp = normalise_unix_timestamp_us(integer)
         if timestamp is not None:
-            return utc_us_to_datetime(timestamp).astimezone(UTC).date()
+            return utc_us_to_datetime(timestamp).astimezone(_QMT_TIMEZONE).date()
     return None
 
 

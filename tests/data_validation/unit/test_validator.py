@@ -12,7 +12,7 @@ from data_validation import (
     compare_financial,
     sample_stocks,
 )
-from qmt_protocol import HistoryFrame
+from qmt_protocol import DividendFactor, FinancialFrame, HistoryFrame
 from qmt_receiver import QmtDataStore
 from tushare_data import TABLE_SCHEMAS, TushareDataStore
 
@@ -79,10 +79,22 @@ def test_sampled_qmt_data_matches_tushare(tmp_path: Path) -> None:
                     "imp_ann_date": date(2024, 5, 20),
                     "div_proc": "实施",
                     "ex_date": ex_day,
-                    "cash_div_tax": 0.1,
-                    "stk_bo_rate": 0.2,
-                    "stk_co_rate": 0.3,
-                    "stk_div": 0.5,
+                    "cash_div_tax": 0.06,
+                    "stk_bo_rate": 0.1,
+                    "stk_co_rate": 0.2,
+                    "stk_div": 0.3,
+                },
+                {
+                    "ts_code": "000001.SZ",
+                    "end_date": date(2023, 6, 30),
+                    "ann_date": date(2024, 3, 2),
+                    "imp_ann_date": date(2024, 5, 21),
+                    "div_proc": "实施",
+                    "ex_date": ex_day,
+                    "cash_div_tax": 0.04,
+                    "stk_bo_rate": 0.1,
+                    "stk_co_rate": 0.1,
+                    "stk_div": 0.2,
                 },
             ),
         )
@@ -98,7 +110,7 @@ def test_sampled_qmt_data_matches_tushare(tmp_path: Path) -> None:
         store.write_financial(
             {
                 "000001.SZ": {
-                    "Income": HistoryFrame(
+                    "Income": FinancialFrame(
                         index=[20231231],
                         columns=["m_anntime", "m_timetag", "revenue_inc", "revenue"],
                         data=[[20240430, 20231231, 100.0, 120.0]],
@@ -108,11 +120,14 @@ def test_sampled_qmt_data_matches_tushare(tmp_path: Path) -> None:
         )
         store.write_dividend_factors(
             {
-                "000001.SZ": HistoryFrame(
-                    index=[20240601],
-                    columns=["interest", "stockBonus", "stockGift"],
-                    data=[[0.1, 0.2, 0.3]],
-                )
+                "000001.SZ": [
+                    DividendFactor(
+                        event_time=1_717_200_000_000,
+                        interest=0.1,
+                        stockBonus=0.2,
+                        stockGift=0.3,
+                    )
+                ]
             }
         )
 

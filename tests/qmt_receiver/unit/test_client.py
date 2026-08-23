@@ -71,19 +71,23 @@ def response_payload(request: httpx2.Request) -> dict[str, object]:
         return {
             "stocks": ["000001.SZ"],
             "period": "1d",
+            "start_time": "",
+            "end_time": "",
             "mode": "incremental",
             "completed": True,
         }
     if path == "/v1/history/query":
-        return {"data": {}}
+        return {"period": "1d", "data": {}}
     if path == "/v1/financial/download":
         return {
             "stocks": ["000001.SZ"],
             "tables": ["Balance"],
+            "start_time": "",
+            "end_time": "",
             "completed": True,
         }
     if path == "/v1/financial/query":
-        return {"data": {}}
+        return {"report_type": "report_time", "data": {}}
     if path == "/v1/dividend-factors/query":
         return {"data": {}}
     raise AssertionError(f"未处理的测试路径：{request.method} {path}")

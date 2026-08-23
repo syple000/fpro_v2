@@ -374,7 +374,7 @@ def compare_financial(
         "SELECT code, dataset, report_date, data_json FROM qmt.financial "
         f"WHERE {_stock_filter('code', stocks)} AND report_date BETWEEN ? AND ? "
         "QUALIFY row_number() OVER (PARTITION BY code, dataset, report_date "
-        "ORDER BY announcement_date DESC NULLS LAST) = 1",
+        "ORDER BY disclosure_date DESC NULLS LAST) = 1",
         [*stocks, start_date, end_date],
     )
     qmt = {
@@ -439,12 +439,20 @@ def compare_dividends(
 ) -> CheckResult:
     tushare_rows = _fetch(
         connection,
-        "SELECT ts_code, ex_date, cash_div_tax, stk_bo_rate, stk_co_rate, stk_div "
-        "FROM tushare.dividend "
-        f"WHERE {_stock_filter('ts_code', stocks)} AND ex_date BETWEEN ? AND ? "
-        "AND div_proc = '实施' "
-        "QUALIFY row_number() OVER (PARTITION BY ts_code, ex_date "
-        "ORDER BY imp_ann_date DESC NULLS LAST) = 1",
+        "WITH latest_plan AS ("
+        "SELECT ts_code, end_date, ann_date, ex_date, cash_div_tax, "
+        "stk_bo_rate, stk_co_rate, stk_div FROM tushare.dividend "
+        f"WHERE {_stock_filter('ts_code', stocks)} AND div_proc = '实施' "
+        "QUALIFY row_number() OVER ("
+        "PARTITION BY ts_code, end_date, ann_date "
+        "ORDER BY imp_ann_date DESC NULLS LAST) = 1"
+        ") SELECT ts_code, ex_date, "
+        "sum(coalesce(cash_div_tax, 0)) AS cash_div_tax, "
+        "sum(coalesce(stk_bo_rate, 0)) AS stk_bo_rate, "
+        "sum(coalesce(stk_co_rate, 0)) AS stk_co_rate, "
+        "sum(coalesce(stk_div, 0)) AS stk_div "
+        "FROM latest_plan WHERE ex_date BETWEEN ? AND ? "
+        "GROUP BY ts_code, ex_date",
         [*stocks, start_date, end_date],
     )
     qmt_rows = _fetch(

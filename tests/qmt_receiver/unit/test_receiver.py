@@ -73,7 +73,7 @@ def quote(seq: int) -> SequencedQuote:
         source="market",
         subscription="SZ",
         received_at=1_786_842_000_000_000,
-        quote=TickQuote(lastPrice=10.0),
+        quote=TickQuote(time=1_786_842_000_000, lastPrice=10.0),
     )
 
 

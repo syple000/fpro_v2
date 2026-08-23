@@ -364,6 +364,8 @@ class QmtMarketService:
         return HistoryDownloadResponse(
             stocks=stocks,
             period=period,
+            start_time=start_time,
+            end_time=end_time,
             mode="incremental" if incrementally else "full",
             completed=True,
         )
@@ -398,7 +400,13 @@ class QmtMarketService:
         end_time: str,
     ) -> FinancialDownloadResponse:
         self._gateway.download_financial(stocks, tables, start_time, end_time)
-        return FinancialDownloadResponse(stocks=stocks, tables=tables, completed=True)
+        return FinancialDownloadResponse(
+            stocks=stocks,
+            tables=tables,
+            start_time=start_time,
+            end_time=end_time,
+            completed=True,
+        )
 
     def get_financial(
         self,
@@ -408,10 +416,8 @@ class QmtMarketService:
         end_time: str,
         report_type: FinancialReportType,
     ) -> FinancialQueryResponse:
-        data = self._gateway.get_financial(
-            stocks, tables, start_time, end_time, report_type
-        )
-        return FinancialQueryResponse(data=data)
+        data = self._gateway.get_financial(stocks, tables, start_time, end_time, report_type)
+        return FinancialQueryResponse(report_type=report_type, data=data)
 
     def get_dividend_factors(
         self,
@@ -474,6 +480,9 @@ class QmtMarketService:
         sequence_items: list[tuple[str, QuotePayload]] = []
         for code, quote in quotes.items():
             normalized_code = code.strip().upper()
+            if quote.time is None:
+                logger.debug("丢弃缺少 time 的实时行情：code=%s source=market", normalized_code)
+                continue
             sequence_items.append((normalized_code, quote))
             normalized[normalized_code] = quote
 
@@ -505,10 +514,18 @@ class QmtMarketService:
         sequence_items: list[tuple[str, QuotePayload]] = []
         for code, quote_rows in quotes.items():
             normalized_code = code.strip().upper()
-            if not quote_rows:
+            timed_rows = [quote for quote in quote_rows if quote.time is not None]
+            dropped = len(quote_rows) - len(timed_rows)
+            if dropped:
+                logger.debug(
+                    "丢弃缺少 time 的实时行情：code=%s source=stock count=%s",
+                    normalized_code,
+                    dropped,
+                )
+            if not timed_rows:
                 continue
-            sequence_items.extend((normalized_code, quote) for quote in quote_rows)
-            latest[normalized_code] = quote_rows[-1]
+            sequence_items.extend((normalized_code, quote) for quote in timed_rows)
+            latest[normalized_code] = timed_rows[-1]
 
         if not sequence_items:
             return
