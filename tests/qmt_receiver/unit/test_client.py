@@ -76,6 +76,16 @@ def response_payload(request: httpx2.Request) -> dict[str, object]:
         }
     if path == "/v1/history/query":
         return {"data": {}}
+    if path == "/v1/financial/download":
+        return {
+            "stocks": ["000001.SZ"],
+            "tables": ["Balance"],
+            "completed": True,
+        }
+    if path == "/v1/financial/query":
+        return {"data": {}}
+    if path == "/v1/dividend-factors/query":
+        return {"data": {}}
     raise AssertionError(f"未处理的测试路径：{request.method} {path}")
 
 
@@ -119,6 +129,9 @@ def test_client_exposes_all_qmt_agent_business_interfaces() -> None:
     client.quote_sequence(1, wait_ms=500)
     client.download_history(("000001.SZ",))
     client.query_history(("000001.SZ",))
+    client.download_financial(("000001.SZ",), ("Balance",))
+    client.query_financial(("000001.SZ",), ("Balance",))
+    client.query_dividend_factors(("000001.SZ",))
     http_client.close()
 
     assert requests == [
@@ -135,6 +148,9 @@ def test_client_exposes_all_qmt_agent_business_interfaces() -> None:
         ("POST", "/v1/quotes/subscribed/sequence"),
         ("POST", "/v1/history/download"),
         ("POST", "/v1/history/query"),
+        ("POST", "/v1/financial/download"),
+        ("POST", "/v1/financial/query"),
+        ("POST", "/v1/dividend-factors/query"),
     ]
 
 

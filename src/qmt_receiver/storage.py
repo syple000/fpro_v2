@@ -1,25 +1,50 @@
-"""Tick 与 bar 的强类型、按交易日 Parquet 写入。"""
+"""QMT 实时与下载数据的统一 Parquet 存储。"""
 
 from __future__ import annotations
 
 import json
 import logging
-from collections.abc import Sequence
-from datetime import date
+import math
+from collections.abc import Mapping, Sequence
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
 import pyarrow as pa
 
-from fpro_common import utc_us_to_datetime
+from fpro_common import normalise_unix_timestamp_us, utc_us_to_datetime
 from parquet_store import ParquetStore, TableConfig
-from qmt_protocol import BarQuote, QuoteEvent, SequencedQuote, TickQuote
+from qmt_protocol import (
+    BarQuote,
+    DividendType,
+    HistoryFrame,
+    QuoteEvent,
+    SequencedQuote,
+    TickQuote,
+)
 
 logger = logging.getLogger(__name__)
 
 TICK_TABLE = "ticks"
 BAR_TABLE = "bars"
+DAILY_TABLE = "daily"
+FINANCIAL_TABLE = "financial"
+DIVIDEND_FACTOR_TABLE = "dividend_factors"
+
+_DAILY_FIELDS = (
+    "time",
+    "open",
+    "high",
+    "low",
+    "close",
+    "volume",
+    "amount",
+    "settelementPrice",
+    "openInterest",
+    "preClose",
+    "suspendFlag",
+)
 
 _ENVELOPE_FIELDS = (
     pa.field("trading_date", pa.date32(), nullable=False),
@@ -82,38 +107,109 @@ _BAR_QUOTE_TYPE = pa.struct([*_BAR_QUOTE_FIELDS, pa.field("extra_json", pa.large
 TICK_SCHEMA = pa.schema([*_ENVELOPE_FIELDS, pa.field("quote", _TICK_QUOTE_TYPE, nullable=False)])
 BAR_SCHEMA = pa.schema([*_ENVELOPE_FIELDS, pa.field("quote", _BAR_QUOTE_TYPE, nullable=False)])
 
+DAILY_SCHEMA = pa.schema(
+    [
+        pa.field("trade_date", pa.date32(), nullable=False),
+        pa.field("code", pa.string(), nullable=False),
+        pa.field("adjustment", pa.string(), nullable=False),
+        pa.field("time", pa.int64()),
+        pa.field("open", pa.float64()),
+        pa.field("high", pa.float64()),
+        pa.field("low", pa.float64()),
+        pa.field("close", pa.float64()),
+        pa.field("volume", pa.int64()),
+        pa.field("amount", pa.float64()),
+        pa.field("settelementPrice", pa.float64()),
+        pa.field("openInterest", pa.float64()),
+        pa.field("preClose", pa.float64()),
+        pa.field("suspendFlag", pa.int64()),
+        pa.field("extra_json", pa.large_string()),
+    ]
+)
+FINANCIAL_SCHEMA = pa.schema(
+    [
+        pa.field("report_date", pa.date32(), nullable=False),
+        pa.field("code", pa.string(), nullable=False),
+        pa.field("dataset", pa.string(), nullable=False),
+        pa.field("announcement_date", pa.date32()),
+        pa.field("data_json", pa.large_string(), nullable=False),
+    ]
+)
+DIVIDEND_FACTOR_SCHEMA = pa.schema(
+    [
+        pa.field("ex_date", pa.date32(), nullable=False),
+        pa.field("code", pa.string(), nullable=False),
+        pa.field("interest", pa.float64()),
+        pa.field("stockBonus", pa.float64()),
+        pa.field("stockGift", pa.float64()),
+        pa.field("allotNum", pa.float64()),
+        pa.field("allotPrice", pa.float64()),
+        pa.field("gugai", pa.float64()),
+        pa.field("dr", pa.float64()),
+        pa.field("extra_json", pa.large_string()),
+    ]
+)
+
 _TICK_QUOTE_COLUMNS = tuple(field.name for field in _TICK_QUOTE_FIELDS)
 _BAR_QUOTE_COLUMNS = tuple(field.name for field in _BAR_QUOTE_FIELDS)
 
+_DOWNLOAD_PARTITION_BY = {
+    DAILY_TABLE: "trade_date",
+    FINANCIAL_TABLE: "report_date",
+    DIVIDEND_FACTOR_TABLE: "ex_date",
+}
 
-class QuoteParquetWriter:
-    """把 sequence 中的 tick 和 bar 写入各自的按交易日分区表。"""
+
+class QmtDataStore:
+    """QMT 实时和下载数据共用的薄存储层。"""
 
     def __init__(self, root: str | Path, timezone: str = "Asia/Shanghai") -> None:
         self._timezone = ZoneInfo(timezone)
         self._store = ParquetStore(root)
-        self._store.register(
+        for config in (
             TableConfig(
                 name=TICK_TABLE,
                 schema=TICK_SCHEMA,
                 partition_by="trading_date",
                 sort_by="seq",
-            )
-        )
-        self._store.register(
+                primary_key=("received_at", "seq"),
+            ),
             TableConfig(
                 name=BAR_TABLE,
                 schema=BAR_SCHEMA,
                 partition_by="trading_date",
                 sort_by="seq",
-            )
-        )
+                primary_key=("received_at", "seq"),
+            ),
+            TableConfig(
+                name=DAILY_TABLE,
+                schema=DAILY_SCHEMA,
+                partition_by="trade_date",
+                sort_by=("code", "adjustment"),
+                primary_key=("code", "adjustment"),
+            ),
+            TableConfig(
+                name=FINANCIAL_TABLE,
+                schema=FINANCIAL_SCHEMA,
+                partition_by="report_date",
+                sort_by=("code", "dataset", "announcement_date"),
+                primary_key=("code", "dataset", "announcement_date"),
+            ),
+            TableConfig(
+                name=DIVIDEND_FACTOR_TABLE,
+                schema=DIVIDEND_FACTOR_SCHEMA,
+                partition_by="ex_date",
+                sort_by="code",
+                primary_key="code",
+            ),
+        ):
+            self._store.register(config)
 
-    def append(self, records: Sequence[SequencedQuote]) -> list[QuoteEvent]:
+    def append_quotes(self, records: Sequence[SequencedQuote]) -> list[QuoteEvent]:
+        """追加实时行情，不立即 flush 或整理。"""
         tick_rows: list[dict[str, Any]] = []
         bar_rows: list[dict[str, Any]] = []
         events: list[QuoteEvent] = []
-
         for record in records:
             trading_date = _trading_date(record.event_at, record.received_at, self._timezone)
             common = _envelope_row(record, trading_date)
@@ -125,35 +221,112 @@ class QuoteParquetWriter:
                 if not isinstance(record.quote, BarQuote):
                     raise TypeError("bar 行情必须使用 BarQuote")
                 bar_rows.append(_quote_row(common, record.quote, _BAR_QUOTE_COLUMNS))
-
             events.append(
                 QuoteEvent(
                     trading_date=trading_date,
-                    seq=record.seq,
-                    code=record.code,
-                    period=record.period,
-                    source=record.source,
-                    subscription=record.subscription,
-                    received_at=record.received_at,
-                    event_at=record.event_at,
-                    quote=record.quote,
+                    **record.model_dump(mode="python"),
                 )
             )
 
-        # 先完成两张 Arrow Table 的构造和 schema 校验，再写入 ParquetStore 缓冲区。
-        # 是否立即落盘由 store 的缓冲阈值决定，close() 会提交剩余数据。
-        tick_table = pa.Table.from_pylist(tick_rows, schema=TICK_SCHEMA) if tick_rows else None
-        bar_table = pa.Table.from_pylist(bar_rows, schema=BAR_SCHEMA) if bar_rows else None
-        if tick_table is not None:
-            self._store.append(TICK_TABLE, tick_table)
-        if bar_table is not None:
-            self._store.append(BAR_TABLE, bar_table)
+        if tick_rows:
+            self._store.append(TICK_TABLE, pa.Table.from_pylist(tick_rows, schema=TICK_SCHEMA))
+        if bar_rows:
+            self._store.append(BAR_TABLE, pa.Table.from_pylist(bar_rows, schema=BAR_SCHEMA))
         return events
+
+    def write_daily(
+        self,
+        frames: Mapping[str, HistoryFrame],
+        adjustment: DividendType,
+    ) -> int:
+        """写入一种复权方式的下载日线。"""
+        rows: list[dict[str, object]] = []
+        for code, frame in frames.items():
+            for index, values in _frame_rows(frame):
+                row = {
+                    "trade_date": _date_value(index),
+                    "code": code,
+                    "adjustment": adjustment,
+                }
+                for field in _DAILY_FIELDS:
+                    value = values.get(field)
+                    row[field] = (
+                        _integer(value)
+                        if field in {"time", "volume", "suspendFlag"}
+                        else _number(value)
+                    )
+                row["extra_json"] = _extra_fields_json(values, _DAILY_FIELDS)
+                rows.append(row)
+        return self._write(
+            DAILY_TABLE,
+            pa.Table.from_pylist(rows, schema=DAILY_SCHEMA),
+        )
+
+    def write_financial(self, data: Mapping[str, Mapping[str, HistoryFrame]]) -> int:
+        """写入下载财务数据。"""
+        rows: list[dict[str, object]] = []
+        for code, tables in data.items():
+            for table, frame in tables.items():
+                for index, values in _frame_rows(frame):
+                    rows.append(
+                        {
+                            "report_date": _date_value(values.get("m_timetag", index)),
+                            "code": code,
+                            "dataset": table,
+                            "announcement_date": _optional_date(values.get("m_anntime")),
+                            "data_json": _json(values),
+                        }
+                    )
+        return self._write(
+            FINANCIAL_TABLE,
+            pa.Table.from_pylist(rows, schema=FINANCIAL_SCHEMA),
+        )
+
+    def write_dividend_factors(self, frames: Mapping[str, HistoryFrame]) -> int:
+        """写入下载除权因子。"""
+        fields = (
+            "interest",
+            "stockBonus",
+            "stockGift",
+            "allotNum",
+            "allotPrice",
+            "gugai",
+            "dr",
+        )
+        rows: list[dict[str, object]] = []
+        for code, frame in frames.items():
+            for index, values in _frame_rows(frame):
+                row: dict[str, object] = {"ex_date": _date_value(index), "code": code}
+                row.update({field: _number(values.get(field)) for field in fields})
+                row["extra_json"] = _extra_fields_json(values, fields)
+                rows.append(row)
+        return self._write(
+            DIVIDEND_FACTOR_TABLE,
+            pa.Table.from_pylist(rows, schema=DIVIDEND_FACTOR_SCHEMA),
+        )
+
+    def _write(self, dataset: str, data: pa.Table) -> int:
+        partition_by = _DOWNLOAD_PARTITION_BY[dataset]
+        partitions: set[date] = set()
+        for value in data.column(partition_by).to_pylist():
+            if not isinstance(value, date):
+                raise ValueError(f"{dataset} 返回了无效 {partition_by}: {value!r}")
+            partitions.add(value)
+
+        self._store.append(dataset, data)
+        self._store.flush(dataset)
+        for partition in sorted(partitions):
+            self._store.compact_partition(dataset, partition)
+        return data.num_rows
+
+    def compact_realtime(self) -> dict[str, int]:
+        """扫描并整理实时表中存在多个活动文件的分区。"""
+        return {table: self._store.compact_table(table) for table in (TICK_TABLE, BAR_TABLE)}
 
     def close(self) -> None:
         self._store.close()
 
-    def __enter__(self) -> QuoteParquetWriter:
+    def __enter__(self) -> QmtDataStore:
         return self
 
     def __exit__(self, *_: object) -> None:
@@ -180,12 +353,12 @@ def _quote_row(
 ) -> dict[str, Any]:
     row = dict(common)
     quote_data = quote.model_dump(mode="python", include=set(columns))
-    quote_data["extra_json"] = _extra_json(quote)
+    quote_data["extra_json"] = _quote_extra_json(quote)
     row["quote"] = quote_data
     return row
 
 
-def _extra_json(quote: TickQuote | BarQuote) -> str | None:
+def _quote_extra_json(quote: TickQuote | BarQuote) -> str | None:
     if not quote.model_extra:
         return None
     return json.dumps(
@@ -209,3 +382,69 @@ def _trading_date(
         received_at,
     )
     return utc_us_to_datetime(received_at).astimezone(timezone).date()
+
+
+def _frame_rows(frame: HistoryFrame) -> list[tuple[object, dict[str, object]]]:
+    return [
+        (index, dict(zip(frame.columns, row, strict=True)))
+        for index, row in zip(frame.index, frame.data, strict=True)
+    ]
+
+
+def _date_value(value: object) -> date:
+    result = _optional_date(value)
+    if result is None:
+        raise ValueError(f"QMT 返回了无效日期：{value!r}")
+    return result
+
+
+def _optional_date(value: object) -> date | None:
+    if value is None:
+        return None
+    if isinstance(value, date) and not isinstance(value, datetime):
+        return value
+    if isinstance(value, str):
+        text = value.strip().replace("-", "")
+        if len(text) >= 8 and text[:8].isdigit():
+            return datetime.strptime(text[:8], "%Y%m%d").date()
+        return None
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        integer = int(value)
+        if 19000101 <= integer <= 29991231:
+            return datetime.strptime(str(integer), "%Y%m%d").date()
+        timestamp = normalise_unix_timestamp_us(integer)
+        if timestamp is not None:
+            return utc_us_to_datetime(timestamp).astimezone(UTC).date()
+    return None
+
+
+def _integer(value: object) -> int | None:
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)) and math.isfinite(value):
+        return int(value)
+    return None
+
+
+def _number(value: object) -> float | None:
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        result = float(value)
+        return result if math.isfinite(result) else None
+    return None
+
+
+def _extra_fields_json(values: Mapping[str, object], fields: Sequence[str]) -> str | None:
+    extra = {name: value for name, value in values.items() if name not in fields}
+    return _json(extra) if extra else None
+
+
+def _json(value: object) -> str:
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )

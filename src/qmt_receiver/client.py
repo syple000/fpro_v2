@@ -10,8 +10,13 @@ import httpx2
 from pydantic import ValidationError
 
 from qmt_protocol import (
+    DividendFactorsResponse,
     DividendType,
     ErrorResponse,
+    FinancialDownloadResponse,
+    FinancialQueryResponse,
+    FinancialReportType,
+    FinancialTable,
     HealthResponse,
     HistoryDownloadResponse,
     HistoryMode,
@@ -191,6 +196,63 @@ class QmtAgentClient:
                 "count": count,
                 "dividend_type": dividend_type,
                 "fill_data": fill_data,
+            },
+        )
+
+    def download_financial(
+        self,
+        stocks: Sequence[str],
+        tables: Sequence[FinancialTable] = (),
+        start_time: str = "",
+        end_time: str = "",
+    ) -> FinancialDownloadResponse:
+        return self._request(
+            "POST",
+            "/v1/financial/download",
+            FinancialDownloadResponse,
+            json={
+                "stocks": list(stocks),
+                "tables": list(tables),
+                "start_time": start_time,
+                "end_time": end_time,
+            },
+        )
+
+    def query_financial(
+        self,
+        stocks: Sequence[str],
+        tables: Sequence[FinancialTable] = (),
+        start_time: str = "",
+        end_time: str = "",
+        report_type: FinancialReportType = "report_time",
+    ) -> FinancialQueryResponse:
+        return self._request(
+            "POST",
+            "/v1/financial/query",
+            FinancialQueryResponse,
+            json={
+                "stocks": list(stocks),
+                "tables": list(tables),
+                "start_time": start_time,
+                "end_time": end_time,
+                "report_type": report_type,
+            },
+        )
+
+    def query_dividend_factors(
+        self,
+        stocks: Sequence[str],
+        start_time: str = "",
+        end_time: str = "",
+    ) -> DividendFactorsResponse:
+        return self._request(
+            "POST",
+            "/v1/dividend-factors/query",
+            DividendFactorsResponse,
+            json={
+                "stocks": list(stocks),
+                "start_time": start_time,
+                "end_time": end_time,
             },
         )
 

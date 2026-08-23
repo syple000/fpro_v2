@@ -7,7 +7,7 @@ import pyarrow as pa
 
 from data import DataCatalog
 from qmt_protocol import SequencedQuote, TickQuote
-from qmt_receiver import QuoteParquetWriter
+from qmt_receiver import QmtDataStore
 from tushare_data import TABLE_SCHEMAS, TushareDataStore
 
 
@@ -55,18 +55,13 @@ def test_tushare_statement_as_of_selects_source_declared_revision(tmp_path: Path
 
     with DataCatalog(tushare_root=tushare_root, qmt_root=tmp_path / "qmt") as catalog:
         raw_columns = {
-            row[0]
-            for row in catalog.connection.execute(
-                "DESCRIBE tushare.cashflow"
-            ).fetchall()
+            row[0] for row in catalog.connection.execute("DESCRIBE tushare.cashflow").fetchall()
         }
         before = catalog.connection.execute(
-            "SELECT f_ann_date, free_cashflow "
-            "FROM tushare.cashflow_as_of(DATE '2024-12-31')"
+            "SELECT f_ann_date, free_cashflow FROM tushare.cashflow_as_of(DATE '2024-12-31')"
         ).fetchall()
         after = catalog.connection.execute(
-            "SELECT f_ann_date, free_cashflow "
-            "FROM tushare.cashflow_as_of(DATE '2025-04-29')"
+            "SELECT f_ann_date, free_cashflow FROM tushare.cashflow_as_of(DATE '2025-04-29')"
         ).fetchall()
 
     assert {"partition_date", "visible_at", "observed_at"}.isdisjoint(raw_columns)
@@ -104,8 +99,7 @@ def test_dividend_as_of_keeps_lifecycle_rows_until_their_announcement(
             "SELECT div_proc FROM tushare.dividend_as_of(DATE '2024-04-29')"
         ).fetchall()
         after = catalog.connection.execute(
-            "SELECT div_proc FROM tushare.dividend_as_of(DATE '2024-04-30') "
-            "ORDER BY div_proc"
+            "SELECT div_proc FROM tushare.dividend_as_of(DATE '2024-04-30') ORDER BY div_proc"
         ).fetchall()
 
     assert before == [("预案",)]
@@ -150,12 +144,10 @@ def test_sw_industry_as_of_returns_active_membership_without_future_state(
 
     with DataCatalog(tushare_root=tushare_root, qmt_root=tmp_path / "qmt") as catalog:
         old = catalog.connection.execute(
-            "SELECT l3_code, out_date, is_new "
-            "FROM tushare.sw_industry_as_of(DATE '2023-12-31')"
+            "SELECT l3_code, out_date, is_new FROM tushare.sw_industry_as_of(DATE '2023-12-31')"
         ).fetchall()
         new = catalog.connection.execute(
-            "SELECT l3_code, out_date, is_new "
-            "FROM tushare.sw_industry_as_of(DATE '2024-01-01')"
+            "SELECT l3_code, out_date, is_new FROM tushare.sw_industry_as_of(DATE '2024-01-01')"
         ).fetchall()
 
     assert old == [("850001.SI", None, None)]
@@ -165,8 +157,8 @@ def test_sw_industry_as_of_returns_active_membership_without_future_state(
 def test_qmt_as_of_uses_receiver_timestamp(tmp_path: Path) -> None:
     qmt_root = tmp_path / "qmt"
     first = int(datetime(2024, 1, 2, tzinfo=UTC).timestamp() * 1_000_000)
-    with QuoteParquetWriter(qmt_root) as writer:
-        writer.append(
+    with QmtDataStore(qmt_root) as store:
+        store.append_quotes(
             [
                 SequencedQuote(
                     seq=1,

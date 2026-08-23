@@ -41,6 +41,10 @@ SELECT * FROM tushare.sw_industry_as_of(DATE '2024-04-30');
 SELECT * FROM qmt.ticks_as_of(1714464000000000);
 ```
 
+QMT 还公开用于跨源复核的 `qmt.daily`、`qmt.financial` 和
+`qmt.dividend_factors`。这些历史表按自身业务日期查询，不使用实时行情的 `received_at`
+宏。
+
 同步任务写入或整理文件后，对已存在的 `DataCatalog` 调用 `refresh()`。
 新建对象会自动执行一次刷新。目录中未被 Manifest 引用的 Parquet 文件不会对外可见。
 

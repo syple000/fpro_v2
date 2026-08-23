@@ -2,8 +2,13 @@
 
 from qmt_protocol.models import (
     BarQuote,
+    DividendFactorsResponse,
     DividendType,
     ErrorResponse,
+    FinancialDownloadResponse,
+    FinancialQueryResponse,
+    FinancialReportType,
+    FinancialTable,
     HealthResponse,
     HistoryDownloadResponse,
     HistoryFrame,
@@ -31,8 +36,13 @@ from qmt_protocol.models import (
 
 __all__ = [
     "BarQuote",
+    "DividendFactorsResponse",
     "DividendType",
     "ErrorResponse",
+    "FinancialDownloadResponse",
+    "FinancialQueryResponse",
+    "FinancialReportType",
+    "FinancialTable",
     "HealthResponse",
     "HistoryDownloadResponse",
     "HistoryFrame",

@@ -45,11 +45,12 @@ class FakeClient:
         return response
 
 
-class FakeWriter:
+class FakeStore:
     def __init__(self) -> None:
         self.records: list[SequencedQuote] = []
+        self.compactions = 0
 
-    def append(self, records: Sequence[SequencedQuote]) -> list[QuoteEvent]:
+    def append_quotes(self, records: Sequence[SequencedQuote]) -> list[QuoteEvent]:
         self.records.extend(records)
         return [
             QuoteEvent(
@@ -58,6 +59,10 @@ class FakeWriter:
             )
             for record in records
         ]
+
+    def compact_realtime(self) -> dict[str, int]:
+        self.compactions += 1
+        return {"ticks": 0, "bars": 0}
 
 
 def quote(seq: int) -> SequencedQuote:
@@ -98,23 +103,24 @@ def empty_batch(requested: int, oldest: int | None, latest: int | None) -> Quote
 def test_receive_writes_and_publishes_one_batch() -> None:
     records = [quote(1), quote(2)]
     client = FakeClient([batch(records, requested=1, next_seq=3)])
-    writer = FakeWriter()
+    store = FakeStore()
     queue: Queue[QuoteEvent] = Queue()
-    receiver = QmtReceiver(client, writer, timeout_ms=123)
+    receiver = QmtReceiver(client, store, timeout_ms=123)
 
     result = receiver.receive(queue)
 
     assert result.count == 2
     assert result.next_seq == 3
-    assert writer.records == records
+    assert store.records == records
+    assert store.compactions == 1
     assert [queue.get_nowait().seq, queue.get_nowait().seq] == [1, 2]
     assert client.requested == [(1, 1_000, 123)]
 
 
 def test_receive_returns_empty_after_long_poll_timeout_at_latest() -> None:
     client = FakeClient([empty_batch(11, 1, 10)])
-    writer = FakeWriter()
-    receiver = QmtReceiver(client, writer, start_seq=11, timeout_ms=500)
+    store = FakeStore()
+    receiver = QmtReceiver(client, store, start_seq=11, timeout_ms=500)
 
     result = receiver.receive(Queue())
 
@@ -133,9 +139,9 @@ def test_outdated_sequence_probes_oldest_minus_one_then_exponential_offsets() ->
             available,
         ]
     )
-    writer = FakeWriter()
+    store = FakeStore()
     queue: Queue[QuoteEvent] = Queue()
-    receiver = QmtReceiver(client, writer, timeout_ms=1_000)
+    receiver = QmtReceiver(client, store, timeout_ms=1_000)
 
     result = receiver.receive(queue)
 

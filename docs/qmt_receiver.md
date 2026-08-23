@@ -12,15 +12,15 @@
 ```python
 from queue import Queue
 
-from qmt_receiver import QmtAgentClient, QmtReceiver, QuoteEvent, QuoteParquetWriter
+from qmt_receiver import QmtAgentClient, QmtDataStore, QmtReceiver, QuoteEvent
 
 quote_queue: Queue[QuoteEvent] = Queue()  # Python Queue 本身是线程安全的
 
 with (
     QmtAgentClient("http://127.0.0.1:8765") as client,
-    QuoteParquetWriter("data/qmt_receiver") as writer,
+    QmtDataStore("data/qmt_receiver") as store,
 ):
-    receiver = QmtReceiver(client, writer, timeout_ms=30_000)
+    receiver = QmtReceiver(client, store, timeout_ms=30_000)
 
     while platform_is_running:
         result = receiver.receive(quote_queue)
@@ -50,6 +50,36 @@ with (
 - `market_snapshot()`、`stock_snapshot()`；
 - `market_quotes()`、`stock_quotes()`、`quote_sequence()`；
 - `download_history()`、`query_history()`。
+- `download_financial()`、`query_financial()`、`query_dividend_factors()`。
+
+## 下载同步
+
+`sync.py` 负责把 qmt-agent 下载接口和 `QmtDataStore` 串起来，对外直接暴露
+`sync_daily()`、`sync_financial()`、`sync_dividend_factors()` 和 `sync_all()`：
+
+- `daily`：日线，`adjustment` 区分 `none` 和 `front`；
+- `financial`：财务报表，公共日期列固定，原始财务字段完整保存在 `data_json`；
+- `dividend_factors`：除权事件和 `dr` 复权系数。
+
+```python
+from qmt_receiver import QmtAgentClient, QmtDataStore, sync_all
+
+with (
+    QmtAgentClient() as client,
+    QmtDataStore("data/qmt_receiver") as store,
+):
+    result = sync_all(
+        client,
+        store,
+        ["000001.SZ", "600000.SH"],
+        "20240101",
+        "20241231",
+    )
+```
+
+财务下载会补全抽样股票的本地数据，再按报告期读取指定区间。下载类数据每次写完都会立即
+flush，并按业务主键去重合并受影响的日期分区。写入后 `DataCatalog` 会将三张表公开为
+`qmt.daily`、`qmt.financial` 和 `qmt.dividend_factors`。
 
 ## Parquet
 
@@ -90,9 +120,19 @@ OHLC、金额、结算价、持仓量及复权子字段为 `float64`。完整字
 
 新时间 Schema 不兼容旧数据目录，不做自动迁移；切换版本时应删除旧数据并重新接收。
 
-`append()` 不会为每个接收批次强制 `flush`。数据进入 `ParquetStore` 缓冲区后即可写入队列并
-推进 receiver 的内存 `next_seq`；达到 store 的行数或内存阈值时自动提交，writer
+`append_quotes()` 不会为每个接收批次强制 `flush`。数据进入 `ParquetStore` 缓冲区后即可写入
+队列并推进 receiver 的内存 `next_seq`；达到 store 的行数或内存阈值时自动提交，store
 `close()` 时会提交全部剩余数据。这样可以避免每个接收批次产生一个小 Parquet 文件。
+
+实时数据以 `(received_at, seq)` 识别重复接收，但 append 时不会立即去重合并。
+`QmtReceiver` 每次创建时会扫描 tick/bar 的 Manifest，仅整理存在多个活动文件的分区；运行中
+需要手动整理时直接调用：
+
+```python
+result = store.compact_realtime()
+```
+
+返回值是 `ticks`、`bars` 各自实际整理的分区数。
 
 ## 测试 main
 
@@ -102,17 +142,25 @@ OHLC、金额、结算价、持仓量及复权子字段为 `float64`。完整字
 uv sync --group qmt-receiver
 ```
 
-运行：
+实时接收：
 
 ```bash
-uv run --group qmt-receiver qmt-receiver-test
+uv run --group qmt-receiver qmt-receiver-test realtime
 ```
 
-测试 main 自己创建线程安全 `Queue` 并连续调用 `receive()`，启动时订阅 SH/SZ 全市场；每分钟
-用 `000001.SZ` 调用一遍 qmt-agent 全部业务接口。只运行一轮：
+只接收一批：
 
 ```bash
-uv run --group qmt-receiver qmt-receiver-test --once
+uv run --group qmt-receiver qmt-receiver-test realtime --once
 ```
 
-可用 `--url`、`--data-dir` 和 `--timeout-ms` 覆盖默认参数。
+同步下载：
+
+```bash
+uv run --group qmt-receiver qmt-receiver-test sync \
+  --stocks 000001.SZ 600000.SH \
+  --start-time 20240101 \
+  --end-time 20241231
+```
+
+可用 `--url` 和 `--data-dir` 覆盖默认参数；实时模式还支持 `--markets` 和 `--timeout-ms`。

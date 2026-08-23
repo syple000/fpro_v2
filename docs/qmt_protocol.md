@@ -38,7 +38,7 @@ XtData object
   -> QmtMarketService（只保存协议模型）
   -> FastAPI（按响应模型生成 OpenAPI 和 JSON）
   -> QmtAgentClient（从 JSON 严格反序列化为同一响应模型）
-  -> QmtReceiver / QuoteParquetWriter（只接收 SequencedQuote）
+  -> QmtReceiver / QmtDataStore（只接收 SequencedQuote）
   -> Queue[QuoteEvent]
 ```
 
@@ -110,6 +110,9 @@ XtData object
 | `POST /v1/quotes/subscribed/sequence` | `QuoteSequenceResponse` |
 | `POST /v1/history/download` | `HistoryDownloadResponse` |
 | `POST /v1/history/query` | `HistoryQueryResponse` |
+| `POST /v1/financial/download` | `FinancialDownloadResponse` |
+| `POST /v1/financial/query` | `FinancialQueryResponse` |
+| `POST /v1/dividend-factors/query` | `DividendFactorsResponse` |
 
 ### 状态和订阅结果
 
@@ -202,6 +205,10 @@ XtData object
 `HistoryQueryResponse.data` 是 `dict[str, HistoryFrame]`。
 `HistoryDownloadResponse` 包含 `stocks: list[str]`、`period: XtDataPeriod`、
 `mode: Literal["incremental", "full"]`、`completed: bool`。
+
+`FinancialQueryResponse` 在股票代码下再按财务表名组织 `HistoryFrame`；
+`FinancialDownloadResponse` 返回股票、表名和完成状态；`DividendFactorsResponse` 按股票代码
+返回除权数据 `HistoryFrame`。
 
 ## Receiver 队列事件
 

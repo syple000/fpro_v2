@@ -71,6 +71,9 @@ with ParquetStore(Path("data")) as store:
 null-safe 语义分组，多行中相同位置的 null 视为同一键值。配置主键后，即使分区只有一个文件，
 也会检查并清理文件内部的重复键。
 
+`compact_table` 会先 flush，再扫描整张表，只整理包含多个活动文件的分区，并返回实际整理的
+分区数，适合进程启动时做轻量维护。
+
 `deduplicate_prefer_by` 是可选冲突优先字段：按字段升序比较，较大值胜出；完全相同时仍由
 后提交的行胜出。该配置不会在 Parquet 中增加字段。
 

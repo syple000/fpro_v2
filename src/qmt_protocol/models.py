@@ -38,6 +38,17 @@ XtDataPeriod: TypeAlias = Literal[
 QuoteSource: TypeAlias = Literal["market", "stock"]
 HistoryMode: TypeAlias = Literal["incremental", "full"]
 DividendType: TypeAlias = Literal["none", "front", "back", "front_ratio", "back_ratio"]
+FinancialTable: TypeAlias = Literal[
+    "Balance",
+    "Income",
+    "CashFlow",
+    "Capital",
+    "Holdernum",
+    "Top10holder",
+    "Top10flowholder",
+    "Pershareindex",
+]
+FinancialReportType: TypeAlias = Literal["report_time", "announce_time"]
 
 
 def _finite_float(value: object) -> object:
@@ -361,6 +372,20 @@ class HistoryDownloadResponse(ProtocolModel):
     period: XtDataPeriod
     mode: HistoryMode
     completed: bool
+
+
+class FinancialQueryResponse(ProtocolModel):
+    data: dict[str, dict[str, HistoryFrame]]
+
+
+class FinancialDownloadResponse(ProtocolModel):
+    stocks: list[str]
+    tables: list[FinancialTable]
+    completed: bool
+
+
+class DividendFactorsResponse(ProtocolModel):
+    data: dict[str, HistoryFrame]
 
 
 class ErrorResponse(ProtocolModel):

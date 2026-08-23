@@ -27,6 +27,20 @@ class FakeXtData:
                 "data": [[10.0]],
             }
         }
+        self.financial: dict[str, Any] = {
+            "000001.SZ": {
+                "Balance": {
+                    "index": [20241231],
+                    "columns": ["m_anntime", "m_timetag", "tot_assets"],
+                    "data": [[20250331, 20241231, 100.0]],
+                }
+            }
+        }
+        self.dividend_factors: dict[str, Any] = {
+            "index": [20240601],
+            "columns": ["interest", "dr"],
+            "data": [[0.1, 0.99]],
+        }
 
     def subscribe_whole_quote(self, **kwargs: Any) -> int:
         self.method = "subscribe_whole_quote"
@@ -55,6 +69,20 @@ class FakeXtData:
         self.method = "get_local_data"
         self.arguments = kwargs
         return self.history
+
+    def download_financial_data2(self, **kwargs: Any) -> None:
+        self.method = "download_financial_data2"
+        self.arguments = kwargs
+
+    def get_financial_data(self, **kwargs: Any) -> dict[str, Any]:
+        self.method = "get_financial_data"
+        self.arguments = kwargs
+        return self.financial
+
+    def get_divid_factors(self, **kwargs: Any) -> dict[str, Any]:
+        self.method = "get_divid_factors"
+        self.arguments = kwargs
+        return self.dividend_factors
 
 
 def make_gateway(xtdata: object) -> XtDataGateway:
@@ -279,4 +307,43 @@ def test_history_download_supports_legacy_client_without_incremental_argument() 
         "period": "1d",
         "start_time": "",
         "end_time": "",
+    }
+
+
+def test_financial_download_and_query_use_official_interfaces() -> None:
+    xtdata = FakeXtData()
+    gateway = make_gateway(xtdata)
+
+    gateway.download_financial(
+        ["000001.SZ"], ["Balance"], "20240101", "20251231"
+    )
+    assert xtdata.method == "download_financial_data2"
+    assert xtdata.arguments == {
+        "stock_list": ["000001.SZ"],
+        "table_list": ["Balance"],
+        "start_time": "20240101",
+        "end_time": "20251231",
+        "callback": None,
+    }
+
+    result = gateway.get_financial(
+        ["000001.SZ"], ["Balance"], "20240101", "20251231", "announce_time"
+    )
+    assert result["000001.SZ"]["Balance"].data == [[20250331, 20241231, 100.0]]
+    assert xtdata.method == "get_financial_data"
+    assert xtdata.arguments["report_type"] == "announce_time"
+
+
+def test_dividend_factor_query_reads_each_stock() -> None:
+    xtdata = FakeXtData()
+    gateway = make_gateway(xtdata)
+
+    result = gateway.get_dividend_factors(["000001.SZ"], "20240101", "20241231")
+
+    assert result["000001.SZ"].data == [[0.1, 0.99]]
+    assert xtdata.method == "get_divid_factors"
+    assert xtdata.arguments == {
+        "stock_code": "000001.SZ",
+        "start_time": "20240101",
+        "end_time": "20241231",
     }

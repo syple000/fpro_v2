@@ -16,6 +16,12 @@ data = [
     "requests>=2.32,<3.0",
     "tzdata>=2025.2",
 ]
+data-validation = [
+    "duckdb>=1.4,<2.0",
+    "httpx2>=2.0,<3.0",
+    "pydantic>=2.10,<3.0",
+    "pyarrow>=18.0,<24.0",
+]
 parquet-store = [
     "pyarrow>=18.0,<24.0",
 ]
@@ -54,6 +60,7 @@ qmt-agent = { requires-python = ">=3.11,<3.12" }
 
 [project.scripts]
 data-test = "data.test_main:main"
+data-validation = "data_validation.__main__:main"
 qmt-agent = "qmt_agent.__main__:main"
 qmt-agent-start = "qmt_agent.windows_launcher:main"
 qmt-receiver-test = "qmt_receiver.test_main:main"
@@ -67,6 +74,7 @@ build-backend = "hatchling.build"
 packages = [
     "src/fpro_common",
     "src/data",
+    "src/data_validation",
     "src/parquet_store",
     "src/qmt_agent",
     "src/qmt_protocol",

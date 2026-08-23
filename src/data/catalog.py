@@ -4,12 +4,22 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any
 
 import duckdb
 import pyarrow as pa
 
-from qmt_receiver.storage import BAR_SCHEMA, BAR_TABLE, TICK_SCHEMA, TICK_TABLE
+from qmt_receiver import (
+    BAR_SCHEMA,
+    BAR_TABLE,
+    DAILY_SCHEMA,
+    DAILY_TABLE,
+    DIVIDEND_FACTOR_SCHEMA,
+    DIVIDEND_FACTOR_TABLE,
+    FINANCIAL_SCHEMA,
+    FINANCIAL_TABLE,
+    TICK_SCHEMA,
+    TICK_TABLE,
+)
 from tushare_data.schemas import TABLE_SCHEMAS
 
 _TUSHARE_MARKET_TABLES = (
@@ -28,7 +38,13 @@ _TUSHARE_ANNOUNCEMENT_TABLES = (
     "fina_audit",
     "fina_indicator",
 )
-_QMT_SCHEMAS = {TICK_TABLE: TICK_SCHEMA, BAR_TABLE: BAR_SCHEMA}
+_QMT_SCHEMAS = {
+    TICK_TABLE: TICK_SCHEMA,
+    BAR_TABLE: BAR_SCHEMA,
+    DAILY_TABLE: DAILY_SCHEMA,
+    FINANCIAL_TABLE: FINANCIAL_SCHEMA,
+    DIVIDEND_FACTOR_TABLE: DIVIDEND_FACTOR_SCHEMA,
+}
 
 
 class DataCatalog:
@@ -45,7 +61,6 @@ class DataCatalog:
         self._qmt_root = Path(qmt_root).expanduser().resolve()
         self._connection = connection or duckdb.connect(":memory:")
         self._owns_connection = connection is None
-        self._empty_registrations: set[str] = set()
         self.refresh()
 
     @property
@@ -83,11 +98,7 @@ class DataCatalog:
     ) -> None:
         files = _active_files(root / table)
         qualified = f'{_quote_identifier(source)}.{_quote_identifier(table)}'
-        registration = f"__data_empty_{source}_{table}"
         if files:
-            if registration in self._empty_registrations:
-                self._connection.unregister(registration)
-                self._empty_registrations.remove(registration)
             paths = ", ".join(_quote_string(str(path)) for path in files)
             query = (
                 f"CREATE OR REPLACE VIEW {qualified} AS "
@@ -95,10 +106,8 @@ class DataCatalog:
                 "union_by_name = true, hive_partitioning = false)"
             )
         else:
-            if registration in self._empty_registrations:
-                self._connection.unregister(registration)
-            self._connection.register(registration, pa.Table.from_batches([], schema=schema))
-            self._empty_registrations.add(registration)
+            registration = f"__data_empty_{source}_{table}"
+            self._connection.register(registration, schema.empty_table())
             query = (
                 f"CREATE OR REPLACE VIEW {qualified} AS "
                 f"SELECT * FROM {_quote_identifier(registration)}"
@@ -171,7 +180,7 @@ class DataCatalog:
             "WHERE cal_date <= CAST(as_of_date AS DATE)",
         )
 
-        for table in _QMT_SCHEMAS:
+        for table in (TICK_TABLE, BAR_TABLE):
             self._create_macro(
                 "qmt",
                 f"{table}_as_of",
@@ -190,11 +199,9 @@ class DataCatalog:
 def _active_files(table_root: Path) -> list[Path]:
     """仅返回每个分区 Manifest 当前引用的文件。"""
     files: list[Path] = []
-    if not table_root.exists():
-        return files
     for manifest_path in sorted(table_root.rglob("_manifest.json")):
         try:
-            payload: Any = json.loads(manifest_path.read_text(encoding="utf-8"))
+            payload = json.loads(manifest_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
             raise ValueError(f"无法读取 Parquet Manifest: {manifest_path}") from exc
         if not isinstance(payload, dict):
@@ -205,9 +212,7 @@ def _active_files(table_root: Path) -> list[Path]:
             or Path(name).name != name
             or not name.endswith(".parquet")
             for name in names
-        ):
-            raise ValueError(f"Parquet Manifest 格式无效: {manifest_path}")
-        if len(names) != len(set(names)):
+        ) or len(names) != len(set(names)):
             raise ValueError(f"Parquet Manifest 格式无效: {manifest_path}")
         committed = payload.get("file_committed_at")
         if committed is not None and (
@@ -220,17 +225,8 @@ def _active_files(table_root: Path) -> list[Path]:
         ):
             raise ValueError(f"Parquet Manifest 格式无效: {manifest_path}")
         if isinstance(committed, dict):
-            commit_times = {
-                name: value for name, value in committed.items() if isinstance(value, int)
-            }
-            indexed = enumerate(names)
-            names = [
-                name
-                for _, name in sorted(
-                    indexed,
-                    key=lambda item: (commit_times[item[1]], item[0]),
-                )
-            ]
+            commit_times = committed
+            names.sort(key=lambda name: commit_times[name])
         for name in names:
             path = manifest_path.parent / name
             if not path.is_file():

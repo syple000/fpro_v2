@@ -16,7 +16,13 @@ from pydantic import (
 )
 
 from fpro_common import datetime_to_utc_us
-from qmt_protocol import DividendType, HistoryMode, XtDataPeriod
+from qmt_protocol import (
+    DividendType,
+    FinancialReportType,
+    FinancialTable,
+    HistoryMode,
+    XtDataPeriod,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -181,6 +187,46 @@ class HistoryQueryRequest(StockRequest):
             seen.add(value)
             normalized.append(value)
         return normalized
+
+    @field_validator("start_time", "end_time")
+    @classmethod
+    def validate_time(cls, value: str) -> str:
+        return _validate_xt_time(value)
+
+    @model_validator(mode="after")
+    def validate_time_range(self) -> Self:
+        _validate_time_range(self.start_time, self.end_time)
+        return self
+
+
+class FinancialRequest(StockRequest):
+    tables: list[FinancialTable] = Field(default_factory=list)
+    start_time: str = ""
+    end_time: str = ""
+
+    @field_validator("tables")
+    @classmethod
+    def unique_tables(cls, values: list[FinancialTable]) -> list[FinancialTable]:
+        return list(dict.fromkeys(values))
+
+    @field_validator("start_time", "end_time")
+    @classmethod
+    def validate_time(cls, value: str) -> str:
+        return _validate_xt_time(value)
+
+    @model_validator(mode="after")
+    def validate_time_range(self) -> Self:
+        _validate_time_range(self.start_time, self.end_time)
+        return self
+
+
+class FinancialQueryRequest(FinancialRequest):
+    report_type: FinancialReportType = "report_time"
+
+
+class DividendFactorsRequest(StockRequest):
+    start_time: str = ""
+    end_time: str = ""
 
     @field_validator("start_time", "end_time")
     @classmethod

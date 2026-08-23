@@ -6,6 +6,9 @@ import pytest
 from pydantic import BaseModel, ValidationError
 
 from qmt_agent.models import (
+    DividendFactorsRequest,
+    FinancialQueryRequest,
+    FinancialRequest,
     HistoryDownloadRequest,
     HistoryQueryRequest,
     MarketRequest,
@@ -31,6 +34,9 @@ from qmt_agent.models import (
         (SequencedQuoteRequest, {"seq": 1, "limit": 100}),
         (HistoryDownloadRequest, {"stocks": ["000001.SZ"]}),
         (HistoryQueryRequest, {"stocks": ["000001.SZ"]}),
+        (FinancialRequest, {"stocks": ["000001.SZ"]}),
+        (FinancialQueryRequest, {"stocks": ["000001.SZ"]}),
+        (DividendFactorsRequest, {"stocks": ["000001.SZ"]}),
     ],
 )
 def test_every_request_model_rejects_unknown_fields(
@@ -64,7 +70,16 @@ def test_request_models_do_not_coerce_wrong_types(
     assert any(item["type"] == error_type for item in error.value.errors())
 
 
-@pytest.mark.parametrize("model", [HistoryDownloadRequest, HistoryQueryRequest])
+@pytest.mark.parametrize(
+    "model",
+    [
+        HistoryDownloadRequest,
+        HistoryQueryRequest,
+        FinancialRequest,
+        FinancialQueryRequest,
+        DividendFactorsRequest,
+    ],
+)
 def test_history_models_reject_impossible_dates_and_reversed_ranges(
     model: type[BaseModel],
 ) -> None:
@@ -80,7 +95,16 @@ def test_history_models_reject_impossible_dates_and_reversed_ranges(
         )
 
 
-@pytest.mark.parametrize("model", [HistoryDownloadRequest, HistoryQueryRequest])
+@pytest.mark.parametrize(
+    "model",
+    [
+        HistoryDownloadRequest,
+        HistoryQueryRequest,
+        FinancialRequest,
+        FinancialQueryRequest,
+        DividendFactorsRequest,
+    ],
+)
 def test_date_only_end_time_includes_the_whole_day(model: type[BaseModel]) -> None:
     request = model.model_validate(
         {
@@ -91,3 +115,14 @@ def test_date_only_end_time_includes_the_whole_day(model: type[BaseModel]) -> No
     )
 
     assert request.model_dump()["end_time"] == "20250201"
+
+
+def test_financial_request_deduplicates_tables() -> None:
+    request = FinancialRequest.model_validate(
+        {
+            "stocks": ["000001.SZ"],
+            "tables": ["Balance", "Income", "Balance"],
+        }
+    )
+
+    assert request.tables == ["Balance", "Income"]

@@ -20,8 +20,10 @@ class QuoteSequenceClient(Protocol):
     ) -> QuoteSequenceResponse: ...
 
 
-class QuoteWriter(Protocol):
-    def append(self, records: Sequence[SequencedQuote]) -> list[QuoteEvent]: ...
+class QuoteStore(Protocol):
+    def append_quotes(self, records: Sequence[SequencedQuote]) -> list[QuoteEvent]: ...
+
+    def compact_realtime(self) -> dict[str, int]: ...
 
 
 class QuoteQueue(Protocol):
@@ -44,7 +46,7 @@ class QmtReceiver:
     def __init__(
         self,
         client: QuoteSequenceClient,
-        writer: QuoteWriter,
+        store: QuoteStore,
         *,
         start_seq: int = 1,
         batch_size: int = 1_000,
@@ -57,7 +59,8 @@ class QmtReceiver:
         if not 0 <= timeout_ms <= 30_000:
             raise ValueError("timeout_ms 必须在 0 到 30000 之间")
         self._client = client
-        self._writer = writer
+        self._store = store
+        self._store.compact_realtime()
         self._next_seq = start_seq
         self._batch_size = batch_size
         self._timeout_ms = timeout_ms
@@ -85,7 +88,7 @@ class QmtReceiver:
 
         records = payload.data
         next_seq = payload.next_seq
-        events = self._writer.append(records)
+        events = self._store.append_quotes(records)
         for event in events:
             queue.put(event)
         self._next_seq = next_seq

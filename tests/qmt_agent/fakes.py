@@ -13,6 +13,8 @@ from qmt_agent.gateway import (
 )
 from qmt_protocol import (
     DividendType,
+    FinancialReportType,
+    FinancialTable,
     HistoryFrame,
     QuotePayload,
     TickQuote,
@@ -37,6 +39,7 @@ class FakeGateway:
         self.unsubscribed: list[int] = []
         self.fail_next_subscribe = False
         self.history_download: dict[str, Any] | None = None
+        self.financial_download: dict[str, Any] | None = None
         self._lock = RLock()
 
     def subscribe_market_quote(self, market: str, callback: MarketQuoteCallback) -> int:
@@ -106,6 +109,56 @@ class FakeGateway:
                 index=[20250101],
                 columns=columns,
                 data=[[10.0 for _ in columns]],
+            )
+            for stock in stocks
+        }
+
+    def download_financial(
+        self,
+        stocks: Sequence[str],
+        tables: Sequence[FinancialTable],
+        start_time: str,
+        end_time: str,
+    ) -> None:
+        self.financial_download = {
+            "stocks": list(stocks),
+            "tables": list(tables),
+            "start_time": start_time,
+            "end_time": end_time,
+        }
+
+    def get_financial(
+        self,
+        stocks: Sequence[str],
+        tables: Sequence[FinancialTable],
+        start_time: str,
+        end_time: str,
+        report_type: FinancialReportType,
+    ) -> dict[str, dict[str, HistoryFrame]]:
+        selected = list(tables) or ["Balance"]
+        return {
+            stock: {
+                table: HistoryFrame(
+                    index=[20241231],
+                    columns=["m_anntime", "m_timetag", "tot_assets"],
+                    data=[[20250331, 20241231, 100.0]],
+                )
+                for table in selected
+            }
+            for stock in stocks
+        }
+
+    def get_dividend_factors(
+        self,
+        stocks: Sequence[str],
+        start_time: str,
+        end_time: str,
+    ) -> dict[str, HistoryFrame]:
+        return {
+            stock: HistoryFrame(
+                index=[20240601],
+                columns=["interest", "dr"],
+                data=[[0.1, 0.99]],
             )
             for stock in stocks
         }

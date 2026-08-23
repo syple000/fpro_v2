@@ -1,7 +1,10 @@
-"""可由 platform 直接调用的 QMT 行情接收组件。"""
+"""QMT 实时接收、下载同步与本地存储。"""
 
 from qmt_protocol import (
     BarQuote,
+    DividendFactorsResponse,
+    FinancialDownloadResponse,
+    FinancialQueryResponse,
     HealthResponse,
     HistoryDownloadResponse,
     HistoryFrame,
@@ -22,15 +25,37 @@ from qmt_receiver.receiver import QmtReceiver, ReceiveResult
 from qmt_receiver.storage import (
     BAR_SCHEMA,
     BAR_TABLE,
+    DAILY_SCHEMA,
+    DAILY_TABLE,
+    DIVIDEND_FACTOR_SCHEMA,
+    DIVIDEND_FACTOR_TABLE,
+    FINANCIAL_SCHEMA,
+    FINANCIAL_TABLE,
     TICK_SCHEMA,
     TICK_TABLE,
-    QuoteParquetWriter,
+    QmtDataStore,
+)
+from qmt_receiver.sync import (
+    SyncResult,
+    sync_all,
+    sync_daily,
+    sync_dividend_factors,
+    sync_financial,
 )
 
 __all__ = [
     "BarQuote",
     "BAR_SCHEMA",
     "BAR_TABLE",
+    "DAILY_SCHEMA",
+    "DAILY_TABLE",
+    "DividendFactorsResponse",
+    "DIVIDEND_FACTOR_SCHEMA",
+    "DIVIDEND_FACTOR_TABLE",
+    "FinancialDownloadResponse",
+    "FinancialQueryResponse",
+    "FINANCIAL_SCHEMA",
+    "FINANCIAL_TABLE",
     "HealthResponse",
     "HistoryDownloadResponse",
     "HistoryFrame",
@@ -39,12 +64,13 @@ __all__ = [
     "MarketSubscriptionResponse",
     "QmtAgentClient",
     "QmtAgentError",
+    "QmtDataStore",
     "QmtReceiver",
     "QuoteEvent",
-    "QuoteParquetWriter",
     "QuoteSequenceResponse",
     "QuoteSequenceStatus",
     "ReceiveResult",
+    "SyncResult",
     "SequencedQuote",
     "SnapshotResponse",
     "StockSubscriptionResponse",
@@ -52,4 +78,8 @@ __all__ = [
     "TickQuote",
     "TICK_SCHEMA",
     "TICK_TABLE",
+    "sync_all",
+    "sync_daily",
+    "sync_dividend_factors",
+    "sync_financial",
 ]

@@ -8,6 +8,7 @@
 - 按合约列表获取最新快照；
 - 获取订阅收到的最新行情，或按全局递增序号顺序消费行情；
 - 按合约列表增量或全量下载历史数据，并查询本地历史数据。
+- 下载和查询财务数据，查询除权因子。
 
 服务只运行单进程。订阅状态、最新行情和顺序行情循环缓存保存在内存中，重启后需要
 重新订阅，行情序号也会从 1 重新开始。
@@ -319,6 +320,13 @@ Content-Type: application/json
 
 K 线中的 pandas DataFrame 会返回为 `{"index": [...], "columns": [...], "data": [...]}`，numpy 数值和数组会转换为普通 JSON；`NaN`、正负无穷会转换为 `null`。
 
+### 财务和除权数据
+
+财务数据使用 `/v1/financial/download` 下载，再通过 `/v1/financial/query` 查询。支持
+`Balance`、`Income`、`CashFlow`、`Capital`、`Holdernum`、`Top10holder`、
+`Top10flowholder` 和 `Pershareindex`。除权数据通过 `/v1/dividend-factors/query` 查询。
+三类查询中的 DataFrame 都使用与历史行情相同的 `HistoryFrame` split 编码。
+
 ### 查看订阅状态
 
 ```http
@@ -340,6 +348,9 @@ GET /v1/subscriptions
 | 市场/股票快照 | `get_full_tick` | 分别传市场代码或合约代码列表 |
 | 历史下载 | `download_history_data2` | 使用官方批量同步下载接口 |
 | 历史查询 | `get_local_data` | 下载完成后从本地文件快速批量读取，不产生隐式订阅 |
+| 财务下载 | `download_financial_data2` | 使用官方批量同步下载接口 |
+| 财务查询 | `get_financial_data` | 支持按报告期或公告期筛选 |
+| 除权查询 | `get_divid_factors` | 逐只股票读取除权事件和复权系数 |
 
 ## 本地开发
 

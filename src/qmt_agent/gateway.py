@@ -13,7 +13,11 @@ from pydantic import JsonValue, ValidationError
 from qmt_agent.serialization import to_jsonable
 from qmt_protocol import (
     BarQuote,
+    DividendFactorsResponse,
     DividendType,
+    FinancialQueryResponse,
+    FinancialReportType,
+    FinancialTable,
     HistoryFrame,
     HistoryQueryResponse,
     QuotePayload,
@@ -74,6 +78,30 @@ class MarketDataGateway(Protocol):
         fill_data: bool,
     ) -> dict[str, HistoryFrame]: ...
 
+    def download_financial(
+        self,
+        stocks: Sequence[str],
+        tables: Sequence[FinancialTable],
+        start_time: str,
+        end_time: str,
+    ) -> None: ...
+
+    def get_financial(
+        self,
+        stocks: Sequence[str],
+        tables: Sequence[FinancialTable],
+        start_time: str,
+        end_time: str,
+        report_type: FinancialReportType,
+    ) -> dict[str, dict[str, HistoryFrame]]: ...
+
+    def get_dividend_factors(
+        self,
+        stocks: Sequence[str],
+        start_time: str,
+        end_time: str,
+    ) -> dict[str, HistoryFrame]: ...
+
 
 class _XtDataModule(Protocol):
     """本机 xtquant 没有类型声明；所有返回先按 object 接收再校验。"""
@@ -113,6 +141,31 @@ class _XtDataModule(Protocol):
         count: int,
         dividend_type: str,
         fill_data: bool,
+    ) -> object: ...
+
+    def download_financial_data2(
+        self,
+        stock_list: list[str],
+        table_list: list[str],
+        start_time: str,
+        end_time: str,
+        callback: Callable[[object], None] | None,
+    ) -> None: ...
+
+    def get_financial_data(
+        self,
+        stock_list: list[str],
+        table_list: list[str],
+        start_time: str,
+        end_time: str,
+        report_type: str,
+    ) -> object: ...
+
+    def get_divid_factors(
+        self,
+        stock_code: str,
+        start_time: str,
+        end_time: str,
     ) -> object: ...
 
 
@@ -269,6 +322,80 @@ class XtDataGateway:
             raise
         except Exception as exc:
             raise QmtGatewayError(f"读取历史行情失败：{exc}") from exc
+
+    def download_financial(
+        self,
+        stocks: Sequence[str],
+        tables: Sequence[FinancialTable],
+        start_time: str,
+        end_time: str,
+    ) -> None:
+        try:
+            with self._call_lock:
+                self._xtdata.download_financial_data2(
+                    stock_list=list(stocks),
+                    table_list=list(tables),
+                    start_time=start_time,
+                    end_time=end_time,
+                    callback=None,
+                )
+        except Exception as exc:
+            raise QmtGatewayError(f"下载财务数据失败：{exc}") from exc
+
+    def get_financial(
+        self,
+        stocks: Sequence[str],
+        tables: Sequence[FinancialTable],
+        start_time: str,
+        end_time: str,
+        report_type: FinancialReportType,
+    ) -> dict[str, dict[str, HistoryFrame]]:
+        raw: object = None
+        try:
+            with self._call_lock:
+                raw = self._xtdata.get_financial_data(
+                    stock_list=list(stocks),
+                    table_list=list(tables),
+                    start_time=start_time,
+                    end_time=end_time,
+                    report_type=report_type,
+                )
+            json_data = to_jsonable({} if raw is None else raw)
+            return FinancialQueryResponse.model_validate({"data": json_data}).data
+        except ValidationError as exc:
+            logger.debug("被拒绝的 XtData 财务数据原始返回：%r", raw)
+            raise QmtGatewayError(f"财务数据返回结构不合法：{exc}") from exc
+        except QmtGatewayError:
+            raise
+        except Exception as exc:
+            raise QmtGatewayError(f"读取财务数据失败：{exc}") from exc
+
+    def get_dividend_factors(
+        self,
+        stocks: Sequence[str],
+        start_time: str,
+        end_time: str,
+    ) -> dict[str, HistoryFrame]:
+        raw: dict[str, object] = {}
+        try:
+            with self._call_lock:
+                for stock in stocks:
+                    frame = self._xtdata.get_divid_factors(
+                        stock_code=stock,
+                        start_time=start_time,
+                        end_time=end_time,
+                    )
+                    if frame is not None:
+                        raw[stock] = frame
+            json_data = to_jsonable(raw)
+            return DividendFactorsResponse.model_validate({"data": json_data}).data
+        except ValidationError as exc:
+            logger.debug("被拒绝的 XtData 除权数据原始返回：%r", raw)
+            raise QmtGatewayError(f"除权数据返回结构不合法：{exc}") from exc
+        except QmtGatewayError:
+            raise
+        except Exception as exc:
+            raise QmtGatewayError(f"读取除权数据失败：{exc}") from exc
 
 
 def _normalise_history_time(frame: HistoryFrame, code: str) -> HistoryFrame:

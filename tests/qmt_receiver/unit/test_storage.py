@@ -7,8 +7,13 @@ from pathlib import Path
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from qmt_protocol import BarQuote, SequencedQuote, TickQuote
-from qmt_receiver.storage import BAR_SCHEMA, TICK_SCHEMA, QuoteParquetWriter
+from qmt_protocol import BarQuote, HistoryFrame, SequencedQuote, TickQuote
+from qmt_receiver.storage import (
+    BAR_SCHEMA,
+    DAILY_TABLE,
+    TICK_SCHEMA,
+    QmtDataStore,
+)
 
 
 def _read_only_table(table_root: Path) -> pa.Table:
@@ -27,7 +32,7 @@ def test_parquet_quote_columns_cover_protocol_models() -> None:
     assert bar_quote_type.names[:-1] == list(BarQuote.model_fields)
 
 
-def test_writer_separates_tick_and_bar_with_fixed_schemas(tmp_path: Path) -> None:
+def test_store_separates_tick_and_bar_with_fixed_schemas(tmp_path: Path) -> None:
     quote_time = int(
         datetime(
             2026,
@@ -41,9 +46,9 @@ def test_writer_separates_tick_and_bar_with_fixed_schemas(tmp_path: Path) -> Non
         * 1_000
     )
     received_at = 1_786_928_400_000_000
-    writer = QuoteParquetWriter(tmp_path)
+    store = QmtDataStore(tmp_path)
 
-    events = writer.append(
+    events = store.append_quotes(
         [
             SequencedQuote(
                 seq=8,
@@ -80,7 +85,7 @@ def test_writer_separates_tick_and_bar_with_fixed_schemas(tmp_path: Path) -> Non
             ),
         ]
     )
-    writer.close()
+    store.close()
 
     tick_table = _read_only_table(tmp_path / "ticks")
     bar_table = _read_only_table(tmp_path / "bars")
@@ -97,9 +102,7 @@ def test_writer_separates_tick_and_bar_with_fixed_schemas(tmp_path: Path) -> Non
     assert tick_row["event_at"] == quote_time * 1_000
     assert tick_row["quote"]["lastPrice"] == 10.5
     assert tick_row["quote"]["askPrice"] == [10.6, 10.7]
-    assert json.loads(tick_row["quote"]["extra_json"]) == {
-        "vendorFlag": "tick-extension"
-    }
+    assert json.loads(tick_row["quote"]["extra_json"]) == {"vendorFlag": "tick-extension"}
     assert "close" not in TICK_SCHEMA.field("quote").type.names
     assert "quote_json" not in tick_table.column_names
 
@@ -113,9 +116,7 @@ def test_writer_separates_tick_and_bar_with_fixed_schemas(tmp_path: Path) -> Non
     assert bar_row["quote"]["open"] == 10.1
     assert bar_row["quote"]["close"] == 10.5
     assert bar_row["quote"]["volume"] == 123
-    assert json.loads(bar_row["quote"]["extra_json"]) == {
-        "vendorFlag": "bar-extension"
-    }
+    assert json.loads(bar_row["quote"]["extra_json"]) == {"vendorFlag": "bar-extension"}
     assert "lastPrice" not in BAR_SCHEMA.field("quote").type.names
     assert "quote_json" not in bar_table.column_names
 
@@ -125,9 +126,9 @@ def test_writer_separates_tick_and_bar_with_fixed_schemas(tmp_path: Path) -> Non
     assert isinstance(events[1].quote, BarQuote)
 
 
-def test_writer_only_creates_manifest_for_received_quote_kind(tmp_path: Path) -> None:
-    writer = QuoteParquetWriter(tmp_path)
-    writer.append(
+def test_store_only_creates_manifest_for_received_quote_kind(tmp_path: Path) -> None:
+    store = QmtDataStore(tmp_path)
+    store.append_quotes(
         [
             SequencedQuote(
                 seq=1,
@@ -143,7 +144,65 @@ def test_writer_only_creates_manifest_for_received_quote_kind(tmp_path: Path) ->
 
     # append 只需进入 store 缓冲区，小批次不会立即生成 Parquet manifest。
     assert list((tmp_path / "ticks").rglob("_manifest.json")) == []
-    writer.close()
+    store.close()
 
     assert len(list((tmp_path / "ticks").rglob("_manifest.json"))) == 1
     assert list((tmp_path / "bars").rglob("_manifest.json")) == []
+
+
+def test_download_write_immediately_deduplicates_partition(tmp_path: Path) -> None:
+    first = HistoryFrame(index=[20240102], columns=["close"], data=[[10.0]])
+    latest = HistoryFrame(index=[20240102], columns=["close"], data=[[11.0]])
+
+    with QmtDataStore(tmp_path) as store:
+        store.write_daily({"000001.SZ": first}, "none")
+        store.write_daily({"000001.SZ": latest}, "none")
+
+    table = _read_only_table(tmp_path / DAILY_TABLE)
+    assert table.num_rows == 1
+    assert table.column("close").to_pylist() == [11.0]
+
+
+def test_store_compacts_and_deduplicates_realtime_files(tmp_path: Path) -> None:
+    record = SequencedQuote(
+        seq=1,
+        code="000001.SZ",
+        period="tick",
+        source="market",
+        subscription="SZ",
+        received_at=1_786_928_400_000_000,
+        quote=TickQuote(lastPrice=10.5),
+    )
+    for _ in range(2):
+        with QmtDataStore(tmp_path) as store:
+            store.append_quotes([record])
+
+    manifest_path = next((tmp_path / "ticks").rglob("_manifest.json"))
+    fragmented = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert len(fragmented["files"]) == 2
+
+    with QmtDataStore(tmp_path) as store:
+        store.compact_realtime()
+
+    compacted = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert len(compacted["files"]) == 1
+    assert _read_only_table(tmp_path / "ticks").num_rows == 1
+
+
+def test_store_can_explicitly_compact_realtime_files(tmp_path: Path) -> None:
+    record = SequencedQuote(
+        seq=1,
+        code="000001.SZ",
+        period="tick",
+        source="market",
+        subscription="SZ",
+        received_at=1_786_928_400_000_000,
+        quote=TickQuote(lastPrice=10.5),
+    )
+    with QmtDataStore(tmp_path) as store:
+        store.append_quotes([record])
+        assert store.compact_realtime() == {"ticks": 0, "bars": 0}
+        store.append_quotes([record])
+        assert store.compact_realtime() == {"ticks": 1, "bars": 0}
+
+    assert _read_only_table(tmp_path / "ticks").num_rows == 1

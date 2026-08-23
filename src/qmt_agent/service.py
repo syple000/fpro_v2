@@ -18,7 +18,12 @@ from qmt_agent.gateway import (
 from qmt_agent.quote_sequence import QuoteSequenceBuffer
 from qmt_agent.subscription_callback import QuoteCallbackGate
 from qmt_protocol import (
+    DividendFactorsResponse,
     DividendType,
+    FinancialDownloadResponse,
+    FinancialQueryResponse,
+    FinancialReportType,
+    FinancialTable,
     HistoryDownloadResponse,
     HistoryFrame,
     LatestQuotesResponse,
@@ -384,6 +389,38 @@ class QmtMarketService:
             dividend_type,
             fill_data,
         )
+
+    def download_financial(
+        self,
+        stocks: list[str],
+        tables: list[FinancialTable],
+        start_time: str,
+        end_time: str,
+    ) -> FinancialDownloadResponse:
+        self._gateway.download_financial(stocks, tables, start_time, end_time)
+        return FinancialDownloadResponse(stocks=stocks, tables=tables, completed=True)
+
+    def get_financial(
+        self,
+        stocks: list[str],
+        tables: list[FinancialTable],
+        start_time: str,
+        end_time: str,
+        report_type: FinancialReportType,
+    ) -> FinancialQueryResponse:
+        data = self._gateway.get_financial(
+            stocks, tables, start_time, end_time, report_type
+        )
+        return FinancialQueryResponse(data=data)
+
+    def get_dividend_factors(
+        self,
+        stocks: list[str],
+        start_time: str,
+        end_time: str,
+    ) -> DividendFactorsResponse:
+        data = self._gateway.get_dividend_factors(stocks, start_time, end_time)
+        return DividendFactorsResponse(data=data)
 
     def close(self) -> None:
         """进程退出时尽力释放订阅；失败也不阻碍退出。"""

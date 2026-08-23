@@ -65,6 +65,8 @@ def test_openapi_exposes_explicit_response_and_quote_schemas() -> None:
         "QuoteSequenceResponse",
         "SubscriptionStatus",
         "HistoryQueryResponse",
+        "FinancialQueryResponse",
+        "DividendFactorsResponse",
     } <= components.keys()
     response_schema = schema["paths"]["/v1/quotes/subscribed/sequence"]["post"]["responses"]["200"][
         "content"
@@ -163,6 +165,41 @@ def test_history_download_mode_is_forwarded() -> None:
     assert response.status_code == 200
     assert gateway.history_download is not None
     assert gateway.history_download["incrementally"] is False
+
+
+def test_financial_and_dividend_factor_endpoints() -> None:
+    gateway = FakeGateway()
+    with TestClient(create_app(gateway=gateway, settings=Settings())) as client:
+        downloaded = client.post(
+            "/v1/financial/download",
+            json={
+                "stocks": ["000001.SZ"],
+                "tables": ["Balance", "Income"],
+                "start_time": "20240101",
+                "end_time": "20251231",
+            },
+        )
+        financial = client.post(
+            "/v1/financial/query",
+            json={
+                "stocks": ["000001.SZ"],
+                "tables": ["Balance"],
+                "report_type": "announce_time",
+            },
+        )
+        dividends = client.post(
+            "/v1/dividend-factors/query",
+            json={"stocks": ["000001.SZ"], "start_time": "20240101"},
+        )
+
+    assert downloaded.status_code == 200
+    assert downloaded.json()["completed"] is True
+    assert gateway.financial_download is not None
+    assert gateway.financial_download["tables"] == ["Balance", "Income"]
+    assert financial.json()["data"]["000001.SZ"]["Balance"]["data"] == [
+        [20250331, 20241231, 100.0]
+    ]
+    assert dividends.json()["data"]["000001.SZ"]["data"] == [[0.1, 0.99]]
 
 
 def test_market_endpoints_have_useful_defaults() -> None:
