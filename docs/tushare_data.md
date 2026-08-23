@@ -78,7 +78,7 @@ uv run --group tushare-data tushare-data-test \
 
 `create_pro_client` 为 Tushare SDK 安装独立的直连 HTTP 传输；它不读取
 `HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY` 或 Windows 系统代理，也不会清除进程环境，
-因此不影响同一进程中的其他网络客户端。
+因此不影响同一进程中的其他网络客户端。单次请求读取超时为 120 秒。
 
 ## 迁移
 

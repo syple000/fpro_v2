@@ -137,7 +137,7 @@ def test_create_pro_client_uses_direct_http_session(monkeypatch) -> None:
         def post(self, url: str, **kwargs: object) -> FakeResponse:
             assert self.trust_env is False
             assert url == "http://api.example.test/daily"
-            assert kwargs["timeout"] == 30
+            assert kwargs["timeout"] == 120
             return FakeResponse()
 
     original_requests = tushare_client_module.requests

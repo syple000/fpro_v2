@@ -28,6 +28,7 @@ from tushare_data.storage import TushareDataStore
 logger = logging.getLogger(__name__)
 
 DEFAULT_API_URL = "http://api.quicksync.cn"
+_REQUEST_TIMEOUT_SECONDS = 120
 MARKET_EXCHANGES = ("SSE", "SZSE", "BSE")
 PAGE_SIZE = 5_000
 INDEX_MEMBER_PAGE_SIZE = 2_000
@@ -84,7 +85,7 @@ def create_pro_client(
     # DataApi.query 固定调用其模块级 requests.post；替换成相同窄接口，避免
     # HTTP_PROXY/HTTPS_PROXY/ALL_PROXY 以及 Windows 系统代理影响 Tushare。
     client.requests = _DirectRequests()  # pyright: ignore[reportAttributeAccessIssue]
-    raw_pro: object = ts.pro_api(token)
+    raw_pro: object = ts.pro_api(token, timeout=_REQUEST_TIMEOUT_SECONDS)
     limiter = RequestLimiter(requests_per_minute, max_concurrency)
     return TushareProClient(
         require_tushare_data_api(raw_pro),
