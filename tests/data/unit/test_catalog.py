@@ -17,7 +17,7 @@ def _table(dataset: str, *rows: dict[str, object]) -> pa.Table:
 
 def _cashflow(
     *,
-    f_ann_date: date,
+    f_ann_date: date | None,
     update_flag: str,
     free_cashflow: float,
 ) -> dict[str, object]:
@@ -69,7 +69,30 @@ def test_tushare_statement_as_of_selects_source_declared_revision(tmp_path: Path
     assert after == [(date(2025, 4, 29), 2.0)]
 
 
-def test_dividend_as_of_keeps_lifecycle_rows_until_their_announcement(
+def test_tushare_statement_as_of_does_not_fall_back_to_ann_date(tmp_path: Path) -> None:
+    tushare_root = tmp_path / "tushare"
+    with TushareDataStore(tushare_root) as store:
+        store.write(
+            "cashflow",
+            _table(
+                "cashflow",
+                _cashflow(
+                    f_ann_date=None,
+                    update_flag="1",
+                    free_cashflow=1.0,
+                ),
+            ),
+        )
+
+    with DataCatalog(tushare_root=tushare_root, qmt_root=tmp_path / "qmt") as catalog:
+        rows = catalog.connection.execute(
+            "SELECT * FROM tushare.cashflow_as_of(DATE '2025-12-31')"
+        ).fetchall()
+
+    assert rows == []
+
+
+def test_dividend_as_of_requires_implementation_announcement(
     tmp_path: Path,
 ) -> None:
     tushare_root = tmp_path / "tushare"
@@ -83,7 +106,12 @@ def test_dividend_as_of_keeps_lifecycle_rows_until_their_announcement(
             "dividend",
             _table(
                 "dividend",
-                {**common, "div_proc": "预案"},
+                {
+                    **common,
+                    "div_proc": "预案",
+                    "record_date": date(2024, 5, 8),
+                    "ex_date": date(2024, 5, 9),
+                },
                 {
                     **common,
                     "div_proc": "实施",
@@ -102,8 +130,8 @@ def test_dividend_as_of_keeps_lifecycle_rows_until_their_announcement(
             "SELECT div_proc FROM tushare.dividend_as_of(DATE '2024-04-30') ORDER BY div_proc"
         ).fetchall()
 
-    assert before == [("预案",)]
-    assert after == [("实施",), ("预案",)]
+    assert before == []
+    assert after == [("实施",)]
 
 
 def test_sw_industry_as_of_returns_active_membership_without_future_state(

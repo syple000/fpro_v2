@@ -397,7 +397,7 @@ def compare_financial(
                 f"WHERE {_stock_filter('ts_code', stocks)} AND end_date BETWEEN ? AND ? "
                 "AND report_type = '1' "
                 "QUALIFY row_number() OVER (PARTITION BY ts_code, end_date "
-                "ORDER BY coalesce(f_ann_date, ann_date) DESC NULLS LAST, "
+                "ORDER BY f_ann_date DESC NULLS LAST, "
                 "try_cast(update_flag AS INTEGER) DESC NULLS LAST) = 1"
             )
         tushare_rows = _fetch(connection, query, [*stocks, start_date, end_date])

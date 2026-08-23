@@ -57,7 +57,11 @@ checkpoint，重跑 `sync_all` 只补未完成区间。
 
 三张财务报表将 `ann_date/f_ann_date` 放入存储主键，是为了保留源数据声明的
 每个公告版本。DuckDB `as_of` 查询则使用不包公告日的业务键选择截止当日
-最新版本，两者不能混用。
+`f_ann_date` 最新版本；`f_ann_date` 缺失时不会回退到 `ann_date`，两者不能混用。
+
+分红原始表保留预案、决案和实施等生命周期记录。DuckDB `dividend_as_of` 只按
+`imp_ann_date` 暴露已经发布实施公告的记录，不使用 `ann_date` 替补，以免预案行中
+后来反填的登记日、除权日或派息日形成未来函数。
 
 `TushareDataStore.write()` 会追加数据、刷新文件，再整理本次触及的每个分区。
 空输入不会创建或清空分区。

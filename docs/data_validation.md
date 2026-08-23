@@ -15,7 +15,7 @@ QMT 与 Tushare 的股票日线成交量都以手为单位；QMT 用整数手、
 
 财务字段按报告期对齐；QMT `m_anntime` 只表示一个披露日，没有 Tushare
 `ann_date/f_ann_date` 两套日期，因此不用于伪造“实际公告日”。同一报告期使用 QMT 最新
-披露快照，对比 Tushare `coalesce(f_ann_date, ann_date)` 对应的最新版本。新旧会计报表中
+披露快照，对比 Tushare `f_ann_date` 对应的最新版本。新旧会计报表中
 固定资产、在建工程、其他应收和其他应付字段会使用明确的等价候选字段；`NULL` 与数值零
 视为相同，EPS 允许 QMT 两位小数带来的半个最小单位误差。供应商语义不同或 Tushare 代理
 没有对应字段的项目不进入自动比较。

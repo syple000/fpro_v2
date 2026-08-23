@@ -28,9 +28,11 @@ with DataCatalog(
 `<table>_as_of(...)` 表宏：
 
 - Tushare 宏接受 `DATE`，按日末 EOD 语义解释。盘前研究应传上一个交易日。
-- 三张财务报表按 `coalesce(f_ann_date, ann_date)` 选择当时最新版本。
+- 三张财务报表只按实际公告日 `f_ann_date` 选择当时最新版本；不回退到
+  `ann_date`。
 - 预告、快报、财务指标和审计意见按 `ann_date` 选择当时最新版本。
-- 分红按 `coalesce(imp_ann_date, ann_date)` 返回已可见的各阶段记录，不强行合并为一条。
+- 分红只按实施公告日 `imp_ann_date` 返回已经实施公告的记录；没有实施公告日的
+  预案和决案记录不会由该宏提前暴露。
 - 申万行业返回当日有效成员，并屏蔽未来 `out_date` 与当前快照 `is_new`。
 - QMT 宏接受 UTC Unix Epoch 微秒整数，使用 `received_at <= as_of_us`。
 

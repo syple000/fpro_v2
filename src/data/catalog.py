@@ -130,10 +130,10 @@ class DataCatalog:
                 f"{table}_as_of",
                 "as_of_date",
                 f'SELECT * FROM "tushare".{_quote_identifier(table)} '
-                "WHERE coalesce(f_ann_date, ann_date) <= CAST(as_of_date AS DATE) "
+                "WHERE f_ann_date <= CAST(as_of_date AS DATE) "
                 "QUALIFY row_number() OVER ("
                 "PARTITION BY ts_code, end_date, report_type, comp_type "
-                "ORDER BY coalesce(f_ann_date, ann_date) DESC NULLS LAST, "
+                "ORDER BY f_ann_date DESC NULLS LAST, "
                 "try_cast(update_flag AS INTEGER) DESC NULLS LAST"
                 ") = 1",
             )
@@ -161,7 +161,7 @@ class DataCatalog:
             "dividend_as_of",
             "as_of_date",
             'SELECT * FROM "tushare"."dividend" '
-            "WHERE coalesce(imp_ann_date, ann_date) <= CAST(as_of_date AS DATE)",
+            "WHERE imp_ann_date <= CAST(as_of_date AS DATE)",
         )
         self._create_macro(
             "tushare",

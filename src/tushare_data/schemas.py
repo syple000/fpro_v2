@@ -177,7 +177,7 @@ MONEYFLOW_FIELDS = (
     "net_mf_amount",
 )
 
-# PIT 日期：实施记录优先使用 imp_ann_date，其余使用 ann_date。
+# PIT 日期：只使用 imp_ann_date；ann_date 不作为实施公告日期的替补。
 DIVIDEND_FIELDS = (
     # TS代码
     "ts_code",
@@ -343,7 +343,7 @@ TRADE_CAL_FIELDS = (
     "pretrade_date",
 )
 
-# PIT 日期：优先使用 f_ann_date，缺失时使用 ann_date。
+# PIT 日期：只使用 f_ann_date；ann_date 不作为实际公告日期的替补。
 # 官方新增的 9 个利润表字段目前会被 quicksync 省略，待代理实际返回后再扩展固定 Schema。
 INCOME_FIELDS = (
     # TS代码
@@ -518,7 +518,7 @@ INCOME_FIELDS = (
     "update_flag",
 )
 
-# PIT 日期：优先使用 f_ann_date，缺失时使用 ann_date。
+# PIT 日期：只使用 f_ann_date；ann_date 不作为实际公告日期的替补。
 # 官方新增的 6 个资产负债表字段目前会被 quicksync 省略，待代理实际返回后再扩展固定 Schema。
 BALANCESHEET_FIELDS = (
     # TS股票代码
@@ -827,7 +827,7 @@ BALANCESHEET_FIELDS = (
     "update_flag",
 )
 
-# PIT 日期：优先使用 f_ann_date，缺失时使用 ann_date。
+# PIT 日期：只使用 f_ann_date；ann_date 不作为实际公告日期的替补。
 CASHFLOW_FIELDS = (
     # TS股票代码
     "ts_code",
