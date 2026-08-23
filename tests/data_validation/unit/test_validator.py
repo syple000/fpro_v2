@@ -12,7 +12,7 @@ from data_validation import (
     compare_financial,
     sample_stocks,
 )
-from qmt_protocol import DividendFactor, FinancialFrame, HistoryFrame
+from qmt_protocol import DividendFactor, FinancialData, HistoryBar, IncomeRecord
 from qmt_receiver import QmtDataStore
 from tushare_data import TABLE_SCHEMAS, TushareDataStore
 
@@ -99,30 +99,41 @@ def test_sampled_qmt_data_matches_tushare(tmp_path: Path) -> None:
             ),
         )
 
-    daily = HistoryFrame(
-        index=[20240102],
-        columns=["open", "high", "low", "close", "volume", "amount"],
-        data=[[10.0, 11.0, 9.0, 10.5, 1000, 100000.0]],
-    )
+    daily = [
+        HistoryBar(
+            index=20240102,
+            open=10.0,
+            high=11.0,
+            low=9.0,
+            close=10.5,
+            volume=1000,
+            amount=100000.0,
+        )
+    ]
     with QmtDataStore(qmt_root) as store:
         store.write_daily({"000001.SZ": daily}, "none")
         store.write_daily({"000001.SZ": daily}, "front")
         store.write_financial(
             {
-                "000001.SZ": {
-                    "Income": FinancialFrame(
-                        index=[20231231],
-                        columns=["m_anntime", "m_timetag", "revenue_inc", "revenue"],
-                        data=[[20240430, 20231231, 100.0, 120.0]],
-                    )
-                }
+                "000001.SZ": FinancialData(
+                    Income=[
+                        IncomeRecord(
+                            index=0,
+                            m_anntime="20240430",
+                            m_timetag="20231231",
+                            revenue_inc=100.0,
+                            revenue=120.0,
+                        )
+                    ]
+                )
             }
         )
         store.write_dividend_factors(
             {
                 "000001.SZ": [
                     DividendFactor(
-                        event_time=1_717_200_000_000,
+                        date="20240601",
+                        time=1_717_200_000_000.0,
                         interest=0.1,
                         stockBonus=0.2,
                         stockGift=0.3,

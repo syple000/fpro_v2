@@ -88,7 +88,7 @@ def test_quote_callbacks_and_reads_remain_consistent_under_pressure() -> None:
             for stock in writer_stocks:
                 gateway.push(
                     subscription_ids[stock],
-                    {stock: {"writer": writer_id, "sequence": sequence}},
+                    {stock: {"lastPrice": writer_id * 1_000 + sequence}},
                 )
 
     def read_quotes() -> None:
@@ -97,10 +97,8 @@ def test_quote_callbacks_and_reads_remain_consistent_under_pressure() -> None:
         for _ in range(1_000):
             result = service.get_stock_quotes()
             assert set(result.data) <= expected
-            assert set(result.missing) <= expected
-            assert not result.not_subscribed
             for quote in result.data.values():
-                assert 0 <= quote.model_dump()["sequence"] < 500
+                assert 0 <= quote.model_dump()["lastPrice"] < 8_000
 
     with ThreadPoolExecutor(max_workers=16) as executor:
         futures = [
@@ -115,8 +113,9 @@ def test_quote_callbacks_and_reads_remain_consistent_under_pressure() -> None:
     sequence_status = service.quote_sequence_status()
     final_sequence_window = service.get_subscribed_quote_sequence(19_001, 1_000)
     assert set(final_quotes.data) == set(stocks)
-    assert final_quotes.missing == []
-    assert all(quote.model_dump()["sequence"] == 499 for quote in final_quotes.data.values())
+    assert all(
+        quote.model_dump()["lastPrice"] % 1_000 == 499 for quote in final_quotes.data.values()
+    )
     assert sequence_status.model_dump() == {
         "oldest_seq": 10_001,
         "latest_seq": 20_000,

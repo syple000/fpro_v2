@@ -55,8 +55,6 @@ def response_payload(request: httpx2.Request) -> dict[str, object]:
             "data": {},
             "updated_at": {},
             "periods": {},
-            "missing": [],
-            "not_subscribed": [],
         }
     if path == "/v1/quotes/subscribed/sequence":
         return {
@@ -68,26 +66,13 @@ def response_payload(request: httpx2.Request) -> dict[str, object]:
             "latest_seq": 1,
         }
     if path == "/v1/history/download":
-        return {
-            "stocks": ["000001.SZ"],
-            "period": "1d",
-            "start_time": "",
-            "end_time": "",
-            "mode": "incremental",
-            "completed": True,
-        }
+        return {"completed": True}
     if path == "/v1/history/query":
         return {"period": "1d", "data": {}}
     if path == "/v1/financial/download":
-        return {
-            "stocks": ["000001.SZ"],
-            "tables": ["Balance"],
-            "start_time": "",
-            "end_time": "",
-            "completed": True,
-        }
+        return {"completed": True}
     if path == "/v1/financial/query":
-        return {"report_type": "report_time", "data": {}}
+        return {"data": {}}
     if path == "/v1/dividend-factors/query":
         return {"data": {}}
     raise AssertionError(f"未处理的测试路径：{request.method} {path}")
@@ -128,8 +113,8 @@ def test_client_exposes_all_qmt_agent_business_interfaces() -> None:
     client.unsubscribe_stocks(("000001.SZ",), "tick")
     client.market_snapshot()
     client.stock_snapshot(("000001.SZ",))
-    client.market_quotes(("000001.SZ",))
-    client.stock_quotes(("000001.SZ",))
+    client.market_quotes()
+    client.stock_quotes()
     client.quote_sequence(1, wait_ms=500)
     client.download_history(("000001.SZ",))
     client.query_history(("000001.SZ",))
@@ -147,8 +132,8 @@ def test_client_exposes_all_qmt_agent_business_interfaces() -> None:
         ("DELETE", "/v1/subscriptions/stocks"),
         ("POST", "/v1/snapshots/markets"),
         ("POST", "/v1/snapshots/stocks"),
-        ("POST", "/v1/quotes/subscribed/markets"),
-        ("POST", "/v1/quotes/subscribed/stocks"),
+        ("GET", "/v1/quotes/subscribed/markets"),
+        ("GET", "/v1/quotes/subscribed/stocks"),
         ("POST", "/v1/quotes/subscribed/sequence"),
         ("POST", "/v1/history/download"),
         ("POST", "/v1/history/query"),

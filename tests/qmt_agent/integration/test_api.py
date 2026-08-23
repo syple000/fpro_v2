@@ -65,7 +65,8 @@ def test_openapi_exposes_explicit_response_and_quote_schemas() -> None:
         "QuoteSequenceResponse",
         "SubscriptionStatus",
         "HistoryQueryResponse",
-        "FinancialFrame",
+        "BalanceRecord",
+        "FinancialData",
         "FinancialQueryResponse",
         "DividendFactor",
         "DividendFactorsResponse",
@@ -165,9 +166,7 @@ def test_history_download_mode_is_forwarded() -> None:
         )
 
     assert response.status_code == 200
-    assert response.json()["start_time"] == "20250101"
-    assert response.json()["end_time"] == ""
-    assert response.json()["mode"] == "full"
+    assert response.json() == {"completed": True}
     assert gateway.history_download is not None
     assert gateway.history_download["incrementally"] is False
 
@@ -199,23 +198,22 @@ def test_financial_and_dividend_factor_endpoints() -> None:
 
     assert downloaded.status_code == 200
     assert downloaded.json()["completed"] is True
-    assert downloaded.json()["start_time"] == "20240101"
-    assert downloaded.json()["end_time"] == "20251231"
     assert gateway.financial_download is not None
     assert gateway.financial_download["tables"] == ["Balance", "Income"]
-    assert financial.json()["data"]["000001.SZ"]["Balance"]["data"] == [[20250331, 20241231, 100.0]]
-    assert financial.json()["report_type"] == "announce_time"
+    assert financial.json()["data"]["000001.SZ"]["Balance"] == [
+        {
+            "index": 0,
+            "m_timetag": "20241231",
+            "m_anntime": "20250331",
+            "tot_assets": 100.0,
+        }
+    ]
     assert dividends.json()["data"]["000001.SZ"] == [
         {
-            "event_time": 1_717_200_000_000_000,
+            "date": "20240601",
+            "time": 1_717_200_000_000.0,
             "interest": 0.1,
-            "stockBonus": None,
-            "stockGift": None,
-            "allotNum": None,
-            "allotPrice": None,
-            "gugai": None,
             "dr": 0.99,
-            "extra": {},
         }
     ]
 
@@ -333,11 +331,11 @@ def test_market_and_stock_quote_endpoints_return_separate_caches() -> None:
         subscription_ids = gateway.active_subscription_ids()
         gateway.push(
             subscription_ids["SH"],
-            {"600000.SH": {"lastPrice": 10.2, "kind": "tick"}},
+            {"600000.SH": {"lastPrice": 10.2}},
         )
         gateway.push(
             subscription_ids["600000.SH"],
-            {"600000.SH": [{"close": 10.1, "kind": "1m"}]},
+            {"600000.SH": [{"close": 10.1}]},
         )
 
         market_quotes = client.post("/v1/quotes/subscribed/markets")
@@ -349,10 +347,8 @@ def test_market_and_stock_quote_endpoints_return_separate_caches() -> None:
 
     assert market_quotes.status_code == 200
     assert market_quotes.json()["data"]["600000.SH"]["lastPrice"] == 10.2
-    assert market_quotes.json()["data"]["600000.SH"]["kind"] == "tick"
     assert market_quotes.json()["periods"] == {"600000.SH": "tick"}
     assert stock_quotes.status_code == 200
     assert stock_quotes.json()["data"]["600000.SH"]["close"] == 10.1
-    assert stock_quotes.json()["data"]["600000.SH"]["kind"] == "1m"
     assert stock_quotes.json()["periods"] == {"600000.SH": "1m"}
-    assert market_filter.json()["not_subscribed"] == ["000001.SZ"]
+    assert market_filter.json()["data"] == market_quotes.json()["data"]

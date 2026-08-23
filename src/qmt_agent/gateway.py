@@ -1,4 +1,4 @@
-"""对 xtdata 的强类型边界，业务层不接触客户端原始对象。"""
+"""xtdata 的薄边界：串行调用、JSON 化并校验原始返回结构。"""
 
 from __future__ import annotations
 
@@ -6,28 +6,24 @@ import logging
 from collections.abc import Callable, Mapping, Sequence
 from numbers import Integral
 from threading import Lock
-from typing import Protocol, TypeAlias, cast
+from typing import Protocol, TypeAlias, TypeVar, cast
 
-from pydantic import JsonValue, ValidationError
+from pydantic import ValidationError
 
-from qmt_agent.serialization import to_jsonable
+from qmt_agent.serialization import dataframe_records
 from qmt_protocol import (
-    BarQuote,
-    DividendFactor,
     DividendFactorsResponse,
     DividendType,
-    FinancialFrame,
+    FinancialDownloadResponse,
     FinancialQueryResponse,
     FinancialReportType,
     FinancialTable,
-    HistoryFrame,
+    HistoryDownloadResponse,
     HistoryQueryResponse,
     QuotePayload,
-    TabularFrame,
     TickQuote,
     XtDataPeriod,
     quote_model_for_period,
-    unix_timestamp_to_utc_us,
 )
 
 logger = logging.getLogger(__name__)
@@ -36,25 +32,16 @@ MarketQuotePush: TypeAlias = dict[str, TickQuote]
 StockQuotePush: TypeAlias = dict[str, list[QuotePayload]]
 MarketQuoteCallback: TypeAlias = Callable[[MarketQuotePush], None]
 StockQuoteCallback: TypeAlias = Callable[[StockQuotePush], None]
-# 仅保留给自定义网关实现做联合标注；生产协议方法使用上面两个精确回调类型。
 QuoteCallback: TypeAlias = Callable[[MarketQuotePush | StockQuotePush], None]
-_DIVIDEND_FACTOR_FIELDS = (
-    "interest",
-    "stockBonus",
-    "stockGift",
-    "allotNum",
-    "allotPrice",
-    "gugai",
-    "dr",
-)
+QuotePushT = TypeVar("QuotePushT")
 
 
 class QmtGatewayError(RuntimeError):
-    """miniQMT 调用失败，或返回值不符合已定义的数据结构。"""
+    """miniQMT 调用失败，或返回值不符合 XtData 已知结构。"""
 
 
 class MarketDataGateway(Protocol):
-    """业务层使用的强类型最小行情接口。"""
+    """service 使用的最小 QMT 接口。"""
 
     def subscribe_market_quote(self, market: str, callback: MarketQuoteCallback) -> int: ...
 
@@ -76,7 +63,7 @@ class MarketDataGateway(Protocol):
         start_time: str,
         end_time: str,
         incrementally: bool,
-    ) -> None: ...
+    ) -> HistoryDownloadResponse: ...
 
     def get_history(
         self,
@@ -88,7 +75,7 @@ class MarketDataGateway(Protocol):
         count: int,
         dividend_type: DividendType,
         fill_data: bool,
-    ) -> dict[str, HistoryFrame]: ...
+    ) -> HistoryQueryResponse: ...
 
     def download_financial(
         self,
@@ -96,7 +83,7 @@ class MarketDataGateway(Protocol):
         tables: Sequence[FinancialTable],
         start_time: str,
         end_time: str,
-    ) -> None: ...
+    ) -> FinancialDownloadResponse: ...
 
     def get_financial(
         self,
@@ -105,18 +92,18 @@ class MarketDataGateway(Protocol):
         start_time: str,
         end_time: str,
         report_type: FinancialReportType,
-    ) -> dict[str, dict[FinancialTable, FinancialFrame]]: ...
+    ) -> FinancialQueryResponse: ...
 
     def get_dividend_factors(
         self,
         stocks: Sequence[str],
         start_time: str,
         end_time: str,
-    ) -> dict[str, list[DividendFactor]]: ...
+    ) -> DividendFactorsResponse: ...
 
 
 class _XtDataModule(Protocol):
-    """本机 xtquant 没有类型声明；所有返回先按 object 接收再校验。"""
+    """本机 xtquant 没有类型声明；动态结果统一从 ``object`` 校验。"""
 
     def subscribe_whole_quote(
         self, code_list: list[str], callback: Callable[[object], None]
@@ -182,11 +169,10 @@ class _XtDataModule(Protocol):
 
 
 class XtDataGateway:
-    """串行调用 xtdata，并在最底层把动态返回值转换成协议模型。"""
+    """只处理 xtdata 调用约束，不承载订阅状态或业务转换。"""
 
     def __init__(self) -> None:
         try:
-            # xtquant 由 Windows 客户端提供，不属于项目可安装依赖。
             from xtquant import xtdata  # pyright: ignore[reportMissingImports]
         except Exception as exc:
             raise QmtGatewayError(
@@ -195,17 +181,17 @@ class XtDataGateway:
             ) from exc
 
         self._xtdata = cast(_XtDataModule, xtdata)
+        # xtdata 底层客户端不是可重入接口，所有主动调用共用一把锁。
         self._call_lock = Lock()
 
     def subscribe_market_quote(self, market: str, callback: MarketQuoteCallback) -> int:
         def receive(raw: object) -> None:
-            try:
-                callback(_validate_tick_mapping(raw, f"{market} 全推回调"))
-            except Exception:
-                # XtData 在自己的线程中执行回调。结构错误会丢弃本次完整回调，
-                # 所以必须同时留下异常和 DEBUG 级原始数据，不能静默跳过字段。
-                logger.exception("丢弃结构不合法的 XtData 全市场行情回调：市场=%s", market)
-                logger.debug("被丢弃的 XtData 全市场行情原始数据：%r", raw)
+            self._deliver_callback(
+                callback,
+                lambda: _validate_tick_mapping(raw, f"{market} 全推回调"),
+                context=f"{market} 全推回调",
+                raw=raw,
+            )
 
         try:
             with self._call_lock:
@@ -214,7 +200,6 @@ class XtDataGateway:
                 )
         except Exception as exc:
             raise QmtGatewayError(f"订阅全市场行情失败：{exc}") from exc
-
         return _subscription_id(subscription_id, "订阅全市场行情失败")
 
     def subscribe_stock_quote(
@@ -224,29 +209,24 @@ class XtDataGateway:
         callback: StockQuoteCallback,
     ) -> int:
         def receive(raw: object) -> None:
-            try:
-                callback(_validate_stock_mapping(raw, period, f"{stock} {period} 回调"))
-            except Exception:
-                # 与全推一致，不能让业务异常终止 XtData 回调线程。
-                logger.exception(
-                    "丢弃结构不合法的 XtData 单股行情回调：合约=%s，周期=%s",
-                    stock,
-                    period,
-                )
-                logger.debug("被丢弃的 XtData 单股行情原始数据：%r", raw)
+            self._deliver_callback(
+                callback,
+                lambda: _validate_stock_mapping(raw, period, f"{stock} {period} 回调"),
+                context=f"{stock} {period} 回调",
+                raw=raw,
+            )
 
         try:
             with self._call_lock:
-                # 官方建议只订阅实时数据时使用 count=0，避免额外请求历史数据。
                 subscription_id = self._xtdata.subscribe_quote(
                     stock_code=stock,
                     period=period,
+                    # 只接收订阅建立后的实时数据，避免隐式拉取历史行情。
                     count=0,
                     callback=receive,
                 )
         except Exception as exc:
             raise QmtGatewayError(f"订阅 {stock} 的 {period} 行情失败：{exc}") from exc
-
         return _subscription_id(subscription_id, f"订阅 {stock} 的 {period} 行情失败")
 
     def unsubscribe(self, subscription_id: int) -> None:
@@ -260,9 +240,11 @@ class XtDataGateway:
         try:
             with self._call_lock:
                 raw = self._xtdata.get_full_tick(code_list=list(codes))
+            return _validate_tick_mapping({} if raw is None else raw, "get_full_tick")
+        except QmtGatewayError:
+            raise
         except Exception as exc:
             raise QmtGatewayError(f"获取行情快照失败：{exc}") from exc
-        return _validate_tick_mapping({} if raw is None else raw, "get_full_tick")
 
     def download_history(
         self,
@@ -271,8 +253,7 @@ class XtDataGateway:
         start_time: str,
         end_time: str,
         incrementally: bool,
-    ) -> None:
-        """使用官方批量接口同步补充历史行情。"""
+    ) -> HistoryDownloadResponse:
         try:
             with self._call_lock:
                 arguments = {
@@ -287,12 +268,11 @@ class XtDataGateway:
                         incrementally=incrementally,
                     )
                 except TypeError as exc:
-                    # 部分券商内置的旧版 xtquant 没有 incrementally 参数。
                     if "unexpected keyword argument 'incrementally'" not in str(exc):
                         raise
-                    # 类型协议描述当前版本；这里显式兼容旧版本的四参数调用。
-                    legacy_download = cast(Callable[..., None], self._xtdata.download_history_data2)
-                    legacy_download(**arguments)
+                    # 保留对旧券商客户端四参数版本的兼容。
+                    cast(Callable[..., None], self._xtdata.download_history_data2)(**arguments)
+            return HistoryDownloadResponse(completed=True)
         except Exception as exc:
             raise QmtGatewayError(f"下载历史行情失败：{exc}") from exc
 
@@ -306,11 +286,10 @@ class XtDataGateway:
         count: int,
         dividend_type: DividendType,
         fill_data: bool,
-    ) -> dict[str, HistoryFrame]:
+    ) -> HistoryQueryResponse:
         raw: object = None
         try:
             with self._call_lock:
-                # 历史数据已经由下载接口落盘，本地读取更快，也不会产生隐式订阅。
                 raw = self._xtdata.get_local_data(
                     field_list=list(fields),
                     stock_list=list(stocks),
@@ -321,14 +300,12 @@ class XtDataGateway:
                     dividend_type=dividend_type,
                     fill_data=fill_data,
                 )
-            json_data = to_jsonable({} if raw is None else raw)
-            frames = HistoryQueryResponse.model_validate({"period": period, "data": json_data}).data
-            return {code: _normalise_history_time(frame, code) for code, frame in frames.items()}
+            frames = _string_mapping({} if raw is None else raw, "get_local_data")
+            data = {code: dataframe_records(frame) for code, frame in frames.items()}
+            return HistoryQueryResponse.model_validate({"period": period, "data": data})
         except ValidationError as exc:
-            logger.debug("被拒绝的 XtData 历史行情原始数据：%r", raw)
+            logger.debug("不符合协议的 XtData 历史行情：%r", raw)
             raise QmtGatewayError(f"历史行情返回结构不合法：{exc}") from exc
-        except QmtGatewayError:
-            raise
         except Exception as exc:
             raise QmtGatewayError(f"读取历史行情失败：{exc}") from exc
 
@@ -338,7 +315,7 @@ class XtDataGateway:
         tables: Sequence[FinancialTable],
         start_time: str,
         end_time: str,
-    ) -> None:
+    ) -> FinancialDownloadResponse:
         try:
             with self._call_lock:
                 self._xtdata.download_financial_data2(
@@ -348,6 +325,7 @@ class XtDataGateway:
                     end_time=end_time,
                     callback=None,
                 )
+            return FinancialDownloadResponse(completed=True)
         except Exception as exc:
             raise QmtGatewayError(f"下载财务数据失败：{exc}") from exc
 
@@ -358,7 +336,7 @@ class XtDataGateway:
         start_time: str,
         end_time: str,
         report_type: FinancialReportType,
-    ) -> dict[str, dict[FinancialTable, FinancialFrame]]:
+    ) -> FinancialQueryResponse:
         raw: object = None
         try:
             with self._call_lock:
@@ -369,15 +347,17 @@ class XtDataGateway:
                     end_time=end_time,
                     report_type=report_type,
                 )
-            json_data = to_jsonable({} if raw is None else raw)
-            return FinancialQueryResponse.model_validate(
-                {"report_type": report_type, "data": json_data}
-            ).data
+            stocks_data = _string_mapping({} if raw is None else raw, "get_financial_data")
+            data: dict[str, dict[str, object]] = {}
+            for code, tables_data in stocks_data.items():
+                table_mapping = _string_mapping(tables_data, f"get_financial_data/{code}")
+                data[code] = {
+                    table: dataframe_records(frame) for table, frame in table_mapping.items()
+                }
+            return FinancialQueryResponse.model_validate({"data": data})
         except ValidationError as exc:
-            logger.debug("被拒绝的 XtData 财务数据原始返回：%r", raw)
+            logger.debug("不符合协议的 XtData 财务数据：%r", raw)
             raise QmtGatewayError(f"财务数据返回结构不合法：{exc}") from exc
-        except QmtGatewayError:
-            raise
         except Exception as exc:
             raise QmtGatewayError(f"读取财务数据失败：{exc}") from exc
 
@@ -386,7 +366,7 @@ class XtDataGateway:
         stocks: Sequence[str],
         start_time: str,
         end_time: str,
-    ) -> dict[str, list[DividendFactor]]:
+    ) -> DividendFactorsResponse:
         raw: dict[str, object] = {}
         try:
             with self._call_lock:
@@ -398,57 +378,30 @@ class XtDataGateway:
                     )
                     if frame is not None:
                         raw[stock] = frame
-            data = {stock: _dividend_factors(frame, stock) for stock, frame in raw.items()}
-            return DividendFactorsResponse(data=data).data
+            data = {
+                code: dataframe_records(frame, index_name="date") for code, frame in raw.items()
+            }
+            return DividendFactorsResponse.model_validate({"data": data})
         except ValidationError as exc:
-            logger.debug("被拒绝的 XtData 除权数据原始返回：%r", raw)
+            logger.debug("不符合协议的 XtData 除权数据：%r", raw)
             raise QmtGatewayError(f"除权数据返回结构不合法：{exc}") from exc
-        except QmtGatewayError:
-            raise
         except Exception as exc:
             raise QmtGatewayError(f"读取除权数据失败：{exc}") from exc
 
-
-def _normalise_history_time(frame: HistoryFrame, code: str) -> HistoryFrame:
-    """把历史 DataFrame 中明确名为 time 的 XtData 时间列统一成微秒。"""
-    try:
-        time_index = frame.columns.index("time")
-    except ValueError:
-        return frame
-
-    rows: list[list[JsonValue]] = []
-    for row_index, source_row in enumerate(frame.data):
-        row = list(source_row)
-        value = row[time_index]
-        if value is not None:
-            converted = unix_timestamp_to_utc_us(value)
-            if converted is None:
-                raise QmtGatewayError(f"{code} 历史行情第 {row_index} 行 time 不是有效整数时间戳")
-            row[time_index] = converted
-        rows.append(row)
-    return frame.model_copy(update={"data": rows})
-
-
-def _dividend_factors(value: object, code: str) -> list[DividendFactor]:
-    """把 XtData 除权 DataFrame 拆成显式记录，保留 index 的时间戳语义。"""
-    frame = TabularFrame.model_validate(to_jsonable(value))
-    known = set(_DIVIDEND_FACTOR_FIELDS)
-    factors: list[DividendFactor] = []
-    for row_index, (event_time, source_row) in enumerate(zip(frame.index, frame.data, strict=True)):
-        values = dict(zip(frame.columns, source_row, strict=True))
+    @staticmethod
+    def _deliver_callback(
+        callback: Callable[[QuotePushT], None],
+        validate: Callable[[], QuotePushT],
+        *,
+        context: str,
+        raw: object,
+    ) -> None:
         try:
-            factors.append(
-                DividendFactor.model_validate(
-                    {
-                        "event_time": event_time,
-                        **{name: values.get(name) for name in _DIVIDEND_FACTOR_FIELDS},
-                        "extra": {name: item for name, item in values.items() if name not in known},
-                    }
-                )
-            )
-        except ValidationError as exc:
-            raise QmtGatewayError(f"{code} 除权数据第 {row_index} 行结构不合法：{exc}") from exc
-    return factors
+            callback(validate())
+        except Exception:
+            # 回调运行在 XtData 线程；结构或业务异常不能终止其线程。
+            logger.exception("处理 XtData %s失败", context)
+            logger.debug("XtData %s原始数据：%r", context, raw)
 
 
 def _subscription_id(value: object, message: str) -> int:
@@ -463,70 +416,50 @@ def _mapping(value: object, context: str) -> Mapping[object, object]:
     return value
 
 
+def _string_mapping(value: object, context: str) -> dict[str, object]:
+    return {_code(key, context): item for key, item in _mapping(value, context).items()}
+
+
 def _code(value: object, context: str) -> str:
-    if not isinstance(value, str):
-        raise QmtGatewayError(f"{context} 的合约代码必须是字符串，实际为 {type(value)}")
-    normalized = value.strip().upper()
-    if not normalized:
-        raise QmtGatewayError(f"{context} 包含空合约代码")
-    return normalized
+    if not isinstance(value, str) or not value:
+        raise QmtGatewayError(f"{context} 包含无效合约代码：{value!r}")
+    return value
 
 
 def _quote_dict(value: object, context: str) -> dict[str, object]:
     if not isinstance(value, Mapping):
         raise QmtGatewayError(f"{context} 行情必须是字段映射，实际为 {type(value)}")
     result: dict[str, object] = {}
-    for raw_key, item in value.items():
-        if not isinstance(raw_key, str):
-            raise QmtGatewayError(f"{context} 行情字段名必须是字符串：{raw_key!r}")
-        result[raw_key] = item
+    for key, item in value.items():
+        if not isinstance(key, str):
+            raise QmtGatewayError(f"{context} 行情字段名必须是字符串：{key!r}")
+        result[key] = item
     return result
-
-
-def _log_unknown_fields(
-    fields: set[str], model: type[TickQuote] | type[BarQuote], context: str
-) -> None:
-    unknown = fields - set(model.model_fields)
-    if unknown:
-        # 未知字段仍在 QuoteModel.__pydantic_extra__ 中完整保留，此日志用于推动补充定义。
-        logger.debug(
-            "XtData %s 出现尚未定义的行情字段，字段不会丢弃并将原样传递：%s",
-            context,
-            sorted(unknown),
-        )
 
 
 def _validate_tick_mapping(value: object, context: str) -> MarketQuotePush:
     result: MarketQuotePush = {}
-    observed_fields: set[str] = set()
     try:
         for raw_code, raw_quote in _mapping(value, context).items():
             code = _code(raw_code, context)
-            quote = _quote_dict(raw_quote, f"{context}/{code}")
-            observed_fields.update(quote)
-            result[code] = TickQuote.model_validate(quote)
+            result[code] = TickQuote.model_validate(_quote_dict(raw_quote, f"{context}/{code}"))
     except ValidationError as exc:
         raise QmtGatewayError(f"{context} 行情字段类型不合法：{exc}") from exc
-    _log_unknown_fields(observed_fields, TickQuote, context)
     return result
 
 
 def _validate_stock_mapping(value: object, period: XtDataPeriod, context: str) -> StockQuotePush:
     result: StockQuotePush = {}
-    observed_fields: set[str] = set()
     model = quote_model_for_period(period)
     try:
         for raw_code, raw_rows in _mapping(value, context).items():
             code = _code(raw_code, context)
             if not isinstance(raw_rows, (list, tuple)):
                 raise QmtGatewayError(f"{context}/{code} 必须是行情列表，实际为 {type(raw_rows)}")
-            rows: list[QuotePayload] = []
-            for index, raw_quote in enumerate(raw_rows):
-                quote = _quote_dict(raw_quote, f"{context}/{code}[{index}]")
-                observed_fields.update(quote)
-                rows.append(model.model_validate(quote))
-            result[code] = rows
+            result[code] = [
+                model.model_validate(_quote_dict(row, f"{context}/{code}[{index}]"))
+                for index, row in enumerate(raw_rows)
+            ]
     except ValidationError as exc:
         raise QmtGatewayError(f"{context} 行情字段类型不合法：{exc}") from exc
-    _log_unknown_fields(observed_fields, model, context)
     return result

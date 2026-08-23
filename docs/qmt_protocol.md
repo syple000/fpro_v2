@@ -1,257 +1,170 @@
-# QMT 行情数据协议
+# QMT 数据协议
 
-`qmt_protocol` 是 `qmt_agent` 与 `qmt_receiver` 唯一共用的数据契约。`base.py` 只定义基础
-类型和业务数据结构，`responses.py` 只定义 HTTP 返回信封。HTTP OpenAPI、
-receiver 的运行时响应校验、Parquet 写入输入和 platform 队列事件都引用这里的 Pydantic
-模型，不再各自维护裸 `dict[str, Any]`。
+`qmt_protocol` 是 qmt-agent 与 qmt-receiver 共同依赖的结构包。协议只做两件事：准确描述 XtData 数据，以及描述中转所需的少量信封字段。这里没有 `XtDataFrame`、`TabularFrame` 或 `JsonValue`。
 
-## 验证依据
+## 文件组织
 
-字段定义同时依据：
-
-1. [迅投 XtData 官方文档](https://dict.thinktrader.net/nativeApi/xtdata.html)中的接口、周期和字段表；
-2. [迅投数据结构文档](https://dict.thinktrader.net/innerApi/data_structure.html?id=7zqjlm)；
-3. 2026-08-17 在本机东北证券 miniQMT 上直接调用 `xtquant.xtdata` 的结果。
-
-实机只调用行情接口：`get_full_tick`、`get_local_data`、`subscribe_quote`、
-`subscribe_whole_quote`、`unsubscribe_quote`。没有调用账户、资产、持仓、委托、成交或
-其他交易接口。
-
-实测外层结构如下：
-
-| XtData 接口 | Python 原始结构 |
+| 文件 | 内容 |
 | --- | --- |
-| `get_full_tick` | `dict[str, dict[str, scalar/list]]` |
-| `subscribe_whole_quote` | `dict[str, dict[str, scalar/list]]` |
-| `subscribe_quote(..., period="tick")` | `dict[str, list[dict[str, scalar/list]]]` |
-| `subscribe_quote(..., period="1m")` | `dict[str, list[dict[str, scalar]]]` |
-| `get_local_data(..., period="1d"/"1m"/"tick")` | `dict[str, pandas.DataFrame]` |
+| `base.py` | XtData 原始行、行情信封、类型别名和基础校验 |
+| `requests.py` | HTTP 请求结构和请求参数校验 |
+| `responses.py` | HTTP 返回结构及响应内部一致性校验 |
 
-SH 全推首包包含 26,585 个合约，所有合约具有相同的 22 个字段；字段和值类型与下文
-`TickQuote` 一致。`get_full_tick` 的 `amount` 和 `settlementPrice` 实测可能是 `int`，而全推
-回调和官方语义为 `float`，协议边界统一转换为 `float`。
+`qmt_agent` 和 `qmt_receiver` 不再各自定义协议模型。公共类型统一从 `qmt_protocol` 导入。
 
-## 链路
+## 数据边界
 
 ```text
-XtData object
-  -> XtDataGateway（校验、规范化为 TickQuote / BarQuote）
-  -> QmtMarketService（只保存协议模型）
-  -> FastAPI（按响应模型生成 OpenAPI 和 JSON）
-  -> QmtAgentClient（从 JSON 严格反序列化为同一响应模型）
-  -> QmtReceiver / QmtDataStore（只接收 SequencedQuote）
-  -> Queue[QuoteEvent]
+XtData dict / DataFrame
+        │ 原字段名、原标量类型、原时间值
+        ▼
+qmt_protocol 具体模型
+        │ HTTP JSON
+        ▼
+receiver 解析并派生存储字段
 ```
 
-协议信封使用 `extra="forbid"` 和严格类型。receiver 收到新增或拼错的信封字段时会拒绝
-响应并抛出 `QmtAgentError`，不会悄悄忽略。
+协议遵循以下规则：
 
-行情明细使用 `extra="allow"`，因为不同券商客户端版本和行情级别确实会扩展字段。已知
-字段严格校验；未知字段保存在模型的 `__pydantic_extra__` 中并随 HTTP、Parquet
-`quote.extra_json` 和队列事件完整传递，同时由 agent 记录 DEBUG 日志，便于后续补入正式定义。
+- 已知字段逐一声明，未知字段拒绝，不静默丢弃。
+- XtData 的字段名不改名，包括历史 K 线的 `settelementPrice` 拼写。
+- agent 不修改 XtData `time` 的单位和数值类型。
+- DataFrame 不作为通用二维结构传输，而是转为具体的行模型列表；原 index 保存为明确字段。
+- 可缺失的 XtData 字段使用 `None`，不是任意 JSON 值。
 
-## 行情明细
+这些结构根据当前东北证券 miniQMT 实机返回采样定义。若客户端升级后增加字段，接入边界会明确报错，便于同步更新协议。
 
-字段为可选并不表示类型不确定。实测 `get_full_tick`、全推回调和不同客户端版本的字段
-集合不完全相同，因此“字段可以不存在”；字段一旦存在，值必须满足表中的确定类型。
+## 基础模型
 
-### `TickQuote`
+### 实时行情
 
-| 字段 | Python / JSON 类型 | 来源 |
+`TickQuote` 对应 `get_full_tick`、全推和 tick 订阅。字段包括：
+
+```text
+time, stime, timetag, lastPrice, open, high, low, lastClose,
+amount, volume, pvolume, stockStatus, openInt, transactionNum,
+lastSettlementPrice, settlementPrice, pe,
+askPrice, bidPrice, askVol, bidVol, volRatio, speed1Min, speed5Min
+```
+
+`BarQuote` 对应分钟线及更大周期的订阅：
+
+```text
+time, open, high, low, close, volume, amount,
+settelementPrice, settlementPrice, openInterest, preClose,
+suspendFlag, dr, totaldr
+```
+
+价格和金额使用 `int | float | None`，避免把 XtData 返回的整数强制改成浮点数；数量字段使用 `int | None`。
+
+### 历史行情
+
+- `HistoryTick(TickQuote)` 增加 `index: int | str`。
+- `HistoryBar(BarQuote)` 增加 `index: int`。
+
+实机日线 index 为 `YYYYMMDD` 整数，分钟线 index 为 `YYYYMMDDHHMMSS` 整数。响应结构是 `dict[code, list[HistoryTick | HistoryBar]]`，不再传递 DataFrame 的 columns/data 矩阵。
+
+### 除权数据
+
+`DividendFactor` 明确声明：
+
+```text
+date, time, interest, stockBonus, stockGift,
+allotNum, allotPrice, gugai, dr
+```
+
+实机返回的 DataFrame index 是 `YYYYMMDD` 字符串，因此放入 `date`；真正的 XtData 毫秒时间戳来自 `time` 列。二者不会混用。
+
+### 财务数据
+
+八张 XtData 财务表分别有独立行模型，所有采样到的列都在模型中逐字段声明：
+
+| XtData 表 | 行模型 | `FinancialData` 字段 |
 | --- | --- | --- |
-| `time` | `int64`，Unix Epoch 微秒；XtData 原始值在边界转换 | 官方、实测 |
-| `stime` | `str` | 新版官方结构 |
-| `timetag` | `str` | 本机 `get_full_tick` 实测 |
-| `lastPrice`, `open`, `high`, `low`, `lastClose` | `float` | 官方、实测 |
-| `amount` | `float` | 官方；本机快照的 `int` 会规范为 `float` |
-| `volume`, `pvolume` | `int` | 官方、实测 |
-| `stockStatus`, `openInt` | `int` | 官方、实测 |
-| `transactionNum` | `int` | 官方、回调实测 |
-| `lastSettlementPrice`, `settlementPrice` | `float` | 官方、实测 |
-| `askPrice`, `bidPrice` | `list[float]` | 官方、实测五档 |
-| `askVol`, `bidVol` | `list[int]` | 官方、实测五档 |
-| `pe` | `float` | 本机全推回调实测 |
-| `volRatio` | `float` | 本机全推回调实测 |
-| `speed1Min`, `speed5Min` | `float` | 本机全推回调实测 |
+| `Balance` | `BalanceRecord` | `Balance` |
+| `Income` | `IncomeRecord` | `Income` |
+| `CashFlow` | `CashFlowRecord` | `CashFlow` |
+| `Capital` | `CapitalRecord` | `Capital` |
+| `Holdernum` | `HolderNumberRecord` | `Holdernum` |
+| `Top10holder` | `Top10HolderRecord` | `Top10holder` |
+| `Top10flowholder` | `Top10FlowHolderRecord` | `Top10flowholder` |
+| `Pershareindex` | `PerShareIndexRecord` | `Pershareindex` |
 
-本机 `get_full_tick` 返回 `timetag`，但不返回 `transactionNum`、`pe`、`volRatio`、
-`speed1Min`、`speed5Min`；全推和单股 tick 回调则返回后五项但没有 `timetag`。协议不伪造
-缺失字段，HTTP 序列化会排除值为 `None` 的可选字段。
+每一行都有明确的 `index: int`，其余字段按 XtData 实际列定义为具体的 `float`、`str` 或可空版本。`FinancialData` 只负责把八种具体列表放在一个证券代码下，不包含通用字典行。
 
-### `BarQuote`
+## 中转行情
 
-| 字段 | Python / JSON 类型 | 来源 |
-| --- | --- | --- |
-| `time` | `int64`，Unix Epoch 微秒；XtData 原始值在边界转换 | 官方、实测 |
-| `open`, `high`, `low`, `close` | `float` | 官方、实测 |
-| `volume` | `int` | 本机实测 |
-| `amount` | `float` | 官方、实测 |
-| `settelementPrice` | `float` | 官方拼写、本机历史 DataFrame 实测 |
-| `settlementPrice` | `float` | 本机实时 K 线回调实测 |
-| `openInterest` | `float` | 官方；本机 `int` 会规范为 `float` |
-| `preClose` | `float` | 官方、实测 |
-| `suspendFlag` | `int` | 官方、实测 |
-| `dr`, `totaldr` | `float` | 本机实时 K 线回调实测 |
+`SequencedQuote` 是 agent 添加的最小信封：
 
-`settelementPrice` 是官方历史字段中长期存在的拼写，实时回调实测使用正确拼写
-`settlementPrice`。协议同时保留两者，不能隐式改名或合并。
-
-## HTTP 响应模型
-
-| 接口 | 响应模型 |
+| 字段 | 含义 |
 | --- | --- |
-| `GET /health` | `HealthResponse` |
-| `GET /v1/subscriptions` | `SubscriptionStatus` |
-| `POST/DELETE /v1/subscriptions/markets` | `MarketSubscriptionResponse` |
-| `POST/DELETE /v1/subscriptions/stocks` | `StockSubscriptionResponse` |
-| `POST /v1/snapshots/markets` | `SnapshotResponse` |
-| `POST /v1/snapshots/stocks` | `SnapshotResponse` |
-| `POST /v1/quotes/subscribed/markets` | `LatestQuotesResponse` |
-| `POST /v1/quotes/subscribed/stocks` | `LatestQuotesResponse` |
-| `POST /v1/quotes/subscribed/sequence` | `QuoteSequenceResponse` |
-| `POST /v1/history/download` | `HistoryDownloadResponse` |
-| `POST /v1/history/query` | `HistoryQueryResponse` |
-| `POST /v1/financial/download` | `FinancialDownloadResponse` |
-| `POST /v1/financial/query` | `FinancialQueryResponse` |
-| `POST /v1/dividend-factors/query` | `DividendFactorsResponse` |
+| `seq` | agent 内单调递增序号 |
+| `code` | XtData 回调中的证券代码 |
+| `period` | 此订阅周期 |
+| `source` | `market` 或 `stock` |
+| `subscription` | 产生该回调的市场或证券订阅 |
+| `received_at` | agent 收到回调的 Unix 微秒时间 |
+| `quote` | `TickQuote` 或 `BarQuote` |
 
-### 状态和订阅结果
+`QuoteEvent` 仅由 receiver 在落盘时产生，它在上述字段上增加：
 
-`QuoteSequenceStatus`：
+- `event_time: int | None`：从原始 `quote.time` 推导出的 Unix 微秒时间；原行情没有时间时保持 `None`。
+- `trading_date: date`：按中国市场时区从事件时间推导；缺少事件时间时使用 `received_at` 分区，但不丢弃行情。
 
-| 字段 | 类型 |
-| --- | --- |
-| `oldest_seq`, `latest_seq` | `int | None` |
-| `next_seq` | `int` |
-| `size`, `capacity` | `int` |
+## 请求模型
 
-`SubscriptionStatus`：
+请求全部位于 `requests.py`：
 
-| 字段 | 类型 |
-| --- | --- |
-| `instance_id` | `str` |
-| `markets`, `stocks` | `list[str]` |
-| `stock_periods` | `dict[str, XtDataPeriod]` |
-| `stock_count`, `stock_limit` | `int` |
-| `quote_sequence` | `QuoteSequenceStatus` |
+```text
+MarketRequest, MarketUnsubscribeRequest
+StockRequest, StockSubscriptionRequest
+SequencedQuoteRequest
+HistoryDownloadRequest, HistoryQueryRequest
+FinancialDownloadRequest, FinancialQueryRequest
+DividendFactorsQueryRequest
+```
 
-`HealthResponse` 在上述字段之外增加 `status: Literal["ok"]` 和 `version: str`。
+请求层只处理输入边界：代码去空格并大写、重复项去重、时间格式和范围校验、数量上限校验。它不会过滤 XtData 返回的数据。
 
-`MarketSubscriptionResponse` 包含四个 `list[str]`：`subscribed`、`added`、`removed`、
-`not_found`。
+## 响应模型
 
-`StockSubscriptionResponse` 包含：
+响应全部位于 `responses.py`。主要形状如下：
 
-- `periods: dict[str, XtDataPeriod]`
-- `subscribed`, `added`, `updated`, `removed`, `not_found: list[str]`
-- `period_mismatches: dict[str, XtDataPeriod]`
+```python
+SnapshotResponse(
+    data: dict[str, TickQuote],
+    count: int,
+)
 
-### 快照、最新行情和顺序行情
+LatestQuotesResponse(
+    data: dict[str, TickQuote | BarQuote],
+    periods: dict[str, XtDataPeriod],
+    updated_at: dict[str, int],
+)
 
-`SnapshotResponse`：`data: dict[str, TickQuote]`、`count: int`；模型会校验 `count` 与
-`data` 数量一致。
+HistoryQueryResponse(
+    period: XtDataPeriod,
+    data: dict[str, list[HistoryTick | HistoryBar]],
+)
 
-`LatestQuotesResponse`：
+FinancialQueryResponse(
+    data: dict[str, FinancialData],
+)
 
-| 字段 | 类型 |
-| --- | --- |
-| `data` | `dict[str, TickQuote | BarQuote]` |
-| `updated_at` | `dict[str, int]`，Unix Epoch 微秒 |
-| `periods` | `dict[str, XtDataPeriod]` |
-| `missing`, `not_subscribed` | `list[str]` |
+DividendFactorsResponse(
+    data: dict[str, list[DividendFactor]],
+)
+```
 
-模型要求 `data`、`updated_at`、`periods` 使用相同的合约代码集合，并根据每个代码的
-`period` 确定行情是 `TickQuote` 还是 `BarQuote`。
+`LatestQuotesResponse` 要求 `data`、`periods`、`updated_at` 的代码集合完全一致。`SnapshotResponse.count` 和顺序行情的 `count` 必须与实际数据长度一致。结构不一致会直接失败，而不是修剪返回数据。
 
-`SequencedQuote`：
+## 时间约定
 
-| 字段 | 类型 |
-| --- | --- |
-| `seq` | `int` |
-| `code` | `str` |
-| `period` | `XtDataPeriod` |
-| `source` | `Literal["market", "stock"]` |
-| `subscription` | `str` |
-| `received_at` | `int64`，Unix Epoch 微秒 |
-| `event_time` | `int64`，与规范化后的 `quote.time` 相同 |
-| `quote` | 按 `period` 确定的 `TickQuote | BarQuote` |
+时间只在有明确边界时转换：
 
-协议入口只接受 `int64` 范围内的微秒整数，不接受 ISO 字符串、浮点数、布尔值或 `datetime`。
-`event_time` 表示行情发生时间，`received_at` 表示系统收到回调的时间，不能互相替代。XtData
-可能返回秒、毫秒、微秒或纳秒整数，接入模型会识别并统一成微秒；对外协议中不再传原始单位。
-实时订阅回调缺少 `quote.time` 时，agent 会在写入最新行情缓存和 sequence 之前丢弃该条记录；
-不会用 `received_at` 冒充业务时间。快照模型的 `time` 仍可空，因为快照不进入实时落盘链路。
+- `quote.time` 和 `DividendFactor.time`：保留 XtData 原值，当前实机为毫秒时间戳。
+- `received_at`：agent 生成的 Unix Epoch 微秒整数。
+- `event_time`：receiver 从 `quote.time` 推导的 Unix Epoch 微秒整数。
+- 历史行 `index`、财务行 `index`、除权 `date`：保留 XtData DataFrame index 的业务表示。
 
-`QuoteSequenceResponse`：`data: list[SequencedQuote]`，`count`、`requested_seq`、
-`next_seq` 为 `int`，`oldest_seq`、`latest_seq` 为 `int | None`。模型校验数量和序号边界。
-长轮询在合法的下一游标处超时时返回成功空批次，此时 `next_seq == requested_seq`；空缓存的
-两个边界为空，已有数据但已追到最新时仍返回当前边界。
-
-只有请求序号已被覆盖或越过下一合法游标时才返回 HTTP 416，使用
-`QuoteSequenceErrorResponse`：`detail: str`，以及可为空的 `requested_seq`、`oldest_seq`、
-`latest_seq`。
-
-### 历史行情、财务和除权
-
-`TabularFrame` 是 pandas DataFrame 的 split 基础结构：
-
-| 字段 | 类型 |
-| --- | --- |
-| `index` | `list[JsonValue]` |
-| `columns` | `list[str]` |
-| `data` | `list[list[JsonValue]]` |
-
-模型校验 index 行数、data 行数、columns 行宽和列名唯一性。业务返回不会直接使用这个
-基础类：历史行情使用 `HistoryFrame`，财务数据使用 `FinancialFrame`。两者结构相同但语义
-不同，不能再互换。单元值保留为 `JsonValue`，因为历史查询字段和不同财务表字段都是动态的。
-
-`HistoryQueryResponse` 明确返回 `period` 和 `data: dict[str, HistoryFrame]`。
-`HistoryDownloadResponse` 包含 `stocks`、`period`、`start_time`、`end_time`、`mode` 和
-`completed`，完整回显实际下载范围与模式。
-
-`FinancialQueryResponse` 明确返回 `report_type`，并在股票代码下按 `FinancialTable` 组织
-`FinancialFrame`。`FinancialDownloadResponse` 包含股票、财务表、起止时间和完成状态。
-
-除权不再复用 DataFrame 返回结构。`DividendFactorsResponse.data` 是
-`dict[str, list[DividendFactor]]`，每条 `DividendFactor` 逐项定义：
-
-| 字段 | 类型 |
-| --- | --- |
-| `event_time` | `int64`，XtData index 时间戳规范化后的 Unix Epoch 微秒 |
-| `interest`, `stockBonus`, `stockGift` | `float | None` |
-| `allotNum`, `allotPrice`, `gugai`, `dr` | `float | None` |
-| `extra` | `dict[str, JsonValue]`，券商扩展列 |
-
-XtData 底层把除权 DataFrame index 定义为时间戳，协议保留这个语义；`ex_date` 只在存储层按
-中国市场时区从 `event_time` 派生。
-
-## Receiver 队列事件
-
-`QuoteEvent` 继承 `SequencedQuote` 的全部字段，并增加：
-
-| 字段 | 类型 |
-| --- | --- |
-| `trading_date` | `datetime.date` |
-
-因此 platform 应创建 `Queue[QuoteEvent]`，消费者使用属性访问，例如
-`event.seq`、`event.quote.lastPrice`。Parquet 分为 `ticks`、`bars` 两张按交易日分区的表；
-固定信封字段落入顶层列，行情主体保存在具有确定 schema 的 `quote` struct 中；
-`event_time` 和 `received_at` 使用 Unix Epoch 微秒 `int64`；`trading_date` 只用于按中国市场
-交易日分区。未知的客户端扩展字段保存在
-`quote.extra_json`，不会因动态字段未建列而丢失。
-
-## 字段丢弃和日志规则
-
-- 未定义的行情字段：不丢弃，保存在模型扩展字段中，并打印 DEBUG；
-- 实时订阅行情缺少 `quote.time`：整条丢弃，不进入缓存、sequence、receiver 或存储；
-- 类型错误的 XtData 回调：拒绝整批，打印异常和原始 payload 的 DEBUG；
-- 未定义的 HTTP 信封字段：receiver 拒绝响应并打印 DEBUG，不静默忽略；
-- 请求中的重复代码、重复历史字段或空历史字段：清洗时打印 DEBUG；
-- 非字符串 JSON key 的字符串化冲突、非法 UTF-8 替换、未知对象字符串回退：打印 DEBUG；
-- 反订阅后的延迟回调或订阅失败前暂存回调：按竞态规则丢弃并打印 DEBUG。
-
-生产环境可通过 `QMT_AGENT_LOG_LEVEL=debug` 查看这些记录。
-
-所有业务时刻在协议、JSON 和 Parquet 中统一为 Unix Epoch 微秒 `int64`。XtData 的无时区
-查询字符串只用于调用外部接口，`stime`/`timetag` 只作为原始审计字段；项目自带命令行日志
-的记录时间使用带 `+08:00` 的北京时间。
+这样 agent 是透明中转，receiver 才是业务时间和存储语义的拥有者。

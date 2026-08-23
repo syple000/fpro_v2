@@ -4,10 +4,10 @@ import pytest
 from pydantic import ValidationError
 
 from qmt_protocol import (
+    BalanceRecord,
     BarQuote,
     DividendFactor,
-    FinancialFrame,
-    HistoryFrame,
+    HistoryBar,
     QuoteSequenceResponse,
     SequencedQuote,
     TickQuote,
@@ -24,7 +24,7 @@ def test_tick_model_matches_real_xtdata_snapshot_and_callback_types() -> None:
             "high": 11.22,
             "low": 11.07,
             "lastClose": 11.11,
-            # get_full_tick 实测为 int；协议统一成 float。
+            # get_full_tick 实测为 int；协议按原始类型保留。
             "amount": 687998800,
             "volume": 619280,
             "pvolume": 61928005,
@@ -44,9 +44,9 @@ def test_tick_model_matches_real_xtdata_snapshot_and_callback_types() -> None:
         }
     )
 
-    assert quote.amount == 687998800.0
-    assert quote.time == 1_786_944_183_000_000
-    assert quote.settlementPrice == 0.0
+    assert quote.amount == 687998800
+    assert quote.time == 1_786_944_183_000
+    assert quote.settlementPrice == 0
     assert quote.askPrice == [11.09, 11.1]
 
 
@@ -70,8 +70,8 @@ def test_bar_model_covers_real_callback_extensions_and_both_settlement_spellings
         }
     )
 
-    assert quote.time == 1_786_944_300_000_000
-    assert quote.openInterest == 13.0
+    assert quote.time == 1_786_944_300_000
+    assert quote.openInterest == 13
     assert quote.settelementPrice == quote.settlementPrice == 0.0
 
 
@@ -89,34 +89,41 @@ def test_sequence_selects_quote_model_from_period_without_guessing() -> None:
     assert isinstance(record.quote, BarQuote)
 
 
-def test_history_frame_rejects_rows_that_do_not_match_columns() -> None:
-    with pytest.raises(ValidationError, match="行宽"):
-        HistoryFrame(index=[20260817], columns=["open", "close"], data=[[11.2]])
+def test_concrete_history_model_rejects_undefined_fields() -> None:
+    with pytest.raises(ValidationError, match="extra"):
+        HistoryBar.model_validate({"index": 20260817, "close": 11.2, "vendor_field": 1})
 
 
 def test_financial_and_dividend_have_distinct_business_structures() -> None:
-    financial = FinancialFrame(
-        index=[20241231],
-        columns=["m_anntime", "tot_assets"],
-        data=[[20250331, 100.0]],
+    financial = BalanceRecord(
+        index=0,
+        m_timetag="20241231",
+        m_anntime="20250331",
+        tot_assets=100.0,
     )
-    factor = DividendFactor(event_time=1_717_200_000_000, interest=0.1, dr=0.99)
+    factor = DividendFactor(
+        date="20240601",
+        time=1_717_200_000_000.0,
+        interest=0.1,
+        dr=0.99,
+    )
 
-    assert not isinstance(financial, HistoryFrame)
-    assert factor.event_time == 1_717_200_000_000_000
+    assert not isinstance(financial, HistoryBar)
+    assert factor.date == "20240601"
 
 
-def test_sequence_rejects_realtime_quote_without_business_time() -> None:
-    with pytest.raises(ValidationError, match="event_time"):
-        SequencedQuote(
-            seq=1,
-            code="000001.SZ",
-            period="tick",
-            source="market",
-            subscription="SH",
-            received_at=1_786_838_400_000_000,
-            quote=TickQuote(lastPrice=10.0),
-        )
+def test_sequence_does_not_filter_quote_without_business_time() -> None:
+    record = SequencedQuote(
+        seq=1,
+        code="000001.SZ",
+        period="tick",
+        source="market",
+        subscription="SH",
+        received_at=1_786_838_400_000_000,
+        quote=TickQuote(lastPrice=10.0),
+    )
+
+    assert record.quote.time is None
 
 
 def test_sequence_response_rejects_inconsistent_count() -> None:
@@ -169,8 +176,7 @@ def test_sequence_accepts_only_int64_microseconds() -> None:
         }
     )
     assert parsed.received_at == 1_786_923_065_934_481
-    assert parsed.quote.time == 1_786_944_183_000_000
-    assert parsed.event_time == 1_786_944_183_000_000
+    assert parsed.quote.time == 1_786_944_183_000
 
     for invalid in (
         "2026-08-17T05:51:05+00:00",

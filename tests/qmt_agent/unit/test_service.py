@@ -89,10 +89,9 @@ def test_callback_keeps_only_latest_quote() -> None:
 
     quotes = service.get_stock_quotes()
     assert quote_dict(quotes) == {"000001.SZ": {"lastPrice": 10.2}}
-    assert quotes.missing == []
 
 
-def test_realtime_quote_without_time_never_enters_downstream_state() -> None:
+def test_realtime_quote_without_time_is_not_filtered() -> None:
     gateway = FakeGateway()
     service = QmtMarketService(gateway)
     service.subscribe_markets(["SH"])
@@ -102,8 +101,8 @@ def test_realtime_quote_without_time_never_enters_downstream_state() -> None:
         {"600000.SH": {"time": None, "lastPrice": 10.0}},
     )
 
-    assert service.get_market_quotes().data == {}
-    assert service.quote_sequence_status().size == 0
+    assert service.get_market_quotes().data["600000.SH"].time is None
+    assert service.quote_sequence_status().size == 1
 
 
 def test_single_subscription_callback_preserves_every_quote_in_sequence() -> None:
@@ -176,7 +175,7 @@ def test_quote_sequence_ring_reports_oldest_and_latest_boundaries() -> None:
     subscription_id = gateway.active_subscription_ids()["000001.SZ"]
 
     for value in range(1, 6):
-        gateway.push(subscription_id, {"000001.SZ": {"value": value}})
+        gateway.push(subscription_id, {"000001.SZ": {"lastPrice": value}})
 
     status = service.quote_sequence_status()
     result = service.get_subscribed_quote_sequence(3, 10)
@@ -188,7 +187,7 @@ def test_quote_sequence_ring_reports_oldest_and_latest_boundaries() -> None:
         "size": 3,
         "capacity": 3,
     }
-    assert [item.quote.model_dump()["value"] for item in result.data] == [3, 4, 5]
+    assert [item.quote.model_dump()["lastPrice"] for item in result.data] == [3, 4, 5]
     with pytest.raises(QuoteSequenceOutOfRangeError) as too_old:
         service.get_subscribed_quote_sequence(2, 10)
     caught_up = service.get_subscribed_quote_sequence(6, 10)
@@ -203,7 +202,7 @@ def test_quote_sequence_ring_reports_oldest_and_latest_boundaries() -> None:
     assert "过新" in str(too_new.value)
 
 
-def test_quote_sequence_filter_advances_over_the_full_sequence_window() -> None:
+def test_quote_sequence_returns_complete_window_without_filtering() -> None:
     gateway = FakeGateway()
     service = QmtMarketService(gateway)
     service.subscribe_markets(["SH"])
@@ -211,15 +210,18 @@ def test_quote_sequence_filter_advances_over_the_full_sequence_window() -> None:
     gateway.push(
         subscription_id,
         {
-            "600000.SH": {"value": 1},
-            "601000.SH": {"value": 2},
-            "600000.SH ": {"value": 3},
+            "600000.SH": {"lastPrice": 1},
+            "601000.SH": {"lastPrice": 2},
+            "600000.SH ": {"lastPrice": 3},
         },
     )
 
-    result = service.get_subscribed_quote_sequence(1, 2, ["601000.SH"])
+    result = service.get_subscribed_quote_sequence(1, 2)
 
-    assert [(item.seq, item.code) for item in result.data] == [(2, "601000.SH")]
+    assert [(item.seq, item.code) for item in result.data] == [
+        (1, "600000.SH"),
+        (2, "601000.SH"),
+    ]
     assert result.next_seq == 3
     assert result.latest_seq == 3
 
@@ -256,7 +258,7 @@ def test_stock_period_changes_only_after_precise_unsubscribe() -> None:
     assert changed.periods == {"000001.SZ": "5m", "600000.SH": "1m"}
     assert gateway.unsubscribed == [original_subscription_id]
     assert gateway.active_stock_periods() == {"000001.SZ": "5m", "600000.SH": "1m"}
-    assert service.get_stock_quotes(["000001.SZ"]).missing == ["000001.SZ"]
+    assert "000001.SZ" not in service.get_stock_quotes().data
 
 
 def test_market_quotes_are_available_from_subscription_cache() -> None:
@@ -272,11 +274,7 @@ def test_market_quotes_are_available_from_subscription_cache() -> None:
     )
 
     all_quotes = service.get_market_quotes()
-    selected_quotes = service.get_market_quotes(["600000.SH", "000001.SZ"])
-
-    assert list(all_quotes.data) == ["600000.SH"]
-    assert list(selected_quotes.data) == ["600000.SH"]
-    assert selected_quotes.not_subscribed == ["000001.SZ"]
+    assert list(all_quotes.data) == ["600000.SH", "000001.SZ"]
 
 
 def test_market_and_stock_quotes_are_returned_from_separate_caches() -> None:
@@ -288,20 +286,20 @@ def test_market_and_stock_quotes_are_returned_from_separate_caches() -> None:
 
     gateway.push(
         subscription_ids["600000.SH"],
-        {"600000.SH": [{"close": 10.1, "kind": "1m"}]},
+        {"600000.SH": [{"close": 10.1}]},
     )
     gateway.push(
         subscription_ids["SH"],
-        {"600000.SH": {"lastPrice": 10.2, "kind": "tick"}},
+        {"600000.SH": {"lastPrice": 10.2}},
     )
 
-    market_quotes = service.get_market_quotes(["600000.SH"])
-    stock_quotes = service.get_stock_quotes(["600000.SH"])
-    compatibility_quotes = service.get_subscribed_quotes(["600000.SH"])
+    market_quotes = service.get_market_quotes()
+    stock_quotes = service.get_stock_quotes()
+    compatibility_quotes = service.get_subscribed_quotes()
 
-    assert quote_dict(market_quotes) == {"600000.SH": {"lastPrice": 10.2, "kind": "tick"}}
+    assert quote_dict(market_quotes) == {"600000.SH": {"lastPrice": 10.2}}
     assert market_quotes.periods == {"600000.SH": "tick"}
-    assert quote_dict(stock_quotes) == {"600000.SH": {"close": 10.1, "kind": "1m"}}
+    assert quote_dict(stock_quotes) == {"600000.SH": {"close": 10.1}}
     assert stock_quotes.periods == {"600000.SH": "1m"}
     assert quote_dict(compatibility_quotes) == quote_dict(stock_quotes)
 

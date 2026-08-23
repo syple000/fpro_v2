@@ -12,14 +12,28 @@ from qmt_agent.gateway import (
     StockQuoteCallback,
 )
 from qmt_protocol import (
+    BalanceRecord,
+    CapitalRecord,
+    CashFlowRecord,
     DividendFactor,
+    DividendFactorsResponse,
     DividendType,
-    FinancialFrame,
+    FinancialData,
+    FinancialDownloadResponse,
+    FinancialQueryResponse,
     FinancialReportType,
     FinancialTable,
-    HistoryFrame,
+    HistoryBar,
+    HistoryDownloadResponse,
+    HistoryQueryResponse,
+    HistoryQuote,
+    HolderNumberRecord,
+    IncomeRecord,
+    PerShareIndexRecord,
     QuotePayload,
     TickQuote,
+    Top10FlowHolderRecord,
+    Top10HolderRecord,
     XtDataPeriod,
     validate_quote,
 )
@@ -75,7 +89,7 @@ class FakeGateway:
             self.active.pop(subscription_id, None)
 
     def get_full_tick(self, codes: Sequence[str]) -> dict[str, TickQuote]:
-        return {"000001.SZ": TickQuote.model_validate({"lastPrice": 10.5, "markets": list(codes)})}
+        return {"000001.SZ": TickQuote(lastPrice=10.5)}
 
     def download_history(
         self,
@@ -84,7 +98,7 @@ class FakeGateway:
         start_time: str,
         end_time: str,
         incrementally: bool,
-    ) -> None:
+    ) -> HistoryDownloadResponse:
         with self._lock:
             self.history_download = {
                 "stocks": list(stocks),
@@ -93,6 +107,7 @@ class FakeGateway:
                 "end_time": end_time,
                 "incrementally": incrementally,
             }
+        return HistoryDownloadResponse(completed=True)
 
     def get_history(
         self,
@@ -104,16 +119,18 @@ class FakeGateway:
         count: int,
         dividend_type: DividendType,
         fill_data: bool,
-    ) -> dict[str, HistoryFrame]:
+    ) -> HistoryQueryResponse:
         columns = list(fields) or ["close"]
-        return {
-            stock: HistoryFrame(
-                index=[20250101],
-                columns=columns,
-                data=[[10.0 for _ in columns]],
-            )
-            for stock in stocks
+        values: dict[str, object] = {
+            field: 10 if field in {"time", "volume", "suspendFlag"} else 10.0 for field in columns
         }
+        data: dict[str, list[HistoryQuote]] = {
+            stock: [HistoryBar.model_validate({"index": 20250101, **values})] for stock in stocks
+        }
+        return HistoryQueryResponse(
+            period=period,
+            data=data,
+        )
 
     def download_financial(
         self,
@@ -121,13 +138,14 @@ class FakeGateway:
         tables: Sequence[FinancialTable],
         start_time: str,
         end_time: str,
-    ) -> None:
+    ) -> FinancialDownloadResponse:
         self.financial_download = {
             "stocks": list(stocks),
             "tables": list(tables),
             "start_time": start_time,
             "end_time": end_time,
         }
+        return FinancialDownloadResponse(completed=True)
 
     def get_financial(
         self,
@@ -136,30 +154,52 @@ class FakeGateway:
         start_time: str,
         end_time: str,
         report_type: FinancialReportType,
-    ) -> dict[str, dict[FinancialTable, FinancialFrame]]:
+    ) -> FinancialQueryResponse:
         selected = list(tables) or ["Balance"]
-        return {
-            stock: {
-                table: FinancialFrame(
-                    index=[20241231],
-                    columns=["m_anntime", "m_timetag", "tot_assets"],
-                    data=[[20250331, 20241231, 100.0]],
-                )
-                for table in selected
-            }
-            for stock in stocks
+        models = {
+            "Balance": BalanceRecord,
+            "Income": IncomeRecord,
+            "CashFlow": CashFlowRecord,
+            "Capital": CapitalRecord,
+            "Holdernum": HolderNumberRecord,
+            "Top10holder": Top10HolderRecord,
+            "Top10flowholder": Top10FlowHolderRecord,
+            "Pershareindex": PerShareIndexRecord,
         }
+        data: dict[str, FinancialData] = {}
+        for stock in stocks:
+            rows: dict[str, object] = {}
+            for table in selected:
+                values: dict[str, object] = {"index": 0}
+                if table in {"Holdernum", "Top10holder", "Top10flowholder"}:
+                    values.update(declareDate="20250331", endDate="20241231")
+                else:
+                    values.update(m_anntime="20250331", m_timetag="20241231")
+                if table == "Balance":
+                    values["tot_assets"] = 100.0
+                rows[table] = [models[table](**values)]
+            data[stock] = FinancialData.model_validate(rows)
+        return FinancialQueryResponse(data=data)
 
     def get_dividend_factors(
         self,
         stocks: Sequence[str],
         start_time: str,
         end_time: str,
-    ) -> dict[str, list[DividendFactor]]:
-        return {
-            stock: [DividendFactor(event_time=1_717_200_000_000, interest=0.1, dr=0.99)]
-            for stock in stocks
-        }
+    ) -> DividendFactorsResponse:
+        return DividendFactorsResponse(
+            data={
+                stock: [
+                    DividendFactor(
+                        date="20240601",
+                        time=1_717_200_000_000.0,
+                        interest=0.1,
+                        dr=0.99,
+                    )
+                ]
+                for stock in stocks
+            }
+        )
 
     def push(self, subscription_id: int, data: dict[str, Any]) -> None:
         with self._lock:

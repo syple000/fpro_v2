@@ -16,7 +16,7 @@ from pydantic import (
 )
 
 from fpro_common import datetime_to_utc_us
-from qmt_protocol import (
+from qmt_protocol.base import (
     DividendType,
     FinancialReportType,
     FinancialTable,
@@ -126,18 +126,7 @@ class StockSubscriptionRequest(StockRequest):
     period: XtDataPeriod
 
 
-class SubscribedQuoteRequest(StrictRequestModel):
-    stocks: list[str] | None = None
-
-    @field_validator("stocks")
-    @classmethod
-    def validate_stocks(cls, values: list[str] | None) -> list[str] | None:
-        if values is None:
-            return None
-        return _unique_upper(values, _STOCK_PATTERN, "合约代码")
-
-
-class SequencedQuoteRequest(SubscribedQuoteRequest):
+class SequencedQuoteRequest(StrictRequestModel):
     seq: int = Field(ge=1)
     limit: int = Field(default=100, ge=1, le=1_000)
     wait_ms: int = Field(default=0, ge=0, le=30_000)

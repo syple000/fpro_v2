@@ -11,19 +11,6 @@ from fastapi.responses import JSONResponse
 from qmt_agent import __version__
 from qmt_agent.config import Settings
 from qmt_agent.gateway import MarketDataGateway, QmtGatewayError, XtDataGateway
-from qmt_agent.models import (
-    DividendFactorsQueryRequest,
-    FinancialDownloadRequest,
-    FinancialQueryRequest,
-    HistoryDownloadRequest,
-    HistoryQueryRequest,
-    MarketRequest,
-    MarketUnsubscribeRequest,
-    SequencedQuoteRequest,
-    StockRequest,
-    StockSubscriptionRequest,
-    SubscribedQuoteRequest,
-)
 from qmt_agent.quote_sequence import QuoteSequenceOutOfRangeError
 from qmt_agent.service import (
     QmtMarketService,
@@ -45,6 +32,18 @@ from qmt_protocol import (
     SnapshotResponse,
     StockSubscriptionResponse,
     SubscriptionStatus,
+)
+from qmt_protocol.requests import (
+    DividendFactorsQueryRequest,
+    FinancialDownloadRequest,
+    FinancialQueryRequest,
+    HistoryDownloadRequest,
+    HistoryQueryRequest,
+    MarketRequest,
+    MarketUnsubscribeRequest,
+    SequencedQuoteRequest,
+    StockRequest,
+    StockSubscriptionRequest,
 )
 
 
@@ -144,7 +143,7 @@ def create_app(
     @app.post(
         "/v1/snapshots/markets",
         summary="获取全市场快照截面",
-        response_model_exclude_none=True,
+        response_model_exclude_unset=True,
     )
     def market_snapshot(request: Request, body: MarketRequest | None = None) -> SnapshotResponse:
         markets = body.markets if body is not None else ["SH", "SZ"]
@@ -153,42 +152,37 @@ def create_app(
     @app.post(
         "/v1/snapshots/stocks",
         summary="按列表获取行情快照",
-        response_model_exclude_none=True,
+        response_model_exclude_unset=True,
     )
     def stock_snapshot(request: Request, body: StockRequest) -> SnapshotResponse:
         return service(request).get_stock_snapshot(body.stocks)
 
-    @app.post(
+    @app.post("/v1/quotes/subscribed/markets", include_in_schema=False)
+    @app.get(
         "/v1/quotes/subscribed/markets",
-        summary="获取全市场订阅的最新数据",
-        response_model_exclude_none=True,
+        summary="获取全市场订阅的完整最新值缓存",
+        response_model_exclude_unset=True,
     )
-    def market_quotes(
-        request: Request, body: SubscribedQuoteRequest | None = None
-    ) -> LatestQuotesResponse:
-        stocks = body.stocks if body is not None else None
-        return service(request).get_market_quotes(stocks)
+    def market_quotes(request: Request) -> LatestQuotesResponse:
+        return service(request).get_market_quotes()
 
-    @app.post(
+    @app.post("/v1/quotes/subscribed/stocks", include_in_schema=False)
+    @app.get(
         "/v1/quotes/subscribed/stocks",
-        summary="获取单股订阅的最新数据",
-        response_model_exclude_none=True,
+        summary="获取单股订阅的完整最新值缓存",
+        response_model_exclude_unset=True,
     )
-    def stock_quotes(
-        request: Request, body: SubscribedQuoteRequest | None = None
-    ) -> LatestQuotesResponse:
-        stocks = body.stocks if body is not None else None
-        return service(request).get_stock_quotes(stocks)
+    def stock_quotes(request: Request) -> LatestQuotesResponse:
+        return service(request).get_stock_quotes()
 
     @app.post(
         "/v1/quotes/subscribed/sequence",
         summary="按序获取订阅行情",
+        response_model_exclude_unset=True,
         response_model_exclude_none=True,
     )
     def sequenced_quotes(request: Request, body: SequencedQuoteRequest) -> QuoteSequenceResponse:
-        return service(request).get_subscribed_quote_sequence(
-            body.seq, body.limit, body.stocks, body.wait_ms
-        )
+        return service(request).get_subscribed_quote_sequence(body.seq, body.limit, body.wait_ms)
 
     @app.post("/v1/history/download", summary="按列表下载增量或全量历史数据")
     def download_history(request: Request, body: HistoryDownloadRequest) -> HistoryDownloadResponse:
@@ -200,9 +194,13 @@ def create_app(
             incrementally=body.mode == "incremental",
         )
 
-    @app.post("/v1/history/query", summary="按列表获取历史数据")
+    @app.post(
+        "/v1/history/query",
+        summary="按列表获取历史数据",
+        response_model_exclude_unset=True,
+    )
     def query_history(request: Request, body: HistoryQueryRequest) -> HistoryQueryResponse:
-        data = service(request).get_history(
+        return service(request).get_history(
             body.stocks,
             body.fields,
             body.period,
@@ -212,7 +210,6 @@ def create_app(
             body.dividend_type,
             body.fill_data,
         )
-        return HistoryQueryResponse(period=body.period, data=data)
 
     @app.post("/v1/financial/download", summary="按列表下载财务数据")
     def download_financial(
@@ -225,7 +222,11 @@ def create_app(
             body.end_time,
         )
 
-    @app.post("/v1/financial/query", summary="按列表获取财务数据")
+    @app.post(
+        "/v1/financial/query",
+        summary="按列表获取财务数据",
+        response_model_exclude_unset=True,
+    )
     def query_financial(request: Request, body: FinancialQueryRequest) -> FinancialQueryResponse:
         return service(request).get_financial(
             body.stocks,
@@ -235,7 +236,11 @@ def create_app(
             body.report_type,
         )
 
-    @app.post("/v1/dividend-factors/query", summary="按列表获取除权数据")
+    @app.post(
+        "/v1/dividend-factors/query",
+        summary="按列表获取除权数据",
+        response_model_exclude_unset=True,
+    )
     def query_dividend_factors(
         request: Request, body: DividendFactorsQueryRequest
     ) -> DividendFactorsResponse:

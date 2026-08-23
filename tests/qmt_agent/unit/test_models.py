@@ -5,7 +5,7 @@ from typing import Any
 import pytest
 from pydantic import BaseModel, ValidationError
 
-from qmt_agent.models import (
+from qmt_protocol.requests import (
     DividendFactorsQueryRequest,
     FinancialDownloadRequest,
     FinancialQueryRequest,
@@ -16,7 +16,6 @@ from qmt_agent.models import (
     SequencedQuoteRequest,
     StockRequest,
     StockSubscriptionRequest,
-    SubscribedQuoteRequest,
 )
 
 
@@ -30,7 +29,6 @@ from qmt_agent.models import (
             StockSubscriptionRequest,
             {"stocks": ["000001.SZ"], "period": "1m"},
         ),
-        (SubscribedQuoteRequest, {"stocks": ["000001.SZ"]}),
         (SequencedQuoteRequest, {"seq": 1, "limit": 100}),
         (HistoryDownloadRequest, {"stocks": ["000001.SZ"]}),
         (HistoryQueryRequest, {"stocks": ["000001.SZ"]}),

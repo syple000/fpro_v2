@@ -5,16 +5,17 @@ from pathlib import Path
 
 from data import DataCatalog
 from qmt_protocol import (
+    BalanceRecord,
     DividendFactor,
     DividendFactorsResponse,
     DividendType,
+    FinancialData,
     FinancialDownloadResponse,
-    FinancialFrame,
     FinancialQueryResponse,
     FinancialReportType,
     FinancialTable,
+    HistoryBar,
     HistoryDownloadResponse,
-    HistoryFrame,
     HistoryMode,
     HistoryQueryResponse,
     XtDataPeriod,
@@ -34,14 +35,7 @@ class FakeSyncClient:
         end_time: str = "",
         mode: HistoryMode = "incremental",
     ) -> HistoryDownloadResponse:
-        return HistoryDownloadResponse(
-            stocks=list(stocks),
-            period=period,
-            start_time=start_time,
-            end_time=end_time,
-            mode=mode,
-            completed=True,
-        )
+        return HistoryDownloadResponse(completed=True)
 
     def query_history(
         self,
@@ -59,11 +53,18 @@ class FakeSyncClient:
         return HistoryQueryResponse(
             period=period,
             data={
-                stocks[0]: HistoryFrame(
-                    index=[20240102],
-                    columns=["time", "open", "high", "low", "close", "volume", "amount"],
-                    data=[[1_704_153_600_000_000, close, close, close, close, 1000, 10000.0]],
-                )
+                stocks[0]: [
+                    HistoryBar(
+                        index=20240102,
+                        time=1_704_153_600_000,
+                        open=close,
+                        high=close,
+                        low=close,
+                        close=close,
+                        volume=1000,
+                        amount=10000.0,
+                    )
+                ]
             },
         )
 
@@ -74,13 +75,7 @@ class FakeSyncClient:
         start_time: str = "",
         end_time: str = "",
     ) -> FinancialDownloadResponse:
-        return FinancialDownloadResponse(
-            stocks=list(stocks),
-            tables=list(tables),
-            start_time=start_time,
-            end_time=end_time,
-            completed=True,
-        )
+        return FinancialDownloadResponse(completed=True)
 
     def query_financial(
         self,
@@ -91,15 +86,17 @@ class FakeSyncClient:
         report_type: FinancialReportType = "report_time",
     ) -> FinancialQueryResponse:
         return FinancialQueryResponse(
-            report_type=report_type,
             data={
-                stocks[0]: {
-                    "Balance": FinancialFrame(
-                        index=[20231231],
-                        columns=["m_anntime", "m_timetag", "tot_assets"],
-                        data=[[20240430, 20231231, 100.0]],
-                    )
-                }
+                stocks[0]: FinancialData(
+                    Balance=[
+                        BalanceRecord(
+                            index=0,
+                            m_anntime="20240430",
+                            m_timetag="20231231",
+                            tot_assets=100.0,
+                        )
+                    ]
+                )
             },
         )
 
@@ -113,7 +110,8 @@ class FakeSyncClient:
             data={
                 stocks[0]: [
                     DividendFactor(
-                        event_time=1_717_200_000_000,
+                        date="20240601",
+                        time=1_717_200_000_000.0,
                         interest=0.1,
                         stockBonus=0.2,
                         stockGift=0.3,

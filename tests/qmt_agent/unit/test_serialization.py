@@ -1,64 +1,32 @@
 from __future__ import annotations
 
 import math
-from datetime import UTC, datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone
 
 import numpy as np
 import pandas as pd
 import pytest
 
 from fpro_common import datetime_to_utc_us
-from qmt_agent.serialization import to_jsonable
+from qmt_agent.serialization import dataframe_records
 
 
-class Scalar:
-    def __init__(self, value: object) -> None:
-        self.value = value
-
-    def item(self) -> object:
-        return self.value
-
-
-class Array:
-    def __init__(self, values: list[object]) -> None:
-        self.values = values
-        self.dtype = None
-
-    def tolist(self) -> list[object]:
-        return self.values
-
-
-def test_scientific_values_are_json_safe() -> None:
-    result = to_jsonable(
-        {
-            "array": Array([Scalar(3), math.nan, math.inf]),
-            "bytes": b"ok",
-        }
-    )
-
-    assert result == {"array": [3, None, None], "bytes": "ok"}
-
-
-def test_numpy_and_dataframe_are_json_safe() -> None:
+def test_dataframe_becomes_concrete_rows_with_original_index() -> None:
     frame = pd.DataFrame(
-        [[np.float64(10.5), np.nan]],
-        index=pd.Index(["000001.SZ"]),
-        columns=pd.Index(["20250101", "20250102"]),
+        {
+            "close": [np.float64(10.5), np.nan],
+            "volume": [np.int64(1), np.int64(2)],
+        },
+        index=pd.Index([20250101, 20250102]),
     )
 
-    result = to_jsonable({"close": frame, "volume": np.array([1, 2])})
-
-    assert result == {
-        "close": {
-            "index": ["000001.SZ"],
-            "columns": ["20250101", "20250102"],
-            "data": [[10.5, None]],
-        },
-        "volume": [1, 2],
-    }
+    assert dataframe_records(frame) == [
+        {"index": 20250101, "close": 10.5, "volume": 1},
+        {"index": 20250102, "close": None, "volume": 2},
+    ]
 
 
-def test_datetime_boundary_is_normalised_to_microseconds_and_naive_is_rejected() -> None:
+def test_dataframe_supports_explicit_index_name_and_datetime_scalar() -> None:
     local_time = datetime(
         2026,
         8,
@@ -67,9 +35,35 @@ def test_datetime_boundary_is_normalised_to_microseconds_and_naive_is_rejected()
         30,
         tzinfo=timezone(timedelta(hours=8)),
     )
+    frame = pd.DataFrame({"time": [local_time]}, index=pd.Index(["20260818"]))
 
-    expected = datetime_to_utc_us(local_time)
-    assert to_jsonable(local_time) == expected
-    assert to_jsonable(local_time.astimezone(UTC)) == expected
-    with pytest.raises(ValueError, match="必须包含时区"):
-        to_jsonable(datetime(2026, 8, 18, 1, 30))
+    assert dataframe_records(frame, index_name="date") == [
+        {"date": "20260818", "time": datetime_to_utc_us(local_time)}
+    ]
+
+
+@pytest.mark.parametrize(
+    "value, message",
+    [
+        ({"index": [1]}, "期望 pandas DataFrame"),
+        (pd.DataFrame({"index": [1]}), "已包含保留字段"),
+        (pd.DataFrame([[1]], columns=pd.Index([1])), "列名必须全部是字符串"),
+        (
+            pd.DataFrame([[1, 2]], columns=pd.Index(["close", "close"])),
+            "列名不能重复",
+        ),
+        (pd.DataFrame({"close": [[1, 2]]}), "不支持的标量类型"),
+    ],
+)
+def test_dataframe_rejects_ambiguous_structures(value: object, message: str) -> None:
+    with pytest.raises((TypeError, ValueError), match=message):
+        dataframe_records(value)
+
+
+def test_non_finite_python_float_becomes_none() -> None:
+    frame = pd.DataFrame({"value": [math.inf, -math.inf, math.nan]})
+    assert dataframe_records(frame) == [
+        {"index": 0, "value": None},
+        {"index": 1, "value": None},
+        {"index": 2, "value": None},
+    ]

@@ -5,6 +5,7 @@ from threading import Lock
 from types import ModuleType
 from typing import Any, cast
 
+import pandas as pd
 import pytest
 
 from qmt_agent.gateway import (
@@ -13,7 +14,7 @@ from qmt_agent.gateway import (
     StockQuotePush,
     XtDataGateway,
 )
-from qmt_protocol import FinancialFrame, HistoryFrame
+from qmt_protocol import BalanceRecord, HistoryBar
 
 
 class FakeXtData:
@@ -21,26 +22,23 @@ class FakeXtData:
         self.arguments: dict[str, Any] = {}
         self.method: str | None = None
         self.history: dict[str, Any] = {
-            "000001.SZ": {
-                "index": [20250101],
-                "columns": ["close"],
-                "data": [[10.0]],
-            }
+            "000001.SZ": pd.DataFrame({"close": [10.0]}, index=pd.Index([20250101]))
         }
         self.financial: dict[str, Any] = {
             "000001.SZ": {
-                "Balance": {
-                    "index": [20241231],
-                    "columns": ["m_anntime", "m_timetag", "tot_assets"],
-                    "data": [[20250331, 20241231, 100.0]],
-                }
+                "Balance": pd.DataFrame(
+                    {
+                        "m_anntime": ["20250331"],
+                        "m_timetag": ["20241231"],
+                        "tot_assets": [100.0],
+                    }
+                )
             }
         }
-        self.dividend_factors: dict[str, Any] = {
-            "index": [1_717_200_000_000],
-            "columns": ["interest", "dr"],
-            "data": [[0.1, 0.99]],
-        }
+        self.dividend_factors: Any = pd.DataFrame(
+            {"time": [1_717_200_000_000.0], "interest": [0.1], "dr": [0.99]},
+            index=pd.Index(["20240601"]),
+        )
 
     def subscribe_whole_quote(self, **kwargs: Any) -> int:
         self.method = "subscribe_whole_quote"
@@ -127,19 +125,18 @@ def test_history_is_read_locally_without_implicit_subscription() -> None:
         True,
     )
 
-    assert result == {"000001.SZ": HistoryFrame(index=[20250101], columns=["close"], data=[[10.0]])}
+    assert result.data == {"000001.SZ": [HistoryBar(index=20250101, close=10.0)]}
     assert xtdata.arguments["stock_list"] == ["000001.SZ"]
     assert xtdata.arguments["field_list"] == ["close"]
 
 
-def test_history_time_column_is_normalised_to_microseconds() -> None:
+def test_history_time_column_is_forwarded_without_unit_conversion() -> None:
     xtdata = FakeXtData()
     xtdata.history = {
-        "000001.SZ": {
-            "index": [20250101],
-            "columns": ["time", "close"],
-            "data": [[1_735_689_600_000, 10.0]],
-        }
+        "000001.SZ": pd.DataFrame(
+            {"time": [1_735_689_600_000], "close": [10.0]},
+            index=pd.Index([20250101]),
+        )
     }
     gateway = make_gateway(xtdata)
 
@@ -154,7 +151,7 @@ def test_history_time_column_is_normalised_to_microseconds() -> None:
         True,
     )
 
-    assert result["000001.SZ"].data == [[1_735_689_600_000_000, 10.0]]
+    assert result.data["000001.SZ"][0].time == 1_735_689_600_000
 
 
 def test_market_subscription_uses_whole_quote() -> None:
@@ -183,7 +180,7 @@ def test_stock_subscription_uses_period_and_realtime_only_count() -> None:
     assert callable(xtdata.arguments["callback"])
 
 
-def test_gateway_validates_callback_and_preserves_unknown_quote_fields(
+def test_gateway_preserves_xtdata_scalar_types(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     xtdata = FakeXtData()
@@ -200,15 +197,28 @@ def test_gateway_validates_callback_and_preserves_unknown_quote_fields(
                 "time": 1786944183000,
                 "lastPrice": 9.06,
                 "amount": 341471100,
-                "vendorField": {"level": 1},
             }
         }
     )
 
     quote = received[0]["600000.SH"]
-    assert quote.amount == 341471100.0
-    assert quote.model_dump(exclude_none=True)["vendorField"] == {"level": 1}
-    assert "字段不会丢弃" in caplog.text
+    assert quote.amount == 341471100
+    assert quote.time == 1786944183000
+
+
+def test_gateway_rejects_undefined_quote_fields(caplog: pytest.LogCaptureFixture) -> None:
+    xtdata = FakeXtData()
+    gateway = make_gateway(xtdata)
+    received: list[MarketQuotePush] = []
+    caplog.set_level("DEBUG", logger="qmt_agent.gateway")
+
+    gateway.subscribe_market_quote("SH", received.append)
+    callback = xtdata.arguments["callback"]
+    assert callable(callback)
+    callback({"600000.SH": {"vendorField": 1}})
+
+    assert received == []
+    assert "原始数据" in caplog.text
 
 
 def test_gateway_logs_raw_callback_when_invalid_data_is_dropped(
@@ -225,7 +235,7 @@ def test_gateway_logs_raw_callback_when_invalid_data_is_dropped(
     callback({"600000.SH": {"volume": "not-an-int"}})
 
     assert received == []
-    assert "被丢弃的 XtData 全市场行情原始数据" in caplog.text
+    assert "原始数据" in caplog.text
 
 
 def test_unsubscribe_and_snapshot_use_official_parameter_names() -> None:
@@ -327,8 +337,15 @@ def test_financial_download_and_query_use_official_interfaces() -> None:
     result = gateway.get_financial(
         ["000001.SZ"], ["Balance"], "20240101", "20251231", "announce_time"
     )
-    assert isinstance(result["000001.SZ"]["Balance"], FinancialFrame)
-    assert result["000001.SZ"]["Balance"].data == [[20250331, 20241231, 100.0]]
+    balance = result.data["000001.SZ"].Balance
+    assert balance == [
+        BalanceRecord(
+            index=0,
+            m_anntime="20250331",
+            m_timetag="20241231",
+            tot_assets=100.0,
+        )
+    ]
     assert xtdata.method == "get_financial_data"
     assert xtdata.arguments["report_type"] == "announce_time"
 
@@ -339,10 +356,11 @@ def test_dividend_factor_query_reads_each_stock() -> None:
 
     result = gateway.get_dividend_factors(["000001.SZ"], "20240101", "20241231")
 
-    assert len(result["000001.SZ"]) == 1
-    assert result["000001.SZ"][0].event_time == 1_717_200_000_000_000
-    assert result["000001.SZ"][0].interest == 0.1
-    assert result["000001.SZ"][0].dr == 0.99
+    assert len(result.data["000001.SZ"]) == 1
+    assert result.data["000001.SZ"][0].date == "20240601"
+    assert result.data["000001.SZ"][0].time == 1_717_200_000_000.0
+    assert result.data["000001.SZ"][0].interest == 0.1
+    assert result.data["000001.SZ"][0].dr == 0.99
     assert xtdata.method == "get_divid_factors"
     assert xtdata.arguments == {
         "stock_code": "000001.SZ",

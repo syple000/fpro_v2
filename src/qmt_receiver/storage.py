@@ -18,9 +18,9 @@ from qmt_protocol import (
     BarQuote,
     DividendFactor,
     DividendType,
-    FinancialFrame,
-    FinancialTable,
-    HistoryFrame,
+    FinancialData,
+    HistoryBar,
+    HistoryQuote,
     QuoteEvent,
     SequencedQuote,
     TickQuote,
@@ -43,9 +43,12 @@ _DAILY_FIELDS = (
     "volume",
     "amount",
     "settelementPrice",
+    "settlementPrice",
     "openInterest",
     "preClose",
     "suspendFlag",
+    "dr",
+    "totaldr",
 )
 
 _ENVELOPE_FIELDS = (
@@ -56,7 +59,7 @@ _ENVELOPE_FIELDS = (
     pa.field("source", pa.string(), nullable=False),
     pa.field("subscription", pa.string(), nullable=False),
     pa.field("received_at", pa.int64(), nullable=False),
-    pa.field("event_time", pa.int64(), nullable=False),
+    pa.field("event_time", pa.int64()),
 )
 
 _TICK_QUOTE_FIELDS = (
@@ -103,9 +106,9 @@ _BAR_QUOTE_FIELDS = (
     pa.field("totaldr", pa.float64()),
 )
 
-# 行情主体保持与协议一致的嵌套结构；仅券商客户端的未知扩展字段进入 extra_json。
-_TICK_QUOTE_TYPE = pa.struct([*_TICK_QUOTE_FIELDS, pa.field("extra_json", pa.large_string())])
-_BAR_QUOTE_TYPE = pa.struct([*_BAR_QUOTE_FIELDS, pa.field("extra_json", pa.large_string())])
+# 行情主体与协议模型逐字段一致，不保留通用 JSON 扩展槽。
+_TICK_QUOTE_TYPE = pa.struct(_TICK_QUOTE_FIELDS)
+_BAR_QUOTE_TYPE = pa.struct(_BAR_QUOTE_FIELDS)
 TICK_SCHEMA = pa.schema([*_ENVELOPE_FIELDS, pa.field("quote", _TICK_QUOTE_TYPE, nullable=False)])
 BAR_SCHEMA = pa.schema([*_ENVELOPE_FIELDS, pa.field("quote", _BAR_QUOTE_TYPE, nullable=False)])
 
@@ -125,7 +128,8 @@ DAILY_SCHEMA = pa.schema(
         pa.field("openInterest", pa.float64()),
         pa.field("preClose", pa.float64()),
         pa.field("suspendFlag", pa.int64()),
-        pa.field("extra_json", pa.large_string()),
+        pa.field("dr", pa.float64()),
+        pa.field("totaldr", pa.float64()),
     ]
 )
 FINANCIAL_SCHEMA = pa.schema(
@@ -149,7 +153,6 @@ DIVIDEND_FACTOR_SCHEMA = pa.schema(
         pa.field("allotPrice", pa.float64()),
         pa.field("gugai", pa.float64()),
         pa.field("dr", pa.float64()),
-        pa.field("extra_json", pa.large_string()),
     ]
 )
 
@@ -217,8 +220,11 @@ class QmtDataStore:
         bar_rows: list[dict[str, Any]] = []
         events: list[QuoteEvent] = []
         for record in records:
-            event_time = record.event_time
-            trading_date = _trading_date(event_time, self._timezone)
+            event_time = normalise_unix_timestamp_us(record.quote.time)
+            trading_date = _trading_date(
+                event_time if event_time is not None else record.received_at,
+                self._timezone,
+            )
             common = _envelope_row(record, trading_date, event_time)
             if record.period == "tick":
                 if not isinstance(record.quote, TickQuote):
@@ -231,6 +237,7 @@ class QmtDataStore:
             events.append(
                 QuoteEvent(
                     trading_date=trading_date,
+                    event_time=event_time,
                     **record.model_dump(mode="python"),
                 )
             )
@@ -243,13 +250,17 @@ class QmtDataStore:
 
     def write_daily(
         self,
-        frames: Mapping[str, HistoryFrame],
+        data: Mapping[str, Sequence[HistoryQuote]],
         adjustment: DividendType,
     ) -> int:
         """写入一种复权方式的下载日线。"""
         rows: list[dict[str, object]] = []
-        for code, frame in frames.items():
-            for index, values in _frame_rows(frame):
+        for code, records in data.items():
+            for record in records:
+                if not isinstance(record, HistoryBar):
+                    raise TypeError("日线存储只接受 HistoryBar")
+                values = record.model_dump(mode="python", exclude_unset=True)
+                index = values.pop("index")
                 row = {
                     "trade_date": _date_value(index),
                     "code": code,
@@ -262,7 +273,6 @@ class QmtDataStore:
                         if field in {"time", "volume", "suspendFlag"}
                         else _number(value)
                     )
-                row["extra_json"] = _extra_fields_json(values, _DAILY_FIELDS)
                 rows.append(row)
         return self._write(
             DAILY_TABLE,
@@ -271,19 +281,28 @@ class QmtDataStore:
 
     def write_financial(
         self,
-        data: Mapping[str, Mapping[FinancialTable, FinancialFrame]],
+        data: Mapping[str, FinancialData],
     ) -> int:
         """写入下载财务数据。"""
         rows: list[dict[str, object]] = []
         for code, tables in data.items():
-            for table, frame in tables.items():
-                for index, values in _frame_rows(frame):
+            for table in FinancialData.model_fields:
+                records = getattr(tables, table)
+                if records is None:
+                    continue
+                for record in records:
+                    values = record.model_dump(mode="python", exclude_unset=True)
+                    index = values.pop("index")
                     rows.append(
                         {
-                            "report_date": _date_value(values.get("m_timetag", index)),
+                            "report_date": _date_value(
+                                values.get("m_timetag", values.get("endDate", index))
+                            ),
                             "code": code,
                             "dataset": table,
-                            "disclosure_date": _optional_date(values.get("m_anntime")),
+                            "disclosure_date": _optional_date(
+                                values.get("m_anntime", values.get("declareDate"))
+                            ),
                             "data_json": _json(values),
                         }
                     )
@@ -300,10 +319,13 @@ class QmtDataStore:
         rows: list[dict[str, object]] = []
         for code, factors in data.items():
             for factor in factors:
+                event_time = _xt_timestamp_us(factor.time)
+                if event_time is None:
+                    raise ValueError(f"{code} 除权数据包含无效 time: {factor.time!r}")
                 rows.append(
                     {
-                        "ex_date": _trading_date(factor.event_time, self._timezone),
-                        "event_time": factor.event_time,
+                        "ex_date": _date_value(factor.date),
+                        "event_time": event_time,
                         "code": code,
                         "interest": factor.interest,
                         "stockBonus": factor.stockBonus,
@@ -312,7 +334,6 @@ class QmtDataStore:
                         "allotPrice": factor.allotPrice,
                         "gugai": factor.gugai,
                         "dr": factor.dr,
-                        "extra_json": _json(factor.extra) if factor.extra else None,
                     }
                 )
         return self._write(
@@ -351,7 +372,7 @@ class QmtDataStore:
 def _envelope_row(
     record: SequencedQuote,
     trading_date: date,
-    event_time: int,
+    event_time: int | None,
 ) -> dict[str, Any]:
     return {
         "trading_date": trading_date,
@@ -372,34 +393,12 @@ def _quote_row(
 ) -> dict[str, Any]:
     row = dict(common)
     quote_data = quote.model_dump(mode="python", include=set(columns))
-    quote_data["extra_json"] = _quote_extra_json(quote)
     row["quote"] = quote_data
     return row
 
 
-def _quote_extra_json(quote: TickQuote | BarQuote) -> str | None:
-    if not quote.model_extra:
-        return None
-    return json.dumps(
-        quote.model_extra,
-        ensure_ascii=False,
-        allow_nan=False,
-        separators=(",", ":"),
-        sort_keys=True,
-    )
-
-
 def _trading_date(event_time: int, timezone: ZoneInfo) -> date:
     return utc_us_to_datetime(event_time).astimezone(timezone).date()
-
-
-def _frame_rows(
-    frame: HistoryFrame | FinancialFrame,
-) -> list[tuple[object, dict[str, object]]]:
-    return [
-        (index, dict(zip(frame.columns, row, strict=True)))
-        for index, row in zip(frame.index, frame.data, strict=True)
-    ]
 
 
 def _date_value(value: object) -> date:
@@ -437,6 +436,14 @@ def _integer(value: object) -> int | None:
     return None
 
 
+def _xt_timestamp_us(value: object) -> int | None:
+    if isinstance(value, float):
+        if not math.isfinite(value) or not value.is_integer():
+            return None
+        value = int(value)
+    return normalise_unix_timestamp_us(value)
+
+
 def _number(value: object) -> float | None:
     if value is None or isinstance(value, bool):
         return None
@@ -444,11 +451,6 @@ def _number(value: object) -> float | None:
         result = float(value)
         return result if math.isfinite(result) else None
     return None
-
-
-def _extra_fields_json(values: Mapping[str, object], fields: Sequence[str]) -> str | None:
-    extra = {name: value for name, value in values.items() if name not in fields}
-    return _json(extra) if extra else None
 
 
 def _json(value: object) -> str:

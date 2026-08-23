@@ -15,7 +15,6 @@ class QuoteSequenceClient(Protocol):
         self,
         seq: int,
         limit: int = 1_000,
-        stocks: Sequence[str] | None = None,
         wait_ms: int = 0,
     ) -> QuoteSequenceResponse: ...
 
@@ -34,10 +33,14 @@ class QuoteQueue(Protocol):
 
 @dataclass(frozen=True, slots=True)
 class ReceiveResult:
-    count: int
+    data: tuple[QuoteEvent, ...]
     next_seq: int
     probes: int = 0
     skipped: int = 0
+
+    @property
+    def count(self) -> int:
+        return len(self.data)
 
 
 class QmtReceiver:
@@ -69,8 +72,8 @@ class QmtReceiver:
     def next_seq(self) -> int:
         return self._next_seq
 
-    def receive(self, queue: QuoteQueue) -> ReceiveResult:
-        """读取、写入按日存储缓冲区并投递一批；调用节奏由 platform 决定。"""
+    def receive(self, queue: QuoteQueue | None = None) -> ReceiveResult:
+        """读取并落盘一批，直接返回事件；传入队列时同时逐条投递。"""
         requested_seq = self._next_seq
         probes = 0
         try:
@@ -81,21 +84,22 @@ class QmtReceiver:
             )
         except QuoteSequenceOutOfRange as error:
             if _is_caught_up(requested_seq, error):
-                return ReceiveResult(0, requested_seq)
+                return ReceiveResult((), requested_seq)
             payload, probes = self._probe_available_sequence(error)
             if payload is None:
-                return ReceiveResult(0, requested_seq, probes=probes)
+                return ReceiveResult((), requested_seq, probes=probes)
 
         records = payload.data
         next_seq = payload.next_seq
         events = self._store.append_quotes(records)
-        for event in events:
-            queue.put(event)
+        if queue is not None:
+            for event in events:
+                queue.put(event)
         self._next_seq = next_seq
 
         first_seq = records[0].seq if records else requested_seq
         return ReceiveResult(
-            count=len(records),
+            data=tuple(events),
             next_seq=next_seq,
             probes=probes,
             skipped=max(0, first_seq - requested_seq),

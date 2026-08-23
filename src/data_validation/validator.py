@@ -457,7 +457,7 @@ def compare_dividends(
     )
     qmt_rows = _fetch(
         connection,
-        "SELECT * EXCLUDE (extra_json) FROM qmt.dividend_factors "
+        "SELECT * FROM qmt.dividend_factors "
         f"WHERE {_stock_filter('code', stocks)} AND ex_date BETWEEN ? AND ?",
         [*stocks, start_date, end_date],
     )

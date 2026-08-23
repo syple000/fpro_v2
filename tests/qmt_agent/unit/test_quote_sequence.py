@@ -16,7 +16,7 @@ def append_values(buffer: QuoteSequenceBuffer, *values: int) -> None:
         [
             (
                 f"{value:06d}.SZ",
-                TickQuote.model_validate({"time": 1_735_689_600_000, "value": value}),
+                TickQuote(time=1_735_689_600_000, lastPrice=value),
             )
             for value in values
         ],
@@ -34,7 +34,7 @@ def test_buffer_assigns_contiguous_sequences_and_reads_only_requested_window() -
     result = buffer.read(2, 2)
 
     assert [item.seq for item in result.data] == [2, 3]
-    assert [item.quote.model_dump()["value"] for item in result.data] == [2, 3]
+    assert [item.quote.model_dump()["lastPrice"] for item in result.data] == [2, 3]
     assert result.next_seq == 4
     assert buffer.status().model_dump() == {
         "oldest_seq": 1,
@@ -64,13 +64,13 @@ def test_buffer_overwrites_only_oldest_records_and_reports_boundaries() -> None:
     assert (too_new.value.oldest_seq, too_new.value.latest_seq) == (3, 5)
 
 
-def test_stock_filter_does_not_change_sequence_window_progress() -> None:
+def test_sequence_returns_the_complete_window_without_filtering() -> None:
     buffer = QuoteSequenceBuffer(capacity=5)
     append_values(buffer, 1, 2, 3)
 
-    result = buffer.read(1, 2, ["000002.SZ"])
+    result = buffer.read(1, 2)
 
-    assert [item.seq for item in result.data] == [2]
+    assert [item.seq for item in result.data] == [1, 2]
     assert result.next_seq == 3
 
 

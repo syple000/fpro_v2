@@ -8,10 +8,11 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from qmt_protocol import (
+    BalanceRecord,
     BarQuote,
     DividendFactor,
-    FinancialFrame,
-    HistoryFrame,
+    FinancialData,
+    HistoryBar,
     SequencedQuote,
     TickQuote,
     XtDataPeriod,
@@ -38,8 +39,8 @@ def test_parquet_quote_columns_cover_protocol_models() -> None:
     bar_quote_type = BAR_SCHEMA.field("quote").type
     assert isinstance(tick_quote_type, pa.StructType)
     assert isinstance(bar_quote_type, pa.StructType)
-    assert tick_quote_type.names[:-1] == list(TickQuote.model_fields)
-    assert bar_quote_type.names[:-1] == list(BarQuote.model_fields)
+    assert tick_quote_type.names == list(TickQuote.model_fields)
+    assert bar_quote_type.names == list(BarQuote.model_fields)
 
 
 def test_store_separates_tick_and_bar_with_fixed_schemas(tmp_path: Path) -> None:
@@ -72,7 +73,6 @@ def test_store_separates_tick_and_bar_with_fixed_schemas(tmp_path: Path) -> None
                         "time": quote_time,
                         "lastPrice": 10.5,
                         "askPrice": [10.6, 10.7],
-                        "vendorFlag": "tick-extension",
                     }
                 ),
             ),
@@ -89,7 +89,6 @@ def test_store_separates_tick_and_bar_with_fixed_schemas(tmp_path: Path) -> None
                         "open": 10.1,
                         "close": 10.5,
                         "volume": 123,
-                        "vendorFlag": "bar-extension",
                     }
                 ),
             ),
@@ -108,12 +107,11 @@ def test_store_separates_tick_and_bar_with_fixed_schemas(tmp_path: Path) -> None
     assert tick_row["period"] == "tick"
     assert TICK_SCHEMA.field("received_at").type == pa.int64()
     assert TICK_SCHEMA.field("event_time").type == pa.int64()
-    assert not TICK_SCHEMA.field("event_time").nullable
+    assert TICK_SCHEMA.field("event_time").nullable
     assert tick_row["received_at"] == received_at
     assert tick_row["event_time"] == quote_time * 1_000
     assert tick_row["quote"]["lastPrice"] == 10.5
     assert tick_row["quote"]["askPrice"] == [10.6, 10.7]
-    assert json.loads(tick_row["quote"]["extra_json"]) == {"vendorFlag": "tick-extension"}
     assert "close" not in TICK_SCHEMA.field("quote").type.names
     assert "quote_json" not in tick_table.column_names
 
@@ -123,12 +121,11 @@ def test_store_separates_tick_and_bar_with_fixed_schemas(tmp_path: Path) -> None
     assert bar_row["period"] == "1m"
     assert BAR_SCHEMA.field("received_at").type == pa.int64()
     assert BAR_SCHEMA.field("event_time").type == pa.int64()
-    assert not BAR_SCHEMA.field("event_time").nullable
+    assert BAR_SCHEMA.field("event_time").nullable
     assert bar_row["event_time"] == quote_time * 1_000
     assert bar_row["quote"]["open"] == 10.1
     assert bar_row["quote"]["close"] == 10.5
     assert bar_row["quote"]["volume"] == 123
-    assert json.loads(bar_row["quote"]["extra_json"]) == {"vendorFlag": "bar-extension"}
     assert "lastPrice" not in BAR_SCHEMA.field("quote").type.names
     assert "quote_json" not in bar_table.column_names
 
@@ -165,8 +162,8 @@ def test_store_only_creates_manifest_for_received_quote_kind(tmp_path: Path) -> 
 
 
 def test_download_write_immediately_deduplicates_partition(tmp_path: Path) -> None:
-    first = HistoryFrame(index=[20240102], columns=["close"], data=[[10.0]])
-    latest = HistoryFrame(index=[20240102], columns=["close"], data=[[11.0]])
+    first = [HistoryBar(index=20240102, close=10.0)]
+    latest = [HistoryBar(index=20240102, close=11.0)]
 
     with QmtDataStore(tmp_path) as store:
         store.write_daily({"000001.SZ": first}, "none")
@@ -178,19 +175,29 @@ def test_download_write_immediately_deduplicates_partition(tmp_path: Path) -> No
 
 
 def test_financial_disclosure_date_is_an_attribute_not_a_key(tmp_path: Path) -> None:
-    first = FinancialFrame(
-        index=[20231231],
-        columns=["m_anntime", "m_timetag", "tot_assets"],
-        data=[[20240401, 20231231, 100.0]],
+    first = FinancialData(
+        Balance=[
+            BalanceRecord(
+                index=0,
+                m_anntime="20240401",
+                m_timetag="20231231",
+                tot_assets=100.0,
+            )
+        ]
     )
-    latest = FinancialFrame(
-        index=[20231231],
-        columns=["m_anntime", "m_timetag", "tot_assets"],
-        data=[[20240430, 20231231, 110.0]],
+    latest = FinancialData(
+        Balance=[
+            BalanceRecord(
+                index=0,
+                m_anntime="20240430",
+                m_timetag="20231231",
+                tot_assets=110.0,
+            )
+        ]
     )
     with QmtDataStore(tmp_path) as store:
-        store.write_financial({"000001.SZ": {"Balance": latest}})
-        store.write_financial({"000001.SZ": {"Balance": first}})
+        store.write_financial({"000001.SZ": latest})
+        store.write_financial({"000001.SZ": first})
 
     table = _read_only_table(tmp_path / FINANCIAL_TABLE)
     assert table.num_rows == 1
@@ -208,7 +215,8 @@ def test_dividend_timestamp_uses_china_calendar_date(tmp_path: Path) -> None:
             {
                 "000001.SZ": [
                     DividendFactor(
-                        event_time=1_689_868_800_000,
+                        date="20230721",
+                        time=1_689_868_800_000.0,
                         interest=0.32,
                         dr=1.04507,
                     )

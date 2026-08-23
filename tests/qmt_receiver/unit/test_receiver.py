@@ -35,7 +35,6 @@ class FakeClient:
         self,
         seq: int,
         limit: int = 1_000,
-        stocks: Sequence[str] | None = None,
         wait_ms: int = 0,
     ) -> QuoteSequenceResponse:
         self.requested.append((seq, limit, wait_ms))
@@ -55,6 +54,7 @@ class FakeStore:
         return [
             QuoteEvent(
                 trading_date=date(2026, 8, 16),
+                event_time=record.quote.time,
                 **record.model_dump(mode="python"),
             )
             for record in records
@@ -111,6 +111,7 @@ def test_receive_writes_and_publishes_one_batch() -> None:
 
     assert result.count == 2
     assert result.next_seq == 3
+    assert [event.seq for event in result.data] == [1, 2]
     assert store.records == records
     assert store.compactions == 1
     assert [queue.get_nowait().seq, queue.get_nowait().seq] == [1, 2]

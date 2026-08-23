@@ -85,7 +85,6 @@ class QuoteSequenceBuffer:
         self,
         seq: int,
         limit: int,
-        stocks: Iterable[str] | None = None,
         wait_ms: int = 0,
     ) -> QuoteSequenceResponse:
         """读取连续序号窗口；可等待下一个序号到达。"""
@@ -94,7 +93,6 @@ class QuoteSequenceBuffer:
         if wait_ms < 0:
             raise ValueError("行情顺序等待时间不能小于 0")
 
-        requested_stocks = None if stocks is None else set(stocks)
         deadline = monotonic() + wait_ms / 1000
         with self._changed:
             while wait_ms and seq == self._next_seq:
@@ -123,8 +121,7 @@ class QuoteSequenceBuffer:
                 # 在锁内且序号已通过范围校验，因此对应槽位一定是当前记录。
                 if record is None or record.seq != current_seq:
                     raise RuntimeError("行情顺序缓存内部状态不一致")
-                if requested_stocks is None or record.code in requested_stocks:
-                    records.append(record)
+                records.append(record)
 
         return QuoteSequenceResponse(
             data=records,

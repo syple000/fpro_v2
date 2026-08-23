@@ -130,22 +130,19 @@ class QmtAgentClient:
             json={"stocks": list(stocks)},
         )
 
-    def market_quotes(self, stocks: Sequence[str] | None = None) -> LatestQuotesResponse:
-        return self._optional_stocks_request("/v1/quotes/subscribed/markets", stocks)
+    def market_quotes(self) -> LatestQuotesResponse:
+        return self._request("GET", "/v1/quotes/subscribed/markets", LatestQuotesResponse)
 
-    def stock_quotes(self, stocks: Sequence[str] | None = None) -> LatestQuotesResponse:
-        return self._optional_stocks_request("/v1/quotes/subscribed/stocks", stocks)
+    def stock_quotes(self) -> LatestQuotesResponse:
+        return self._request("GET", "/v1/quotes/subscribed/stocks", LatestQuotesResponse)
 
     def quote_sequence(
         self,
         seq: int,
         limit: int = 1_000,
-        stocks: Sequence[str] | None = None,
         wait_ms: int = 0,
     ) -> QuoteSequenceResponse:
         body: dict[str, object] = {"seq": seq, "limit": limit, "wait_ms": wait_ms}
-        if stocks is not None:
-            body["stocks"] = list(stocks)
         response = self._send("POST", "/v1/quotes/subscribed/sequence", json=body)
         if response.status_code == 416:
             raise QuoteSequenceOutOfRange(_decode_response(response, QuoteSequenceErrorResponse))
@@ -265,12 +262,6 @@ class QmtAgentClient:
 
     def __exit__(self, *_: object) -> None:
         self.close()
-
-    def _optional_stocks_request(
-        self, path: str, stocks: Sequence[str] | None
-    ) -> LatestQuotesResponse:
-        body = None if stocks is None else {"stocks": list(stocks)}
-        return self._request("POST", path, LatestQuotesResponse, json=body)
 
     def _request(
         self,

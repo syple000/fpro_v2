@@ -1,4 +1,4 @@
-"""QMT HTTP 返回结构。业务数据结构定义在 :mod:`qmt_protocol.base`。"""
+"""qmt-agent 的 HTTP 返回结构。"""
 
 from __future__ import annotations
 
@@ -8,16 +8,14 @@ from pydantic import Field, model_validator
 
 from qmt_protocol.base import (
     DividendFactor,
-    FinancialFrame,
-    FinancialReportType,
-    FinancialTable,
-    HistoryFrame,
-    HistoryMode,
+    FinancialData,
+    HistoryBar,
+    HistoryQuote,
+    HistoryTick,
     ProtocolModel,
     QuotePayload,
     SequencedQuote,
     TickQuote,
-    UtcTimestampUs,
     XtDataPeriod,
     validate_quote,
 )
@@ -34,14 +32,14 @@ class QuoteSequenceStatus(ProtocolModel):
     def validate_bounds(self) -> QuoteSequenceStatus:
         if self.size == 0:
             if self.oldest_seq is not None or self.latest_seq is not None:
-                raise ValueError("空行情缓存不能包含最旧或最新序号")
+                raise ValueError("空缓存不能包含序号边界")
             return self
         if self.oldest_seq is None or self.latest_seq is None:
-            raise ValueError("非空行情缓存必须包含最旧和最新序号")
+            raise ValueError("非空缓存必须包含序号边界")
         if self.oldest_seq > self.latest_seq or self.latest_seq + 1 != self.next_seq:
-            raise ValueError("行情缓存序号边界不一致")
+            raise ValueError("缓存序号边界不一致")
         if self.latest_seq - self.oldest_seq + 1 != self.size:
-            raise ValueError("行情缓存大小与序号边界不一致")
+            raise ValueError("缓存大小与序号边界不一致")
         return self
 
 
@@ -98,16 +96,16 @@ class SnapshotResponse(ProtocolModel):
     @model_validator(mode="after")
     def validate_count(self) -> SnapshotResponse:
         if self.count != len(self.data):
-            raise ValueError("快照 count 与 data 数量不一致")
+            raise ValueError("count 与 data 数量不一致")
         return self
 
 
 class LatestQuotesResponse(ProtocolModel):
+    """某类订阅的完整最新值缓存；不接受代码筛选。"""
+
     data: dict[str, QuotePayload]
-    updated_at: dict[str, UtcTimestampUs]
     periods: dict[str, XtDataPeriod]
-    missing: list[str]
-    not_subscribed: list[str]
+    updated_at: dict[str, int]
 
     @model_validator(mode="before")
     @classmethod
@@ -118,19 +116,19 @@ class LatestQuotesResponse(ProtocolModel):
         periods = value.get("periods")
         if not isinstance(data, dict) or not isinstance(periods, dict):
             return value
+        if set(data) != set(periods):
+            raise ValueError("data 与 periods 的代码范围必须一致")
         converted = dict(value)
         converted["data"] = {
-            code: validate_quote(periods[code], quote)
-            for code, quote in data.items()
-            if code in periods
+            code: validate_quote(periods[code], quote) for code, quote in data.items()
         }
         return converted
 
     @model_validator(mode="after")
     def validate_keys(self) -> LatestQuotesResponse:
         keys = set(self.data)
-        if set(self.updated_at) != keys or set(self.periods) != keys:
-            raise ValueError("data、updated_at 和 periods 的代码范围必须一致")
+        if set(self.periods) != keys or set(self.updated_at) != keys:
+            raise ValueError("data、periods 与 updated_at 的代码范围必须一致")
         return self
 
 
@@ -145,46 +143,53 @@ class QuoteSequenceResponse(ProtocolModel):
     @model_validator(mode="after")
     def validate_window(self) -> QuoteSequenceResponse:
         if self.count != len(self.data):
-            raise ValueError("顺序行情 count 与 data 数量不一致")
+            raise ValueError("count 与 data 数量不一致")
         if self.next_seq < self.requested_seq:
-            raise ValueError("顺序行情 next_seq 不能早于 requested_seq")
+            raise ValueError("next_seq 不能早于 requested_seq")
         if self.next_seq == self.requested_seq and self.count:
-            raise ValueError("未推进的顺序行情必须是空批次")
+            raise ValueError("未推进的窗口必须为空")
         if (self.oldest_seq is None) != (self.latest_seq is None):
-            raise ValueError("顺序行情边界不一致")
+            raise ValueError("序号边界不一致")
         if (
             self.oldest_seq is not None
             and self.latest_seq is not None
             and self.oldest_seq > self.latest_seq
         ):
-            raise ValueError("顺序行情边界不一致")
+            raise ValueError("序号边界不一致")
         return self
 
 
 class HistoryQueryResponse(ProtocolModel):
     period: XtDataPeriod
-    data: dict[str, HistoryFrame]
+    data: dict[str, list[HistoryQuote]]
+
+    @model_validator(mode="before")
+    @classmethod
+    def select_history_model(cls, value: object) -> object:
+        if not isinstance(value, dict):
+            return value
+        period = value.get("period")
+        data = value.get("data")
+        if not isinstance(period, str) or not isinstance(data, dict):
+            return value
+        model = HistoryTick if period == "tick" else HistoryBar
+        converted = dict(value)
+        converted["data"] = {
+            code: [row if isinstance(row, model) else model.model_validate(row) for row in rows]
+            for code, rows in data.items()
+        }
+        return converted
 
 
 class HistoryDownloadResponse(ProtocolModel):
-    stocks: list[str]
-    period: XtDataPeriod
-    start_time: str
-    end_time: str
-    mode: HistoryMode
     completed: bool
 
 
 class FinancialQueryResponse(ProtocolModel):
-    report_type: FinancialReportType
-    data: dict[str, dict[FinancialTable, FinancialFrame]]
+    data: dict[str, FinancialData]
 
 
 class FinancialDownloadResponse(ProtocolModel):
-    stocks: list[str]
-    tables: list[FinancialTable]
-    start_time: str
-    end_time: str
     completed: bool
 
 
