@@ -39,9 +39,7 @@ class TushareDataStore:
                     partition_by=TABLE_PARTITION_BY[table_name],
                     sort_by=TABLE_SORT_BY[table_name],
                     primary_key=TABLE_PRIMARY_KEY[table_name],
-                    deduplicate_prefer_by=(
-                        TABLE_DEDUPLICATE_PREFER_BY[table_name] or None
-                    ),
+                    deduplicate_prefer_by=(TABLE_DEDUPLICATE_PREFER_BY[table_name] or None),
                 )
             )
 
