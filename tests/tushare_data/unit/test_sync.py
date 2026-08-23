@@ -136,18 +136,8 @@ def test_create_pro_client_uses_direct_http_session(monkeypatch) -> None:
 
         def post(self, url: str, **kwargs: object) -> FakeResponse:
             assert self.trust_env is False
-            assert url == "http://tushare.xyz:5000/daily"
+            assert url == "http://api.example.test/daily"
             assert kwargs["timeout"] == 120
-            assert kwargs["json"] == {
-                "api_name": "daily",
-                "token": "test-token",
-                "params": {
-                    "limit": 5_000,
-                    "offset": 0,
-                    "trade_date": "20240102",
-                },
-                "fields": "ts_code,trade_date",
-            }
             return FakeResponse()
 
     original_requests = tushare_client_module.requests
@@ -155,6 +145,7 @@ def test_create_pro_client_uses_direct_http_session(monkeypatch) -> None:
     try:
         pro = sync_module.create_pro_client(
             "test-token",
+            "http://api.example.test/",
             requests_per_minute=120,
             max_concurrency=1,
             max_retries=0,

@@ -36,7 +36,7 @@ tushare-data = [
     "pandas>=2.2,<3.0",
     "pyarrow>=18.0,<24.0",
     "requests>=2.32,<3.0",
-    "tushare @ https://run.quicksync.cn/whl/tushare-1.4.24+instruct-py3-none-any.whl",
+    "tushare>=1.4,<2.0",
     "tzdata>=2025.2",
 ]
 dev = [

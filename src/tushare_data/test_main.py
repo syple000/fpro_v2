@@ -11,6 +11,7 @@ from zoneinfo import ZoneInfo
 
 from fpro_common import configure_beijing_logging
 from tushare_data import (
+    DEFAULT_API_URL,
     DEFAULT_MAX_CONCURRENCY,
     DEFAULT_REQUESTS_PER_MINUTE,
     TABLE_SCHEMAS,
@@ -25,6 +26,7 @@ logger = logging.getLogger("tushare_data.test_main")
 
 def run(
     token: str,
+    api_url: str,
     data_dir: Path,
     mode: str,
     start_date: str,
@@ -36,6 +38,7 @@ def run(
     """按命令行选择完整区间同步或自动滚动增量同步。"""
     pro = create_pro_client(
         token,
+        api_url,
         requests_per_minute=requests_per_minute,
         max_concurrency=max_concurrency,
     )
@@ -58,6 +61,7 @@ def main() -> None:
     today = datetime.now(UTC).astimezone(ZoneInfo("Asia/Shanghai")).date()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--token", default=os.environ.get("TUSHARE_TOKEN"))
+    parser.add_argument("--api-url", default=DEFAULT_API_URL)
     parser.add_argument("--data-dir", type=Path, default=Path("data/tushare"))
     parser.add_argument(
         "--mode",
@@ -88,6 +92,7 @@ def main() -> None:
     configure_beijing_logging(logging.INFO)
     run(
         args.token,
+        args.api_url,
         args.data_dir,
         args.mode,
         args.start_date,
