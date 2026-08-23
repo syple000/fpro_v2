@@ -89,7 +89,7 @@ def sync_daily(
     start_time: str,
     end_time: str,
 ) -> int:
-    """同步前复权和不复权日线。"""
+    """同步等比前复权和不复权日线。"""
     client.download_history(
         stocks,
         period="1d",
@@ -98,7 +98,7 @@ def sync_daily(
         mode="full",
     )
     rows = 0
-    for adjustment in ("none", "front"):
+    for adjustment in ("none", "front_ratio"):
         response = client.query_history(
             stocks,
             fields=_DAILY_FIELDS,

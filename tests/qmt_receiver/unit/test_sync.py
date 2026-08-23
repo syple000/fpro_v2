@@ -142,8 +142,8 @@ def test_sync_all_downloads_and_writes_all_sources(tmp_path: Path) -> None:
     assert result.daily_rows == 2
     assert result.financial_rows == 1
     assert result.dividend_factor_rows == 1
-    assert client.adjustments == ["none", "front"]
-    assert daily == [("front", 8.0), ("none", 10.0)]
+    assert client.adjustments == ["none", "front_ratio"]
+    assert daily == [("front_ratio", 8.0), ("none", 10.0)]
     assert financial is not None
     assert dividend is not None
     assert financial[:2] == ("000001.SZ", "Balance")

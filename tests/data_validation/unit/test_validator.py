@@ -12,7 +12,15 @@ from data_validation import (
     compare_financial,
     sample_stocks,
 )
-from qmt_protocol import DividendFactor, FinancialData, HistoryBar, IncomeRecord
+from qmt_protocol import (
+    BalanceRecord,
+    CashFlowRecord,
+    DividendFactor,
+    FinancialData,
+    HistoryBar,
+    IncomeRecord,
+    PerShareIndexRecord,
+)
 from qmt_receiver import QmtDataStore
 from tushare_data import TABLE_SCHEMAS, TushareDataStore
 
@@ -39,7 +47,7 @@ def test_sampled_qmt_data_matches_tushare(tmp_path: Path) -> None:
                     "high": 11.0,
                     "low": 9.0,
                     "close": 10.5,
-                    "vol": 10.0,
+                    "vol": 10.49,
                     "amount": 100.0,
                 },
             ),
@@ -106,13 +114,13 @@ def test_sampled_qmt_data_matches_tushare(tmp_path: Path) -> None:
             high=11.0,
             low=9.0,
             close=10.5,
-            volume=1000,
+            volume=10,
             amount=100000.0,
         )
     ]
     with QmtDataStore(qmt_root) as store:
         store.write_daily({"000001.SZ": daily}, "none")
-        store.write_daily({"000001.SZ": daily}, "front")
+        store.write_daily({"000001.SZ": daily}, "front_ratio")
         store.write_financial(
             {
                 "000001.SZ": FinancialData(
@@ -171,3 +179,110 @@ def test_sampled_qmt_data_matches_tushare(tmp_path: Path) -> None:
     assert financial_result.compared == 2
     assert dividend_result.passed
     assert dividend_result.compared == 4
+
+
+def test_financial_comparison_normalises_vendor_aliases_and_precision(tmp_path: Path) -> None:
+    tushare_root = tmp_path / "tushare"
+    qmt_root = tmp_path / "qmt"
+    report_day = date(2025, 9, 30)
+    common = {
+        "ts_code": "000001.SZ",
+        "ann_date": date(2025, 10, 31),
+        "end_date": report_day,
+        "update_flag": "1",
+    }
+    with TushareDataStore(tushare_root) as store:
+        store.write(
+            "balancesheet",
+            _table(
+                "balancesheet",
+                {
+                    **common,
+                    "f_ann_date": date(2025, 10, 31),
+                    "report_type": "1",
+                    "comp_type": "1",
+                    "int_receiv": 0.0,
+                    "contract_liab": 10.0,
+                    "fix_assets_total": 20.0,
+                    "cip_total": 30.0,
+                    "oth_rcv_total": 40.0,
+                    "oth_pay_total": 50.0,
+                },
+            ),
+        )
+        store.write(
+            "cashflow",
+            _table(
+                "cashflow",
+                {
+                    **common,
+                    "f_ann_date": date(2025, 10, 31),
+                    "report_type": "1",
+                    "comp_type": "1",
+                    "c_paid_invest": 60.0,
+                },
+            ),
+        )
+        store.write(
+            "fina_indicator",
+            _table(
+                "fina_indicator",
+                {
+                    **common,
+                    "eps": 0.0844,
+                    "dt_eps": 0.0844,
+                    "bps": 0.842,
+                },
+            ),
+        )
+
+    with QmtDataStore(qmt_root) as store:
+        store.write_financial(
+            {
+                "000001.SZ": FinancialData(
+                    Balance=[
+                        BalanceRecord(
+                            index=0,
+                            m_anntime="20251031",
+                            m_timetag="20250930",
+                            int_rcv=None,
+                            advance_peceipts=10.0,
+                            fix_assets=20.0,
+                            constru_in_process=30.0,
+                            other_receivable=40.0,
+                            other_payable=50.0,
+                        )
+                    ],
+                    CashFlow=[
+                        CashFlowRecord(
+                            index=0,
+                            m_anntime="20251031",
+                            m_timetag="20250930",
+                            cash_paid_for_investments=60.0,
+                            cash_paid_invest=None,
+                            other_cash_pay_ral_inv_act=0.0,
+                        )
+                    ],
+                    Pershareindex=[
+                        PerShareIndexRecord(
+                            index=0,
+                            m_anntime="20251031",
+                            m_timetag="20250930",
+                            s_fa_eps_basic=0.08,
+                            s_fa_eps_diluted=0.08,
+                            s_fa_bps=0.842,
+                        )
+                    ],
+                )
+            }
+        )
+
+    with DataCatalog(tushare_root=tushare_root, qmt_root=qmt_root) as catalog:
+        result = compare_financial(
+            catalog.connection,
+            ["000001.SZ"],
+            report_day,
+            report_day,
+        )
+
+    assert result.passed

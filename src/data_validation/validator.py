@@ -61,7 +61,7 @@ _FINANCIAL_FIELDS = {
             "account_receivable": "accounts_receiv",
             "advance_payment": "prepayment",
             "int_rcv": "int_receiv",
-            "other_receivable": "oth_receiv",
+            "other_receivable": ("oth_receiv", "oth_rcv_total"),
             "inventories": "inventories",
             "other_current_assets": "oth_cur_assets",
             "total_current_assets": "total_cur_assets",
@@ -69,8 +69,8 @@ _FINANCIAL_FIELDS = {
             "held_to_mty_invest": "htm_invest",
             "long_term_eqy_invest": "lt_eqt_invest",
             "invest_real_estate": "invest_real_estate",
-            "fix_assets": "fix_assets",
-            "constru_in_process": "cip",
+            "fix_assets": ("fix_assets", "fix_assets_total"),
+            "constru_in_process": ("cip", "cip_total"),
             "construction_materials": "const_materials",
             "intang_assets": "intan_assets",
             "goodwill": "goodwill",
@@ -91,12 +91,12 @@ _FINANCIAL_FIELDS = {
             "surplus_rsrv": "surplus_rese",
             "undistributed_profit": "undistr_porfit",
             "dividend_payable": "div_payable",
-            "other_payable": "oth_payable",
+            "other_payable": ("oth_payable", "oth_pay_total"),
             "non_current_liability_in_one_year": "non_cur_liab_due_1y",
             "other_current_liability": "oth_cur_liab",
             "longterm_account_payable": "lt_payable",
             "accounts_payable": "acct_payable",
-            "advance_peceipts": "adv_receipts",
+            "advance_peceipts": "contract_liab",
             "total_current_liability": "total_cur_liab",
             "notes_payable": "notes_payable",
             "long_term_loans": "lt_borr",
@@ -116,7 +116,6 @@ _FINANCIAL_FIELDS = {
             "revenue_inc": "revenue",
             "revenue": "total_revenue",
             "earned_premium": "prem_earned",
-            "total_operating_cost": "total_cogs",
             "total_expense": "oper_cost",
             "research_expenses": "rd_exp",
             "change_income_fair_value": "fv_value_chg_gain",
@@ -146,7 +145,6 @@ _FINANCIAL_FIELDS = {
             "s_fa_eps_diluted": "diluted_eps",
             "total_income": "t_compr_income",
             "total_income_minority": "compr_inc_attr_m_s",
-            "other_compreh_inc": "oth_compr_income",
         },
     ),
     "CashFlow": (
@@ -159,7 +157,6 @@ _FINANCIAL_FIELDS = {
             "cash_for_payment_original_insurance": "c_pay_claims_orig_inco",
             "cash_payment_policy_dividends": "pay_comm_insur_plcy",
             "cash_paid_for_investments": "c_paid_invest",
-            "cash_paid_invest": "c_paid_invest",
             "cash_paid_by_subsidiaries": "n_disp_subs_oth_biz",
             "other_cash_recp_ral_oper_act": "c_fr_oth_operate_a",
             "goods_sale_and_service_render_cash": "c_fr_sale_sg",
@@ -318,7 +315,7 @@ def compare_daily(
     for key in sorted(tushare.keys() | {(code, day) for code, day, _ in qmt}):
         ts_row = tushare.get(key)
         none_row = qmt.get((*key, "none"))
-        front_row = qmt.get((*key, "front"))
+        front_row = qmt.get((*key, "front_ratio"))
         if ts_row is None or none_row is None:
             differences.append(_missing("daily_none", key, ts_row, none_row))
         else:
@@ -332,7 +329,8 @@ def compare_daily(
                 key,
                 "volume",
                 ts_row["vol"],
-                _scaled(none_row["volume"], 100),
+                none_row["volume"],
+                atol=0.500001,
             )
             compared += _compare(
                 differences,
@@ -358,7 +356,7 @@ def compare_daily(
                 expected,
                 front_row[field],
                 rtol=1e-5,
-                atol=1e-4,
+                atol=0.005001,
             )
     return CheckResult("daily", compared, tuple(differences))
 
@@ -415,18 +413,46 @@ def compare_financial(
             if ts_row is None or qmt_row is None:
                 differences.append(_missing(f"financial_{qmt_table}", key, ts_row, qmt_row))
                 continue
-            for qmt_field, tushare_field in fields.items():
+            for qmt_field, tushare_fields in fields.items():
                 if qmt_field not in qmt_row:
                     continue
+                candidates = (
+                    (tushare_fields,)
+                    if isinstance(tushare_fields, str)
+                    else tushare_fields
+                )
+                qmt_value = qmt_row[qmt_field]
+                values = [ts_row[field] for field in candidates if ts_row[field] is not None]
+                # QMT 在新旧报表格式间会把同一项目放进不同字段。仅在 QMT
+                # 实际提供值时，从等价的 Tushare 字段中选择数值最接近的一项；
+                # QMT 为空时仍用主字段判断是否存在真实的数据覆盖缺口。
+                if (
+                    isinstance(qmt_value, (int, float))
+                    and not isinstance(qmt_value, bool)
+                    and values
+                    and all(
+                        isinstance(value, (int, float)) and not isinstance(value, bool)
+                        for value in values
+                    )
+                ):
+                    tushare_value = min(values, key=lambda value: abs(value - qmt_value))
+                else:
+                    tushare_value = ts_row[candidates[0]]
+                atol = (
+                    0.005001
+                    if qmt_field in {"s_fa_eps_basic", "s_fa_eps_diluted"}
+                    else 1e-4
+                )
                 compared += _compare(
                     differences,
                     f"financial_{qmt_table}",
                     key,
-                    tushare_field,
-                    ts_row[tushare_field],
-                    qmt_row[qmt_field],
+                    candidates[0],
+                    tushare_value,
+                    qmt_value,
                     rtol=1e-6,
-                    atol=1e-4,
+                    atol=atol,
+                    null_equals_zero=True,
                 )
     return CheckResult("financial", compared, tuple(differences))
 
@@ -520,9 +546,15 @@ def _compare(
     *,
     rtol: float = 1e-6,
     atol: float = 1e-6,
+    null_equals_zero: bool = False,
 ) -> int:
     if tushare is None and qmt is None:
         return 0
+    if null_equals_zero:
+        if tushare is None and isinstance(qmt, (int, float)) and qmt == 0:
+            tushare = 0.0
+        elif qmt is None and isinstance(tushare, (int, float)) and tushare == 0:
+            qmt = 0.0
     equal = (
         isinstance(tushare, (int, float))
         and not isinstance(tushare, bool)

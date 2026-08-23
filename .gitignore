@@ -7,3 +7,4 @@ __pycache__/
 .idea/
 .vscode/
 /data
+data_validation.json
