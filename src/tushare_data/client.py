@@ -127,13 +127,15 @@ class TushareProClient:
                 RequestsTimeout,
                 ChunkedEncodingError,
                 TimeoutError,
-            ):
+            ) as exc:
                 if retry_index == self.max_retries:
                     raise
                 delay = self.retry_backoff_seconds * (2**retry_index)
                 logger.warning(
-                    "%s 网络请求失败，%.1f 秒后进行第 %d 次重试",
+                    "%s 网络请求失败（%s: %s），%.1f 秒后进行第 %d 次重试",
                     api_name,
+                    type(exc).__name__,
+                    exc,
                     delay,
                     retry_index + 1,
                 )

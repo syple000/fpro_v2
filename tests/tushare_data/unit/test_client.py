@@ -169,7 +169,7 @@ def test_business_methods_have_only_explicit_parameters(
     )
 
 
-def test_client_retries_transient_network_failure_through_limiter() -> None:
+def test_client_retries_transient_network_failure_through_limiter(caplog) -> None:
     limiter = RecordingLimiter()
     api = OneTimeoutDataApi()
     client = TushareProClient(
@@ -188,6 +188,7 @@ def test_client_retries_transient_network_failure_through_limiter() -> None:
 
     assert result.iloc[0]["trade_date"] == "20240102"
     assert api.attempts == len(limiter.calls) == 2
+    assert "daily 网络请求失败（TimeoutError: temporary timeout）" in caplog.text
 
 
 def test_client_retries_truncated_http_response_through_limiter() -> None:
