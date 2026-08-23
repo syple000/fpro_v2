@@ -4,6 +4,8 @@ import json
 from collections.abc import Callable
 from datetime import date, timedelta
 from pathlib import Path
+from threading import Lock
+from time import sleep
 from typing import ParamSpec, TypeVar
 
 import pandas as pd
@@ -151,13 +153,12 @@ def test_create_pro_client_uses_direct_http_session(monkeypatch) -> None:
             max_retries=0,
         )
         result = pro.daily("20240102", "ts_code,trade_date", 5_000, 0)
+        pro.daily("20240103", "ts_code,trade_date", 5_000, 0)
     finally:
         tushare_client_module.requests = original_requests
 
-    assert sessions
-    assert result.to_dict("records") == [
-        {"ts_code": "000001.SZ", "trade_date": "20240102"}
-    ]
+    assert len(sessions) == 1
+    assert result.to_dict("records") == [{"ts_code": "000001.SZ", "trade_date": "20240102"}]
 
 
 def _market_responder(
@@ -219,6 +220,34 @@ def test_daily_fetches_full_market_and_partitions_by_trade_date(
         "cal_date=value%3A2024-01-02",
         "cal_date=value%3A2024-01-03",
     ]
+
+
+def test_trade_date_chunk_is_not_written_when_one_request_fails(
+    tmp_path: Path,
+) -> None:
+    def responder(
+        api_name: str,
+        fields: str,
+        arguments: dict[str, object],
+    ) -> pd.DataFrame:
+        if api_name == "trade_cal":
+            return _calendar_frame(fields, arguments)
+        if api_name != "daily":
+            return _empty(fields)
+        if arguments["trade_date"] == "20240103":
+            raise RuntimeError("simulated request failure")
+        trade_date = str(arguments["trade_date"])
+        row = _record("daily", "000001.SZ", trade_date)
+        return pd.DataFrame([row], columns=pd.Index(fields.split(",")))
+
+    pro, _ = _client(responder)
+    with (
+        TushareDataStore(tmp_path) as store,
+        pytest.raises(RuntimeError, match="simulated request failure"),
+    ):
+        sync_daily(pro, store, "20240102", "20240104")
+
+    assert not list((tmp_path / "daily").rglob("_manifest.json"))
 
 
 def test_data_store_public_business_methods_are_only_read_and_write() -> None:
@@ -475,6 +504,52 @@ def test_sync_all_expands_both_sides_in_date_order(
     assert completed == [(date(2024, 1, 1), date(2024, 1, 31))]
 
 
+def test_sync_all_runs_datasets_in_parallel_after_calendar_barrier(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state_lock = Lock()
+    calendar_completed = False
+    active = 0
+    maximum_active = 0
+
+    def record(dataset: str) -> Callable[..., int]:
+        def sync_dataset(
+            _pro: TushareProClient,
+            _store: TushareDataStore,
+            _start_date: str | date,
+            _end_date: str | date,
+        ) -> int:
+            nonlocal calendar_completed, active, maximum_active
+            if dataset == "trade_cal":
+                sleep(0.01)
+                with state_lock:
+                    calendar_completed = True
+                return 1
+            with state_lock:
+                assert calendar_completed
+                active += 1
+                maximum_active = max(maximum_active, active)
+            try:
+                sleep(0.02)
+                return 1
+            finally:
+                with state_lock:
+                    active -= 1
+
+        return sync_dataset
+
+    for dataset in TABLE_SCHEMAS:
+        monkeypatch.setattr(sync_module, f"sync_{dataset}", record(dataset))
+
+    pro, _ = _client(_market_responder)
+    with TushareDataStore(tmp_path) as store:
+        result = sync_module.sync_all(pro, store, "20240102", "20240102")
+
+    assert maximum_active > 1
+    assert set(result) == set(TABLE_SCHEMAS)
+
+
 def test_daily_refresh_replaces_old_market_partition(tmp_path: Path) -> None:
     request_count = 0
 
@@ -593,10 +668,7 @@ def test_financial_revision_outside_request_window_is_kept_in_report_partition(
         assert sync_module.sync_cashflow(pro, store, "20240418", "20240418") == 2
         rows = store.read("cashflow", date(2023, 12, 31)).to_pylist()
 
-    assert [
-        (row["f_ann_date"], row["update_flag"], row["free_cashflow"])
-        for row in rows
-    ] == [
+    assert [(row["f_ann_date"], row["update_flag"], row["free_cashflow"]) for row in rows] == [
         (date(2024, 4, 18), "0", 1.0),
         (date(2025, 4, 29), "1", 2.0),
     ]

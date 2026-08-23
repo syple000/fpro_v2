@@ -243,7 +243,7 @@ def test_request_limiter_uses_conservative_quicksync_defaults() -> None:
     limiter = RequestLimiter()
 
     assert limiter.requests_per_minute == DEFAULT_REQUESTS_PER_MINUTE == 120
-    assert limiter.max_concurrency == DEFAULT_MAX_CONCURRENCY == 1
+    assert limiter.max_concurrency == DEFAULT_MAX_CONCURRENCY == 3
 
 
 @pytest.mark.parametrize(
@@ -259,7 +259,7 @@ def test_request_limiter_rejects_invalid_limits(
 
 
 def test_request_limiter_caps_simultaneous_in_flight_calls() -> None:
-    limiter = RequestLimiter(requests_per_minute=60_000, max_concurrency=1)
+    limiter = RequestLimiter(requests_per_minute=60_000, max_concurrency=2)
     state_lock = Lock()
     active = 0
     maximum_active = 0
@@ -276,4 +276,4 @@ def test_request_limiter_caps_simultaneous_in_flight_calls() -> None:
     with ThreadPoolExecutor(max_workers=4) as executor:
         list(executor.map(lambda _: limiter.call(request), range(4)))
 
-    assert maximum_active == 1
+    assert maximum_active == 2

@@ -20,6 +20,19 @@ API 游标和存储分区是两个独立概念。同步层不会根据请求区�
 所有分页请求都按实际返回行数推进 `offset`。`fina_audit` 是唯一个需要先
 拉股票列表再逐股请求的业务；其余表优先使用全市场接口。
 
+## 并发和限速
+
+并发只放在数据表这一层：`sync_all` 和 `sync_inc` 先同步交易日历，再用线程池
+同时运行其余数据表的同步函数。每个数据表内部仍是直观的顺序请求和分页。
+
+所有数据表共用同一个 `TushareProClient`，真实 HTTP 请求统一由它的
+`RequestLimiter` 控制。默认配置是每分钟 120 次、最多 3 个在途请求，可通过
+命令行的 `--requests-per-minute` 和 `--max-concurrency` 按 quicksync 套餐调整。
+线程池只负责让多个数据表同时推进，不重复实现请求限速。
+
+每个数据块会在本块全部请求成功和校验完成后才写盘。一个数据集失败时，其他
+独立数据集可以完成并提交各自 checkpoint，重跑 `sync_all` 只补未完成区间。
+
 ## 自然分区和版本主键
 
 下表的主键是“分区内主键”，表级唯一性等价于 `分区字段 + 分区内主键`。
@@ -76,7 +89,7 @@ uv run --group tushare-data tushare-data-test \
   --data-dir data/tushare
 ```
 
-`create_pro_client` 为 Tushare SDK 安装独立的直连 HTTP 传输；它不读取
+`create_pro_client` 为 Tushare SDK 安装按工作线程复用连接的直连 HTTP 传输；它不读取
 `HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY` 或 Windows 系统代理，也不会清除进程环境，
 因此不影响同一进程中的其他网络客户端。单次请求读取超时为 120 秒。
 

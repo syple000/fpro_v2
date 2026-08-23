@@ -83,7 +83,7 @@ def main() -> None:
         "--max-concurrency",
         type=int,
         default=DEFAULT_MAX_CONCURRENCY,
-        help="同时在途请求数，默认1",
+        help="所有接口共享的同时在途请求数，默认3",
     )
     args = parser.parse_args()
     if not args.token:

@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable, Iterable
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta
 from math import isnan
 from numbers import Real
+from threading import local
 from typing import Any
 
 import pandas as pd
@@ -56,14 +58,21 @@ MarketSyncFunction = Callable[
 
 
 class _DirectRequests:
-    """为 Tushare SDK 提供不读取系统和环境代理的 requests 接口。"""
+    """为每个工作线程复用一个不读取系统和环境代理的 Session。"""
 
-    @staticmethod
-    def post(url: str, **kwargs: Any) -> requests.Response:
-        # Tushare 原本调用 requests.post，本身也是每次创建一个临时 Session。
-        with requests.Session() as session:
+    def __init__(self) -> None:
+        self._local = local()
+
+    def _session(self) -> requests.Session:
+        session = getattr(self._local, "session", None)
+        if session is None:
+            session = requests.Session()
             session.trust_env = False
-            return session.post(url, **kwargs)
+            self._local.session = session
+        return session
+
+    def post(self, url: str, **kwargs: Any) -> requests.Response:
+        return self._session().post(url, **kwargs)
 
 
 def create_pro_client(
@@ -556,45 +565,80 @@ def sync_all(
         ("fina_audit", sync_fina_audit, 366),
     )
 
-    result: dict[str, int] = {}
-    for dataset, function, checkpoint_days in functions:
-        completed = store._sync_all_completed_ranges(dataset)
-        missing = _missing_date_ranges(requested_start, requested_end, completed)
-        total = 0
+    # 交易日历是日频接口的共同依赖，先完整提交；其余数据集再并行回填。
+    result = {
+        "trade_cal": _sync_all_dataset(
+            pro,
+            store,
+            requested_start,
+            requested_end,
+            functions[0],
+        )
+    }
+    dataset_specs = functions[1:]
+    with ThreadPoolExecutor(
+        max_workers=len(dataset_specs),
+        thread_name_prefix="tushare-dataset",
+    ) as executor:
+        futures = {
+            spec[0]: executor.submit(
+                _sync_all_dataset,
+                pro,
+                store,
+                requested_start,
+                requested_end,
+                spec,
+            )
+            for spec in dataset_specs
+        }
+        for dataset, future in futures.items():
+            result[dataset] = future.result()
+    return result
 
-        # 申万接口始终返回完整成员快照，一次调用即可覆盖全部缺失历史区间。
-        if dataset == "sw_industry" and missing:
-            total = function(pro, store, requested_start, requested_end)
-            for range_start, range_end in missing:
-                store._mark_sync_all_completed(dataset, range_start, range_end)
+
+def _sync_all_dataset(
+    pro: TushareProClient,
+    store: TushareDataStore,
+    requested_start: date,
+    requested_end: date,
+    spec: tuple[str, MarketSyncFunction, int],
+) -> int:
+    dataset, function, checkpoint_days = spec
+    completed = store._sync_all_completed_ranges(dataset)
+    missing = _missing_date_ranges(requested_start, requested_end, completed)
+    total = 0
+
+    # 申万接口始终返回完整成员快照，一次调用即可覆盖全部缺失历史区间。
+    if dataset == "sw_industry" and missing:
+        total = function(pro, store, requested_start, requested_end)
+        for range_start, range_end in missing:
+            store._mark_sync_all_completed(dataset, range_start, range_end)
+        logger.info(
+            "sync_all %s 已完成 %s 至 %s，写入 %d 行",
+            dataset,
+            requested_start,
+            requested_end,
+            total,
+        )
+        return total
+
+    for range_start, range_end in missing:
+        for chunk_start, chunk_end in _split_range(
+            range_start,
+            range_end,
+            checkpoint_days,
+        ):
+            written = function(pro, store, chunk_start, chunk_end)
+            total += written
+            store._mark_sync_all_completed(dataset, chunk_start, chunk_end)
             logger.info(
                 "sync_all %s 已完成 %s 至 %s，写入 %d 行",
                 dataset,
-                requested_start,
-                requested_end,
-                total,
+                chunk_start,
+                chunk_end,
+                written,
             )
-            result[dataset] = total
-            continue
-
-        for range_start, range_end in missing:
-            for chunk_start, chunk_end in _split_range(
-                range_start,
-                range_end,
-                checkpoint_days,
-            ):
-                written = function(pro, store, chunk_start, chunk_end)
-                total += written
-                store._mark_sync_all_completed(dataset, chunk_start, chunk_end)
-                logger.info(
-                    "sync_all %s 已完成 %s 至 %s，写入 %d 行",
-                    dataset,
-                    chunk_start,
-                    chunk_end,
-                    written,
-                )
-        result[dataset] = total
-    return result
+    return total
 
 
 def sync_inc(
@@ -608,6 +652,7 @@ def sync_inc(
     calendar_end = current + timedelta(days=INC_CALENDAR_FUTURE_DAYS)
 
     result: dict[str, int] = {"trade_cal": sync_trade_cal(pro, store, calendar_start, calendar_end)}
+    jobs: list[tuple[str, MarketSyncFunction, date, date]] = []
     open_dates = _market_open_dates(store, calendar_start, current)
     if open_dates:
         stable_start = open_dates[-min(len(open_dates), INC_STABLE_TRADING_DAYS)]
@@ -618,13 +663,13 @@ def sync_inc(
             ("suspend_d", sync_suspend_d),
             ("stock_st", sync_stock_st),
         ):
-            result[dataset] = function(pro, store, stable_start, current)
+            jobs.append((dataset, function, stable_start, current))
         for dataset, function in (
             ("daily_basic", sync_daily_basic),
             ("moneyflow", sync_moneyflow),
             ("adj_factor", sync_adj_factor),
         ):
-            result[dataset] = function(pro, store, factor_start, current)
+            jobs.append((dataset, function, factor_start, current))
     else:
         for dataset in (
             "daily",
@@ -648,18 +693,22 @@ def sync_inc(
         ("cashflow", sync_cashflow),
         ("fina_indicator", sync_fina_indicator),
     ):
-        result[dataset] = function(pro, store, financial_start, current)
+        jobs.append((dataset, function, financial_start, current))
 
     event_start = current - timedelta(days=INC_EVENT_DAYS - 1)
     for dataset, function in (
         ("forecast", sync_forecast),
         ("express", sync_express),
     ):
-        result[dataset] = function(pro, store, event_start, current)
+        jobs.append((dataset, function, event_start, current))
 
     if current.weekday() == INC_WEEKLY_REFRESH_WEEKDAY:
-        result["fina_audit"] = sync_fina_audit(pro, store, event_start, current)
-        result["sw_industry"] = sync_sw_industry(pro, store, current, current)
+        jobs.extend(
+            (
+                ("fina_audit", sync_fina_audit, event_start, current),
+                ("sw_industry", sync_sw_industry, current, current),
+            )
+        )
     else:
         result["fina_audit"] = 0
         result["sw_industry"] = 0
@@ -669,12 +718,17 @@ def sync_inc(
         if current.day == INC_MONTHLY_REFRESH_DAY
         else current - timedelta(days=INC_DIVIDEND_DAILY_DAYS - 1)
     )
-    result["dividend"] = sync_dividend(
-        pro,
-        store,
-        dividend_start,
-        current,
-    )
+    jobs.append(("dividend", sync_dividend, dividend_start, current))
+    with ThreadPoolExecutor(
+        max_workers=len(jobs),
+        thread_name_prefix="tushare-dataset",
+    ) as executor:
+        futures = {
+            dataset: executor.submit(function, pro, store, start_date, end_date)
+            for dataset, function, start_date, end_date in jobs
+        }
+        for dataset, future in futures.items():
+            result[dataset] = future.result()
     return result
 
 
