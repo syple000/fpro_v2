@@ -239,6 +239,7 @@ def validate_sample(
             stocks,
             start_date.strftime("%Y%m%d"),
             end_date.strftime("%Y%m%d"),
+            force=True,
         )
 
     with DataCatalog(tushare_root=tushare_root, qmt_root=qmt_root) as catalog:

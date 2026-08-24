@@ -9,8 +9,11 @@
 
 ## 拉取与完成区间
 
-`sync_all(pro, store, start_date, end_date)` 按 API 的 `start_date/end_date` 滑动拉取，
+`sync_all(pro, store, start_date, end_date, force=False)` 按 API 的
+`start_date/end_date` 滑动拉取，
 并在每个块完整落盘后才提交 `<root>/_meta/sync_all/*.json` 完成区间。
+默认只补未完成区间；`force=True` 会在本次调用中忽略已有完成区间，重新抓取整个请求区间，
+但不会预先清空 checkpoint。这样强制重抓失败时，原有完成状态仍然有效；成功块照常写盘并提交。
 `sync_inc` 重新拉取固定回看窗口，不改变 `sync_all` 断点。
 
 API 游标和存储分区是两个独立概念。同步层不会根据请求区间过滤返回行：
@@ -86,6 +89,9 @@ uv run --group tushare-data tushare-data-test \
   --end-date 20260822 \
   --data-dir data/tushare
 ```
+
+需要无视已有完成区间、完整重抓本次区间时增加 `--force`。`sync_inc` 的计划窗口本来就会
+每次重抓，因此也接受 `--force`，但不会扩大或改变滚动窗口。
 
 后续持续刷新：
 

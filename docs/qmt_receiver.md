@@ -70,10 +70,10 @@ agent 保留 XtData 原始 `quote.time`。receiver 落盘时才生成业务字�
 
 `sync.py` 将 agent 的直接查询结果写入 `QmtDataStore`：
 
-- `sync_daily()`：同步日线，`adjustment` 区分 `none` 与 `front`。
+- `sync_daily()`：同步日线，`adjustment` 区分 `none` 与 `front`；默认增量下载。
 - `sync_financial()`：同步八类具体财务记录。
 - `sync_dividend_factors()`：同步具体 `DividendFactor` 记录。
-- `sync_all()`：依次完成上述三类。
+- `sync_all()`：依次完成上述三类，并接受关键字参数 `force=False`。
 
 ```python
 from qmt_receiver import QmtAgentClient, QmtDataStore, sync_all
@@ -88,8 +88,13 @@ with (
         ["000001.SZ", "600000.SH"],
         "20240101",
         "20241231",
+        force=True,
     )
 ```
+
+QMT 历史行情默认以 `incremental` 模式补齐本地缓存；`force=True` 改用 `full`，即使区间已经
+下载过也再次下载。财务下载和除权因子查询没有增量/完整模式，本来就会在每次同步时请求，
+所以 `force` 不改变这两类调用。命令行 `qmt-receiver-test sync` 同样支持 `--force`。
 
 历史、财务和除权返回在进入 receiver 时已经是具体行结构。存储层只做物理表映射，不再解析通用 DataFrame 或任意 JSON 单元。
 
@@ -112,6 +117,11 @@ with (
 ```python
 result = store.compact_realtime()
 ```
+
+实时分区的 Manifest 会持久化压缩签名。未追加新行情且压缩配置未变化时，重复启动 receiver
+或重复调用 `compact_realtime()` 会跳过已经整理过的分区；即使一个交易日数据量较大、整理后
+仍有多个目标大小的文件，也不会再次做无效的全量读取和重写。新行情只会使其所属交易日分区
+失效，其他历史分区保持跳过。
 
 ## 测试命令
 

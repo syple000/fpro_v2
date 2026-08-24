@@ -88,14 +88,16 @@ def sync_daily(
     stocks: Sequence[str],
     start_time: str,
     end_time: str,
+    *,
+    force: bool = False,
 ) -> int:
-    """同步等比前复权和不复权日线。"""
+    """同步等比前复权和不复权日线；force 时覆盖下载已有历史。"""
     client.download_history(
         stocks,
         period="1d",
         start_time=start_time,
         end_time=end_time,
-        mode="full",
+        mode="full" if force else "incremental",
     )
     rows = 0
     for adjustment in ("none", "front_ratio"):
@@ -150,10 +152,19 @@ def sync_all(
     stocks: Sequence[str],
     start_time: str,
     end_time: str,
+    *,
+    force: bool = False,
 ) -> SyncResult:
-    """同步日线、财务和除权因子。"""
+    """同步日线、财务和除权因子；force 时强制重新下载已有历史行情。"""
     return SyncResult(
-        daily_rows=sync_daily(client, store, stocks, start_time, end_time),
+        daily_rows=sync_daily(
+            client,
+            store,
+            stocks,
+            start_time,
+            end_time,
+            force=force,
+        ),
         financial_rows=sync_financial(client, store, stocks, start_time, end_time),
         dividend_factor_rows=sync_dividend_factors(
             client,

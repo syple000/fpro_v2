@@ -538,8 +538,10 @@ def sync_all(
     store: TushareDataStore,
     start_date: str | date,
     end_date: str | date,
+    *,
+    force: bool = False,
 ) -> dict[str, int]:
-    """按日期升序完成一次性历史回填，并跳过已经成功提交的区间。"""
+    """按日期升序完成一次性历史回填；force 时重新抓取已完成区间。"""
     requested_start = _parse_date(start_date)
     requested_end = _parse_date(end_date)
     if requested_start > requested_end:
@@ -574,6 +576,7 @@ def sync_all(
             requested_start,
             requested_end,
             functions[0],
+            force=force,
         )
     }
     dataset_specs = functions[1:]
@@ -589,6 +592,7 @@ def sync_all(
                 requested_start,
                 requested_end,
                 spec,
+                force=force,
             )
             for spec in dataset_specs
         }
@@ -603,9 +607,11 @@ def _sync_all_dataset(
     requested_start: date,
     requested_end: date,
     spec: MarketSyncSpec,
+    *,
+    force: bool = False,
 ) -> int:
     dataset, function, checkpoint_days = spec
-    completed = store._sync_all_completed_ranges(dataset)
+    completed = [] if force else store._sync_all_completed_ranges(dataset)
     missing = _missing_date_ranges(requested_start, requested_end, completed)
     total = 0
 
@@ -647,8 +653,10 @@ def sync_inc(
     pro: TushareProClient,
     store: TushareDataStore,
     current_date: str | date,
+    *,
+    force: bool = False,
 ) -> dict[str, int]:
-    """以给定日期为基准，按各类数据的稳定性自动滚动刷新。"""
+    """以给定日期为基准滚动刷新；窗口本来就会重抓，force 不改变其行为。"""
     current = _parse_date(current_date)
     calendar_start = current - timedelta(days=INC_CALENDAR_PAST_DAYS)
     calendar_end = current + timedelta(days=INC_CALENDAR_FUTURE_DAYS)

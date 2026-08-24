@@ -72,7 +72,10 @@ null-safe 语义分组，多行中相同位置的 null 视为同一键值。配�
 也会检查并清理文件内部的重复键。
 
 `compact_table` 会先 flush，再扫描整张表并返回实际整理的分区数。配置了主键时也会检查
-单文件分区，避免遗漏同一文件内部的重复记录。
+单文件分区，避免遗漏同一文件内部的重复记录。整理成功后，分区 Manifest 会记录当前压缩
+算法和相关 `TableConfig` 的签名；只要文件集和配置没有变化，后续调用会直接跳过该分区。
+因此，一个大分区即使按 `target_rows_per_file` 合理保留多个文件，也不会被反复重写。
+`append` 或 `replace_partition` 会清除签名，使发生变化的分区在下次调用时重新整理。
 
 `deduplicate_prefer_by` 是可选冲突优先字段：按字段升序比较，较大值胜出；完全相同时仍由
 后提交的行胜出。该配置不会在 Parquet 中增加字段。
@@ -87,13 +90,17 @@ Manifest 同时保存本次更新时间和每个文件的提交时间（UTC Unix
   "file_committed_at": {
     "part-old.parquet": 1787155200000000,
     "part-new.parquet": 1787155200000001
-  }
+  },
+  "compaction_signature": "v1:..."
 }
 ```
 
 读取和整理都会按 `file_committed_at` 排序，而不依赖文件名或 JSON 中对象键的顺序。即使系统时钟
 回拨，新的提交时间也至少比当前 Manifest 大 1 微秒。没有时间字段的旧版 Manifest 仍可读取；
 它原有的 `files` 数组顺序会被保留，并在下一次提交时自动补齐每文件时间。
+没有 `compaction_signature` 的旧 Manifest 会在下一次显式整理时检查一次，成功后自动补齐。
+影响整理结果的 Schema、排序键、主键、冲突优先字段或目标文件行数改变时，签名也会改变，
+已有分区会按新配置重新整理。
 
 Schema 可以在末尾追加可空字段：
 

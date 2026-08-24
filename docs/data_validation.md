@@ -1,7 +1,7 @@
 # Tushare/QMT 数据复核
 
-`data_validation` 从 Tushare 日线股票池中做可重复随机抽样，直接调用 `qmt_receiver.sync_all()`
-下载并落地样本股票，然后完成三类比较：
+`data_validation` 从 Tushare 日线股票池中做可重复随机抽样，直接调用
+`qmt_receiver.sync_all(..., force=True)` 强制下载并落地样本股票，然后完成三类比较：
 
 - QMT 不复权日线与 Tushare `daily`；
 - QMT 等比前复权（`front_ratio`）日线与

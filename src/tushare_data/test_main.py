@@ -34,6 +34,7 @@ def run(
     current_date: str,
     requests_per_minute: int,
     max_concurrency: int,
+    force: bool,
 ) -> None:
     """按命令行选择完整区间同步或自动滚动增量同步。"""
     pro = create_pro_client(
@@ -44,9 +45,9 @@ def run(
     )
     with TushareDataStore(data_dir) as store:
         result = (
-            sync_all(pro, store, start_date, end_date)
+            sync_all(pro, store, start_date, end_date, force=force)
             if mode == "sync_all"
-            else sync_inc(pro, store, current_date)
+            else sync_inc(pro, store, current_date, force=force)
         )
     for dataset, fetched in result.items():
         logger.info(
@@ -74,6 +75,11 @@ def main() -> None:
     parser.add_argument("--end-date", default=today.strftime("%Y%m%d"))
     parser.add_argument("--current-date", default=today.strftime("%Y%m%d"))
     parser.add_argument(
+        "--force",
+        action="store_true",
+        help="sync_all 忽略完成区间并重抓；sync_inc 的计划窗口本来就会重抓",
+    )
+    parser.add_argument(
         "--requests-per-minute",
         type=int,
         default=DEFAULT_REQUESTS_PER_MINUTE,
@@ -100,6 +106,7 @@ def main() -> None:
         args.current_date,
         args.requests_per_minute,
         args.max_concurrency,
+        args.force,
     )
 
 

@@ -504,6 +504,50 @@ def test_sync_all_expands_both_sides_in_date_order(
     assert completed == [(date(2024, 1, 1), date(2024, 1, 31))]
 
 
+def test_sync_all_force_refetches_completed_range(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: dict[str, list[tuple[date, date]]] = {dataset: [] for dataset in TABLE_SCHEMAS}
+
+    def record(dataset: str) -> Callable[..., int]:
+        def sync_dataset(
+            _pro: TushareProClient,
+            _store: TushareDataStore,
+            start_date: str | date,
+            end_date: str | date,
+        ) -> int:
+            calls[dataset].append(
+                (
+                    sync_module._parse_date(start_date),
+                    sync_module._parse_date(end_date),
+                )
+            )
+            return 1
+
+        return sync_dataset
+
+    for dataset in TABLE_SCHEMAS:
+        monkeypatch.setattr(sync_module, f"sync_{dataset}", record(dataset))
+
+    pro, _ = _client(_market_responder)
+    with TushareDataStore(tmp_path) as store:
+        initial = sync_module.sync_all(pro, store, "20240102", "20240102")
+        skipped = sync_module.sync_all(pro, store, "20240102", "20240102")
+        forced = sync_module.sync_all(
+            pro,
+            store,
+            "20240102",
+            "20240102",
+            force=True,
+        )
+
+    assert all(value == 1 for value in initial.values())
+    assert all(value == 0 for value in skipped.values())
+    assert all(value == 1 for value in forced.values())
+    assert all(len(dataset_calls) == 2 for dataset_calls in calls.values())
+
+
 def test_sync_all_runs_datasets_in_parallel_after_calendar_barrier(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

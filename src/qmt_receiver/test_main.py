@@ -56,9 +56,10 @@ def run_sync(
     stocks: list[str],
     start_time: str,
     end_time: str,
+    force: bool,
 ) -> None:
     with QmtAgentClient(base_url) as client, QmtDataStore(data_dir) as store:
-        result = sync_all(client, store, stocks, start_time, end_time)
+        result = sync_all(client, store, stocks, start_time, end_time, force=force)
     logger.info("sync 完成：%s", result)
 
 
@@ -73,6 +74,11 @@ def main() -> None:
     parser.add_argument("--end-time")
     parser.add_argument("--timeout-ms", type=int, default=30_000)
     parser.add_argument("--once", action="store_true")
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="sync 模式下对历史行情使用 full 下载，覆盖已有的本地历史",
+    )
     args = parser.parse_args()
     configure_beijing_logging(logging.INFO)
     try:
@@ -93,6 +99,7 @@ def main() -> None:
                 args.stocks,
                 args.start_time,
                 args.end_time,
+                args.force,
             )
     except KeyboardInterrupt:
         logger.info("测试停止")

@@ -26,6 +26,7 @@ from qmt_receiver import QmtDataStore, sync_all
 class FakeSyncClient:
     def __init__(self) -> None:
         self.adjustments: list[DividendType] = []
+        self.history_modes: list[HistoryMode] = []
 
     def download_history(
         self,
@@ -35,6 +36,7 @@ class FakeSyncClient:
         end_time: str = "",
         mode: HistoryMode = "incremental",
     ) -> HistoryDownloadResponse:
+        self.history_modes.append(mode)
         return HistoryDownloadResponse(completed=True)
 
     def query_history(
@@ -142,6 +144,7 @@ def test_sync_all_downloads_and_writes_all_sources(tmp_path: Path) -> None:
     assert result.daily_rows == 2
     assert result.financial_rows == 1
     assert result.dividend_factor_rows == 1
+    assert client.history_modes == ["incremental"]
     assert client.adjustments == ["none", "front_ratio"]
     assert daily == [("front_ratio", 8.0), ("none", 10.0)]
     assert financial is not None
@@ -153,3 +156,18 @@ def test_sync_all_downloads_and_writes_all_sources(tmp_path: Path) -> None:
     assert dividend[0] == "000001.SZ"
     assert dividend[1].isoformat() == "2024-06-01"
     assert dividend[2:] == (0.1, 0.2, 0.3, 0.9)
+
+
+def test_sync_all_force_uses_full_history_download(tmp_path: Path) -> None:
+    client = FakeSyncClient()
+    with QmtDataStore(tmp_path / "qmt") as store:
+        sync_all(
+            client,
+            store,
+            ["000001.SZ"],
+            "20240101",
+            "20241231",
+            force=True,
+        )
+
+    assert client.history_modes == ["full"]
