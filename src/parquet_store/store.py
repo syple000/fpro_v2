@@ -445,24 +445,258 @@ class ParquetStore:
         if not manifest.files or (len(manifest.files) == 1 and not config.primary_key):
             return 0
         paths = [directory / name for name in _ordered_manifest_files(manifest)]
-        tables = _read_parquet_files(paths, config.schema, None, None)
-        data = pa.concat_tables(tables) if tables else _empty_table(config.schema)
-        deduplicated = self._deduplicate_primary_key(config, data)
-        if len(manifest.files) == 1 and deduplicated.num_rows == data.num_rows:
-            self._write_manifest(
-                directory,
-                replace(manifest, compaction_signature=signature),
+
+        # 单文件保留原路径；多文件才需要避免同时持有整张宽表。
+        if len(paths) == 1:
+            tables = _read_parquet_files(paths, config.schema, None, None)
+            data = tables[0] if tables else _empty_table(config.schema)
+            deduplicated = self._deduplicate_primary_key(config, data)
+            if deduplicated.num_rows == data.num_rows:
+                self._write_manifest(
+                    directory,
+                    replace(manifest, compaction_signature=signature),
+                )
+                return 0
+            prepared = self._sort(config, deduplicated)
+            self._commit(
+                config,
+                partition_id,
+                _split_table(prepared, config.target_rows_per_file),
+                keep_current=False,
+                compaction_signature=signature,
             )
-            return 0
-        prepared = self._sort(config, deduplicated)
-        chunks = _split_table(prepared, config.target_rows_per_file)
-        self._commit(
-            config,
-            partition_id,
-            chunks,
-            keep_current=False,
+            return 1
+
+        # 第一遍只读取决定去重和最终顺序所需的窄列，生成获胜行的物理位置。
+        primary_key = tuple(config.primary_key or ())
+        prefer_by = tuple(config.deduplicate_prefer_by or ())
+        sort_by = tuple(config.sort_by or ())
+        key_columns = list(dict.fromkeys((*primary_key, *prefer_by, *sort_by)))
+        key_tables = (
+            _read_parquet_files(paths, config.schema, key_columns, None) if key_columns else []
+        )
+        row_counts = (
+            [table.num_rows for table in key_tables]
+            if key_tables
+            else [pq.ParquetFile(path).metadata.num_rows for path in paths]
+        )
+        total_rows = sum(row_counts)
+        position_name = "__parquet_store_source_position__"
+        while position_name in config.schema.names:
+            position_name = f"_{position_name}"
+
+        if key_columns:
+            key_data = pa.concat_tables(key_tables)
+            key_data = key_data.append_column(
+                position_name,
+                pa.array(range(total_rows), type=pa.int64()),
+            )
+            winners = self._deduplicate_primary_key(config, key_data)
+            winner_column = winners.column(position_name)
+            if sort_by:
+                ordering = cast(
+                    pa.Int64Array,
+                    pc.sort_indices(
+                        winners.select([*sort_by, position_name]),
+                        sort_keys=[
+                            *((name, "ascending") for name in sort_by),
+                            (position_name, "ascending"),
+                        ],
+                    ).cast(pa.int64()),
+                )
+                winner_positions = cast(
+                    pa.Int64Array,
+                    pc.take(winner_column, ordering).combine_chunks(),
+                )
+                del ordering
+            else:
+                winner_positions = cast(pa.Int64Array, winner_column.combine_chunks())
+            del key_data, winners, winner_column
+        else:
+            winner_positions = pa.array(range(total_rows), type=pa.int64())
+        del key_tables
+
+        # 第二遍按照读取计划分批扫描宽表。每个落盘文件本身已按 sort_by 排序，
+        # 因此同一文件在计划中的行号单调递增，可以只向前扫描一次。
+        from contextlib import suppress
+
+        file_starts: list[int] = []
+        file_ends: list[int] = []
+        offset = 0
+        for row_count in row_counts:
+            file_starts.append(offset)
+            offset += row_count
+            file_ends.append(offset)
+        starts = pa.array(file_starts, type=pa.int64()).to_numpy(zero_copy_only=True)
+        ends = pa.array(file_ends, type=pa.int64()).to_numpy(zero_copy_only=True)
+        remaining_rows = [0] * len(paths)
+        for plan_offset in range(0, len(winner_positions), 64_000):
+            positions = winner_positions.slice(plan_offset, 64_000).to_numpy(zero_copy_only=True)
+            counts = pc.value_counts(pa.array(ends.searchsorted(positions, side="right")))
+            for item in cast(Any, counts).to_pylist():
+                remaining_rows[item["values"]] += item["counts"]
+        streams: list[dict[str, Any]] = [
+            {
+                "scanner": None,
+                "batches": None,
+                "table": None,
+                "start": 0,
+                "end": 0,
+            }
+            for _ in paths
+        ]
+
+        def take_source_rows(file_index: int, requested: Any) -> list[pa.Table]:
+            state = streams[file_index]
+            if state["batches"] is None:
+                scanner = ds.dataset(
+                    paths[file_index],
+                    schema=config.schema,
+                    format="parquet",
+                ).scanner(
+                    batch_size=2_048,
+                    batch_readahead=0,
+                    fragment_readahead=0,
+                    use_threads=False,
+                )
+                state["scanner"] = scanner
+                state["batches"] = iter(scanner.to_batches())
+
+            pieces: list[pa.Table] = []
+            request_offset = 0
+            while request_offset < len(requested):
+                requested_position = int(requested[request_offset])
+                if requested_position < state["start"]:
+                    raise ValueError(f"分区 {partition_id} 的文件排序与配置不一致")
+                while state["table"] is None or requested_position >= state["end"]:
+                    try:
+                        batch = next(state["batches"])
+                    except StopIteration:
+                        raise ValueError(f"分区 {partition_id} 的读取计划越界") from None
+                    state["start"] = state["end"]
+                    state["end"] += batch.num_rows
+                    state["table"] = pa.Table.from_batches([batch])
+
+                request_end = int(requested.searchsorted(state["end"], side="left"))
+                indices = pa.array(
+                    requested[request_offset:request_end] - state["start"],
+                    type=pa.int64(),
+                )
+                pieces.append(state["table"].take(indices))
+                request_offset = request_end
+            return pieces
+
+        created: list[str] = []
+        writer: pq.ParquetWriter | None = None
+        temporary: Path | None = None
+        final_path: Path | None = None
+        rows_in_file = 0
+
+        def close_output() -> None:
+            nonlocal writer, temporary, final_path, rows_in_file
+            if writer is None:
+                return
+            writer.close()
+            writer = None
+            assert temporary is not None and final_path is not None
+            _fsync_file(temporary)
+            os.rename(temporary, final_path)
+            created.append(final_path.name)
+            temporary = None
+            final_path = None
+            rows_in_file = 0
+
+        def write_output(table: pa.Table) -> None:
+            nonlocal writer, temporary, final_path, rows_in_file
+            table_offset = 0
+            while table_offset < table.num_rows:
+                if writer is None:
+                    filename = f"part-{uuid4().hex}.parquet"
+                    final_path = directory / filename
+                    temporary = directory / f".{filename}.{uuid4().hex}.tmp"
+                    writer = pq.ParquetWriter(temporary, config.schema)
+                row_count = min(
+                    config.target_rows_per_file - rows_in_file,
+                    table.num_rows - table_offset,
+                )
+                writer.write_table(table.slice(table_offset, row_count))
+                table_offset += row_count
+                rows_in_file += row_count
+                if rows_in_file == config.target_rows_per_file:
+                    close_output()
+
+        try:
+            plan_batch_rows = min(config.target_rows_per_file, 64_000)
+            for plan_offset in range(0, len(winner_positions), plan_batch_rows):
+                positions = winner_positions.slice(plan_offset, plan_batch_rows).to_numpy(
+                    zero_copy_only=True
+                )
+                file_indices = ends.searchsorted(positions, side="right")
+                local_positions = positions - starts[file_indices]
+                grouped_order = file_indices.argsort(kind="stable")
+                grouped_files = file_indices[grouped_order]
+                pieces: list[pa.Table] = []
+                slots: list[pa.Array] = []
+                group_start = 0
+                while group_start < len(grouped_order):
+                    file_index = int(grouped_files[group_start])
+                    group_end = int(grouped_files.searchsorted(file_index, side="right"))
+                    group_slots = grouped_order[group_start:group_end]
+                    requested = local_positions[group_slots]
+                    source_pieces = take_source_rows(file_index, requested)
+                    pieces.extend(source_pieces)
+                    remaining_rows[file_index] -= len(requested)
+                    if remaining_rows[file_index] == 0:
+                        streams[file_index] = {
+                            "scanner": None,
+                            "batches": None,
+                            "table": None,
+                            "start": 0,
+                            "end": 0,
+                        }
+
+                    slot_offset = 0
+                    for piece in source_pieces:
+                        slots.append(
+                            pa.array(
+                                group_slots[slot_offset : slot_offset + piece.num_rows],
+                                type=pa.int64(),
+                            )
+                        )
+                        slot_offset += piece.num_rows
+                    group_start = group_end
+
+                grouped = pa.concat_tables(pieces) if pieces else _empty_table(config.schema)
+                output_order = pc.sort_indices(pa.concat_arrays(slots))
+                write_output(grouped.take(output_order))
+            close_output()
+        except BaseException:
+            if writer is not None:
+                with suppress(BaseException):
+                    writer.close()
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+            _unlink_files(directory / name for name in created)
+            raise
+
+        committed_at = max(
+            time_ns() // 1_000,
+            manifest.updated_at + 1,
+            max(manifest.file_committed_at, default=0) + 1,
+        )
+        compacted_manifest = _Manifest(
+            version=manifest.version + 1,
+            files=tuple(created),
+            file_committed_at=tuple(committed_at for _ in created),
+            updated_at=committed_at,
             compaction_signature=signature,
         )
+        try:
+            self._write_manifest(directory, compacted_manifest)
+        except BaseException:
+            _unlink_files(directory / name for name in created)
+            raise
+        self._cleanup_unreferenced_files(directory, set(compacted_manifest.files))
         return 1
 
     def _commit(
