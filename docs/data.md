@@ -39,8 +39,9 @@ datetime(2024, 4, 30, 9, 25, tzinfo=ZoneInfo("Asia/Shanghai"))
 visible_at <= as_of
 ```
 
-公共接口不接受纯 `date`，也不默认使用 `datetime.now()`。纯日期无法区分盘前、开盘、盘中和
-盘后。`start/end` 只表示查询的数据范围，不能代替 `as_of`。
+`as_of` 不接受纯 `date`，也不默认使用 `datetime.now()`。纯日期无法区分盘前、开盘、盘中和
+盘后。`start/end` 可以使用接口规定的 `date` 或 `datetime`，但只表示数据范围，不能代替
+`as_of`。
 
 回测也是同一套规则，只是 `as_of` 由回测时钟提供，策略不能自行指定或修改。
 
@@ -146,6 +147,16 @@ Tushare 财务数据大多只有公告日期，没有精确发布时间。因此
 价格以不复权日线为源。Reader 只能使用 `visible_at <= as_of` 的 `adj_factor` 现场复权，禁止
 直接使用以今天最新因子生成的前复权历史。
 
+`adjustment="pit"` 表示以 `as_of` 当时最新可见因子为锚点做前复权：
+
+```text
+adjusted_price(t) = raw_price(t) * factor(t) / anchor_factor(as_of)
+```
+
+这里只调整 OHLC 和前收盘价；`volume/amount` 保留实际成交口径。结果元数据记录锚点日期和
+因子；任一必要因子缺失时整个复权查询失败，调用方可以显式改查不复权价格，但 Reader 不返回
+一张混合了复权和未复权行的表，也不自动改用今天的因子。
+
 行业成员可以用 `in_date <= D < out_date` 计算 D 日有效分类，但返回结果不能包含未来
 `out_date` 或当前快照的 `is_new`。
 
@@ -250,8 +261,10 @@ with DataCatalog(
     )
 ```
 
-`DataReader.at()` 拒绝无时区 `datetime`。数据源在创建 Reader 时一次绑定，不允许策略逐次选择，
-也不在数据缺失时静默切换来源。只使用 Tushare 时，`realtime_quotes` 可以设为 `None`。
+`DataReader.at()` 拒绝无时区 `datetime`，并把其他时区的 aware datetime 归一到
+`Asia/Shanghai`。数据源在创建 Reader 时一次绑定，不允许策略逐次选择，也不在数据缺失时
+静默切换来源。只使用 Tushare 时，`intraday_bars` 和 `realtime_quotes` 都设为 `None`，相应
+方法明确报“数据源未配置”。
 
 当前物理表与公共接口的关系如下：
 
@@ -283,16 +296,14 @@ with DataCatalog(
 - `symbols` 必须显式传入；空序列返回空结果，不解释为全市场；
 - 全市场必须显式传 `ALL_SYMBOLS`，并同时提供 `limit` 或使用批量迭代接口；
 - 重复或格式错误的证券代码直接报错；
-- `fields` 只接受该接口登记的字段，不接受表达式或 SQL；
+- `fields=None` 表示该接口的全部公共字段；非空时只接受登记字段，不接受表达式或 SQL；
 - 业务时间的 `start/end` 和报告范围均为左闭右开 `[start, end)`；
 - `order` 只接受 `"asc"` 或 `"desc"`，不能传任意排序字段；
-- `limit` 为非空值时必须是正整数且不超过配置上限，布尔值不视为整数；
+- `limit` 默认 `None`；非空时必须是正整数且不超过配置上限，布尔值不视为整数；
 - 数据缺失返回空行或空表，不自动补数、换源或降低 PIT 规则。
 
 每类结果的身份字段始终返回，不能被 `fields` 删除。例如 bar 始终包含
 `symbol/interval_start/interval_end`，财报始终包含 `symbol/end_date/ann_date/f_ann_date`。
-下文排序中的 `natural_key` 是数据集注册表声明的一组稳定键，不是要求结果中存在一个名为
-`natural_key` 的物理列。
 
 ## 行情接口 `market`
 
@@ -396,7 +407,8 @@ flows = data.market.moneyflow(
 )
 ```
 
-二者默认按 `trade_date ASC, symbol ASC, natural_key ASC` 排序；倒序只反转 `trade_date`。
+二者默认按 `trade_date ASC, symbol ASC` 排序；倒序只反转 `trade_date`。这两个字段组成当前
+两张源表的唯一业务键。
 
 ## 财务接口 `fundamentals`
 
@@ -430,7 +442,8 @@ income = data.fundamentals.statements(
 ```
 
 `periods` 与 `report_start/report_end` 互斥；范围模式至少传 `report_start`，`report_end` 默认不设
-上界。`periods` 是每只股票的报告期数量，`limit` 仍是合并结果的全局上限。默认排序为：
+上界。`periods` 是每只股票最近 N 个不同的 `end_date`，选完报告期后再返回符合
+`report_type/comp_type` 的行；`limit` 仍是合并结果的全局上限。默认排序为：
 
 ```text
 end_date DESC, symbol ASC, report_type ASC, comp_type ASC
@@ -474,7 +487,7 @@ reports = data.fundamentals.disclosures(
 默认排序为：
 
 ```text
-visible_at ASC, symbol ASC, end_date ASC, natural_key ASC
+visible_at ASC, symbol ASC, end_date ASC, ann_date ASC
 ```
 
 ## 公司行动接口 `corporate_actions`
@@ -490,8 +503,8 @@ dividends = data.corporate_actions.dividends(
 ```
 
 默认只返回已可见的完整实施记录，按
-`visible_at ASC, symbol ASC, ex_date ASC, natural_key ASC` 排序。预案将来使用独立方法，不能
-通过参数让完整实施字段提前出现。
+`visible_at ASC, symbol ASC, ex_date ASC, end_date ASC, ann_date ASC, div_proc ASC,
+imp_ann_date ASC` 排序。预案将来使用独立方法，不能通过参数让完整实施字段提前出现。
 
 `visible_end` 默认为 `as_of` 且不得晚于 `as_of`；可见时间范围两端都包含。
 
@@ -559,15 +572,16 @@ class QueryResult:
 | --- | --- |
 | `market.bars()` | `interval_end ASC, symbol ASC, interval_start ASC` |
 | `market.current/status()` | `symbol ASC` |
-| `market.daily_metrics/moneyflow()` | `trade_date ASC, symbol ASC, natural_key ASC` |
-| `fundamentals.statements/indicators()` | `end_date DESC, symbol ASC, natural_key ASC` |
-| `fundamentals.disclosures()` | `visible_at ASC, symbol ASC, end_date ASC, natural_key ASC` |
-| `corporate_actions.dividends()` | `visible_at ASC, symbol ASC, ex_date ASC, natural_key ASC` |
+| `market.daily_metrics/moneyflow()` | `trade_date ASC, symbol ASC` |
+| `fundamentals.statements()` | `end_date DESC, symbol ASC, report_type ASC, comp_type ASC` |
+| `fundamentals.indicators()` | `end_date DESC, symbol ASC` |
+| `fundamentals.disclosures()` | `visible_at ASC, symbol ASC, end_date ASC, ann_date ASC` |
+| `corporate_actions.dividends()` | `visible_at ASC, symbol ASC, ex_date ASC, end_date ASC, ann_date ASC, div_proc ASC, imp_ann_date ASC` |
 | `classification.industry()` | `symbol ASC` |
 | `calendar.sessions()` | `cal_date ASC, exchange ASC` |
 
 排序必须显式写入 SQL，不能依赖 Parquet、Manifest 或 DuckDB 的物理行顺序。`order` 只反转表中
-的主时间键，symbol 和注册的 natural key 始终作为稳定升序 tie-breaker。
+的主时间键，其余键始终作为稳定升序 tie-breaker；所有可空排序键显式使用 `NULLS LAST`。
 
 `limit` 统一遵循：
 
