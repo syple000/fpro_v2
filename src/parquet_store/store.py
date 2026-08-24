@@ -7,6 +7,7 @@ import os
 import warnings
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
+from hashlib import sha256
 from pathlib import Path
 from threading import RLock
 from time import time_ns
@@ -20,6 +21,8 @@ import pyarrow.dataset as ds
 import pyarrow.parquet as pq
 
 MANIFEST_NAME = "_manifest.json"
+# 压缩去重、排序或切分语义改变时必须递增，使旧分区自动重新整理。
+_COMPACTION_ALGORITHM_VERSION = 1
 _PROCESS_LOCKS: dict[tuple[str, str, str], RLock] = {}
 _PROCESS_LOCKS_GUARD = RLock()
 
@@ -130,6 +133,7 @@ class _Manifest:
     files: tuple[str, ...] = ()
     file_committed_at: tuple[int, ...] = ()
     updated_at: int = 0
+    compaction_signature: str | None = None
 
 
 class ParquetStore:
@@ -435,6 +439,9 @@ class ParquetStore:
     def _compact_partition(self, config: TableConfig, partition_id: str) -> int:
         directory = self._partition_path(config.name, partition_id)
         manifest = self._load_manifest(directory)
+        signature = _compaction_signature(config)
+        if manifest.compaction_signature == signature:
+            return 0
         if not manifest.files or (len(manifest.files) == 1 and not config.primary_key):
             return 0
         paths = [directory / name for name in _ordered_manifest_files(manifest)]
@@ -442,10 +449,20 @@ class ParquetStore:
         data = pa.concat_tables(tables) if tables else _empty_table(config.schema)
         deduplicated = self._deduplicate_primary_key(config, data)
         if len(manifest.files) == 1 and deduplicated.num_rows == data.num_rows:
+            self._write_manifest(
+                directory,
+                replace(manifest, compaction_signature=signature),
+            )
             return 0
         prepared = self._sort(config, deduplicated)
         chunks = _split_table(prepared, config.target_rows_per_file)
-        self._commit(config, partition_id, chunks, keep_current=False)
+        self._commit(
+            config,
+            partition_id,
+            chunks,
+            keep_current=False,
+            compaction_signature=signature,
+        )
         return 1
 
     def _commit(
@@ -455,6 +472,7 @@ class ParquetStore:
         chunks: Sequence[pa.Table],
         *,
         keep_current: bool,
+        compaction_signature: str | None = None,
     ) -> None:
         directory = self._partition_path(config.name, partition_id)
         directory.mkdir(parents=True, exist_ok=True)
@@ -479,6 +497,7 @@ class ParquetStore:
             files=tuple(files),
             file_committed_at=tuple(file_committed_at),
             updated_at=committed_at,
+            compaction_signature=compaction_signature,
         )
         try:
             self._write_manifest(directory, manifest)
@@ -517,6 +536,8 @@ class ParquetStore:
             "files": list(manifest.files),
             "file_committed_at": dict(zip(manifest.files, manifest.file_committed_at, strict=True)),
         }
+        if manifest.compaction_signature is not None:
+            payload["compaction_signature"] = manifest.compaction_signature
         try:
             with temporary.open("x", encoding="utf-8") as file:
                 json.dump(payload, file, ensure_ascii=False, indent=2, sort_keys=True)
@@ -573,11 +594,17 @@ class ParquetStore:
             or updated_at < max(file_committed_at, default=0)
         ):
             raise ValueError(f"Manifest 格式无效: {path}")
+        compaction_signature = payload.get("compaction_signature")
+        if compaction_signature is not None and (
+            not isinstance(compaction_signature, str) or not compaction_signature
+        ):
+            raise ValueError(f"Manifest 格式无效: {path}")
         return _Manifest(
             version=version,
             files=tuple(files),
             file_committed_at=file_committed_at,
             updated_at=updated_at,
+            compaction_signature=compaction_signature,
         )
 
     def _cleanup_unreferenced_files(self, directory: Path, active: set[str]) -> None:
@@ -602,6 +629,28 @@ def _ordered_manifest_files(manifest: _Manifest) -> tuple[str, ...]:
     """按提交时间排序文件；同一次提交的多个文件保持 Manifest 内原顺序。"""
     indexed = enumerate(zip(manifest.files, manifest.file_committed_at, strict=True))
     return tuple(name for _, (name, _) in sorted(indexed, key=lambda item: (item[1][1], item[0])))
+
+
+def _compaction_signature(config: TableConfig) -> str:
+    """标识会影响分区压缩结果的算法和表配置。"""
+    digest = sha256()
+    digest.update(f"parquet-store-compaction-v{_COMPACTION_ALGORITHM_VERSION}\0".encode())
+    digest.update(config.schema.serialize().to_pybytes())
+    digest.update(
+        json.dumps(
+            {
+                "partition_by": config.partition_by,
+                "sort_by": config.sort_by,
+                "target_rows_per_file": config.target_rows_per_file,
+                "primary_key": config.primary_key,
+                "deduplicate_prefer_by": config.deduplicate_prefer_by,
+            },
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode()
+    )
+    return f"v{_COMPACTION_ALGORITHM_VERSION}:{digest.hexdigest()}"
 
 
 def _column_tuple(value: str | Sequence[str], name: str) -> tuple[str, ...]:

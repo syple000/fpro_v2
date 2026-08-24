@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import TypedDict, cast
+from typing import NotRequired, TypedDict, cast
 
 import pyarrow as pa
 import pyarrow.dataset as ds
@@ -17,6 +17,7 @@ class ManifestPayload(TypedDict):
     updated_at: int
     files: list[str]
     file_committed_at: dict[str, int]
+    compaction_signature: NotRequired[str]
 
 
 SCHEMA = pa.schema(
@@ -82,6 +83,12 @@ def make_store(
 
 def read_manifest(path: Path) -> ManifestPayload:
     return cast(ManifestPayload, json.loads(path.read_text(encoding="utf-8")))
+
+
+def compaction_signature(manifest: ManifestPayload) -> str:
+    value = manifest.get("compaction_signature")
+    assert isinstance(value, str)
+    return value
 
 
 def manifest_for(root: Path, day: str) -> tuple[Path, ManifestPayload]:
@@ -313,6 +320,55 @@ def test_compact_table_deduplicates_primary_key_inside_single_file(tmp_path: Pat
 
     assert store.compact_table("events") == 1
     assert store.read("events", "a").to_pylist() == [{"day": "a", "id": 1, "value": 2.0}]
+
+
+def test_compact_table_skips_unchanged_multi_file_result_after_restart(
+    tmp_path: Path,
+) -> None:
+    store = make_store(tmp_path, max_buffer_rows=1, target_rows_per_file=2)
+    for identifier in range(5):
+        store.append("events", make_table(("a", identifier, float(identifier))))
+
+    assert store.compact_table("events") == 1
+    manifest_path, compacted = only_manifest(tmp_path)
+    assert len(compacted["files"]) == 3
+    signature = compaction_signature(compacted)
+    assert signature.startswith("v1:")
+    compacted_bytes = manifest_path.read_bytes()
+    store.close()
+
+    reopened = make_store(tmp_path, max_buffer_rows=1, target_rows_per_file=2)
+    assert reopened.compact_table("events") == 0
+    assert manifest_path.read_bytes() == compacted_bytes
+
+    reopened.append("events", make_table(("a", 5, 5.0)))
+    fragmented = read_manifest(manifest_path)
+    assert len(fragmented["files"]) == 4
+    assert "compaction_signature" not in fragmented
+
+    assert reopened.compact_table("events") == 1
+    refreshed = read_manifest(manifest_path)
+    assert len(refreshed["files"]) == 3
+    assert compaction_signature(refreshed) == signature
+    assert reopened.read("events", "a").num_rows == 6
+
+
+def test_compact_table_reprocesses_partition_when_compaction_config_changes(
+    tmp_path: Path,
+) -> None:
+    store = make_store(tmp_path, max_buffer_rows=1, target_rows_per_file=2)
+    for identifier in range(5):
+        store.append("events", make_table(("a", identifier, float(identifier))))
+    assert store.compact_table("events") == 1
+    manifest_path, first = only_manifest(tmp_path)
+    store.close()
+
+    reopened = make_store(tmp_path, max_buffer_rows=1, target_rows_per_file=3)
+    assert reopened.compact_table("events") == 1
+    second = read_manifest(manifest_path)
+
+    assert len(second["files"]) == 2
+    assert compaction_signature(second) != compaction_signature(first)
 
 
 def test_compact_without_primary_key_keeps_duplicate_rows(tmp_path: Path) -> None:
