@@ -79,7 +79,7 @@ DAILY_BASIC_READY 17:05
 | `suspend_d` 日内停牌 | 停牌区间开始时间 | 不提前返回未来停牌区间 |
 | `income`、`balancesheet`、`cashflow` | `next_session(f_ann_date)` 09:25 | 只认实际公告日 `f_ann_date` |
 | `forecast`、`express`、`fina_audit` | `next_session(ann_date)` 09:25 | 公告日当天不可见 |
-| `fina_indicator` | `next_session(ann_date)` 09:25 | Tushare 加工数据，质量低于原始报表 |
+| `fina_indicator` | `next_session(ann_date)` 09:25 | 按 Tushare 已定义的指标口径使用 |
 | 完整 `dividend` 实施记录 | `next_session(imp_ann_date)` 09:25 | 不用预案 `ann_date` 替补 |
 | `sw_industry` 成员 | `in_date` 当日 09:25 | 只返回当前行业，不返回未来退出信息 |
 | `trade_cal` | 不走普通 PIT 规则 | 作为回测引擎配置 |
@@ -136,8 +136,8 @@ Tushare 财务数据大多只有公告日期，没有精确发布时间。因此
 再按 ts_code、end_date、report_type、comp_type 选择最新版本
 ```
 
-不能先选择今天看到的最终版本，再向过去过滤。重要财务因子优先从 PIT 三张报表计算，避免
-直接依赖可能被 Tushare 重新计算的 `fina_indicator`。
+不能先选择今天看到的最终版本，再向过去过滤。需要统一计算口径的重要财务因子从 PIT 三张
+报表计算；需要 Tushare 指标口径时直接使用 `fina_indicator`。
 
 ### 分红、复权和行业
 
@@ -147,7 +147,8 @@ Tushare 财务数据大多只有公告日期，没有精确发布时间。因此
 价格以不复权日线为源。Reader 只能使用 `visible_at <= as_of` 的 `adj_factor` 现场复权，禁止
 直接使用以今天最新因子生成的前复权历史。
 
-`adjustment="pit"` 表示以 `as_of` 当时最新可见因子为锚点做前复权：
+`adjustment="forward"` 表示前复权。它与其他查询一样遵守统一的 PIT 规则，以 `as_of` 当时
+最新可见因子为锚点：
 
 ```text
 adjusted_price(t) = raw_price(t) * factor(t) / anchor_factor(as_of)
@@ -166,33 +167,19 @@ adjusted_price(t) = raw_price(t) * factor(t) / anchor_factor(as_of)
 alpha 数据逐日解锁。策略只读取当前和历史 session；若要精确还原临时休市变更，需要另存
 日历公告时间和版本。
 
-## Tushare 数据质量底线
+## Tushare 数据使用前提
 
-可见时间只能防止日期已知的未来函数，不能恢复供应商已经覆盖的旧值。当前
-`tushare_data` 会保留财报 `ann_date/f_ann_date` 等源数据明确声明的版本，但不保存行级
-`first_seen_at/observed_at`，同一版本键下的静默改值无法还原。因此必须区分三种质量：
+进入本地已发布快照的 Tushare 数据，视为已经由上游完成采集、清洗、校验和定版，是系统可以
+直接使用的自有研究数据。`DataReader` 不在查询时重新评估或质疑数据质量，不做跨源复核，不因
+首次采集时间或供应商身份降级结果，也不向策略返回 `exact/source_declared/approximate` 等质量
+标签或相关警告。
 
-| `pit_quality` | 含义 |
-| --- | --- |
-| `exact` | 有可信事件时间或本系统接收时间，并保留了查询所需版本 |
-| `source_declared` | 只能根据 Tushare 的公告日、生效日等源字段重建 |
-| `approximate` | 首次全量回填、缺少历史版本或来源字段质量不足 |
+Tushare 提供的公告日、生效日、交易日和版本字段是本系统构造 PIT 视图的权威输入。Reader 按
+前文规则计算 `visible_at`、选择当时可见版本并直接返回结果，不猜测字段是否可靠，也不因为
+存在其他数据源而拒绝使用。数据异常和跨源核验属于快照发布前的上游流程；一旦快照发布，
+研究、回测和策略统一信任并使用该快照。
 
-当前 Tushare 历史查询至多是 `source_declared`；首次采集以前的数据应降级为 `approximate`。
-`QueryResult` 必须携带整次结果中最差的 `pit_quality` 和警告，不能把下载时间冒充历史
-`visible_at`。
-
-QMT 的 `received_at` 能提供精确的接收时点，但当前实时表整理时会对相同事件键保留最后收到的
-版本。如果数据源可能修正同一个 tick/bar，旧版本仍会丢失；只有确认事件键不可修订，或以后
-保留所有接收版本时，相关查询才能标记为 `exact`。
-
-如果以后要求跨数据刷新精确复现同一结果，同步层需要另建不可变修订档案，至少保存：
-
-```text
-dataset, business_key, payload_hash, first_seen_at, batch_id, is_backfill, payload
-```
-
-在当前能力下仍必须做到：
+这里仍需保证的是查询语义和运行一致性，而不是再次审查数据质量：
 
 - 回测启动时固定 `snapshot_id` 和 `policy_version`，运行中不自动刷新数据；
 - Manifest 或 Parquet 更新不能改变一个正在运行的回测；
@@ -280,14 +267,14 @@ with DataCatalog(
 | `fundamentals.indicators()` | `tushare.fina_indicator` |
 | `fundamentals.disclosures()` | `tushare.forecast`、`express`、`fina_audit` |
 | `corporate_actions.dividends()` | `tushare.dividend` |
-| `market.bars(adjustment="pit")` | 不复权价格与 `tushare.adj_factor` |
+| `market.bars(adjustment="forward")` | 不复权价格与 `tushare.adj_factor` |
 | `classification.industry()` | `tushare.sw_industry` |
 | `calendar.*` | `tushare.trade_cal` |
 
 `qmt.financial` 和 `qmt.dividend_factors` 当前用于交叉验证，不作为第一版策略公共接口的数据源；
 前者的字段和披露时间语义还需逐表登记，后者不能替代分红公告。`qmt.daily` 中已经下载好的
-`front_ratio` 只用于数据校验，不能直接用于 PIT 回测；`adjustment="pit"` 必须由不复权价格和
-当时可见的因子计算。
+`front_ratio` 只用于数据校验，不能直接用于回测；`adjustment="forward"` 必须由不复权价格和
+`as_of` 当时可见的因子计算。
 
 ### 公共参数
 
@@ -317,7 +304,7 @@ bars = data.market.bars(
     frequency="1d",
     count=20,
     fields=("open", "high", "low", "close", "volume"),
-    adjustment="pit",
+    adjustment="forward",
     order="asc",
     limit=None,
 )
@@ -344,7 +331,7 @@ bars = data.market.bars(
 - `count` 表示每只股票最近 N 根，而 `limit` 表示合并结果的全局行数上限；
 - `count` 与 `start` 互斥；范围模式要求 `start`，`end` 默认 `as_of`；
 - bar 的业务范围按 `interval_start` 判断，`end` 不得晚于 `as_of`；
-- `adjustment` 只允许 `"none"` 和 `"pit"`，默认 `"none"`；
+- `adjustment` 只允许 `"none"` 和 `"forward"`，分别表示不复权和前复权，默认 `"none"`；
 - `count=N` 时先对每个 symbol 选出最新 N 根，再按请求的输出顺序排序；
 - `limit` 可以与 `count` 同时使用，但它会截断合并结果，可能使某些股票不足 N 根。
 
@@ -508,7 +495,7 @@ imp_ann_date ASC` 排序。预案将来使用独立方法，不能通过参数�
 
 `visible_end` 默认为 `as_of` 且不得晚于 `as_of`；可见时间范围两端都包含。
 
-`adj_factor` 默认不作为策略需要直接处理的表，而由 `market.bars(adjustment="pit")` 使用。
+`adj_factor` 默认不作为策略需要直接处理的表，而由 `market.bars(adjustment="forward")` 使用。
 研究确有需要时，可以提供只读的 `corporate_actions.adjustment_factors()`，但仍应用相同 PIT
 规则和固定排序。
 
@@ -558,8 +545,6 @@ class QueryResult:
     snapshot_id: str
     policy_version: int
     sources: tuple[str, ...]
-    pit_quality: Literal["exact", "source_declared", "approximate"]
-    warnings: tuple[str, ...]
     sort_keys: tuple[str, ...]
     truncated: bool
 
@@ -643,7 +628,7 @@ ReadRequest
 -> 按 symbols/业务范围裁剪
 -> 过滤 visible_at <= as_of
 -> 在业务键内选择最新可见版本
--> 计算 PIT 复权或安全派生字段
+-> 基于 as_of 可见数据计算前复权或安全派生字段
 -> 应用用户 payload 过滤
 -> 投影公共字段
 -> 稳定排序
