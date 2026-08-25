@@ -1,12 +1,13 @@
-# `data`：回测数据可见性与读取接口
+# `data`：研究、回测与实盘的数据读取接口
 
 `data` 只解决两个问题：
 
 1. 给定一个时间，当时能看到哪些数据；
-2. 研究和回测如何通过同一个接口读取这些数据。
+2. 研究、回测和实盘如何通过同一个接口读取可替换的数据源。
 
-本文以 Tushare 为主要历史数据源。`DataCatalog` 只注册原始 Parquet 表；策略和回测只能使用
-带 PIT 约束的 `DataReader`，不能直接访问原始表或 DuckDB connection。
+本文以 Tushare 历史数据和 QMT 历史/实时数据为内置实现，但公共接口不绑定任何供应商。
+`DataCatalog` 注册物理数据，`DataReader` 通过数据源适配器提供统一业务语义；策略只能使用
+带 PIT 约束的 `DataReader`，不能直接访问原始表、行情连接或 DuckDB connection。
 
 当前 `DataCatalog` 的 `*_as_of` 宏是过渡实现，不代表本文定义的最终语义。
 
@@ -23,7 +24,7 @@ status = data.market.status(symbols=("000001.SZ",))
 ```
 
 调用方只需要理解 `market/fundamentals/corporate_actions/classification/calendar`，不需要理解
-Tushare 表名、版本选择或 SQL。
+数据来自 Tushare、QMT 还是自定义来源，也不需要理解源表名、版本选择或 SQL。
 
 ## 一条核心规则
 
@@ -33,7 +34,7 @@ Tushare 表名、版本选择或 SQL。
 datetime(2024, 4, 30, 9, 25, tzinfo=ZoneInfo("Asia/Shanghai"))
 ```
 
-任何数据只有满足下面的条件才能返回：
+任何通过 `DataReader` 返回的数据都属于 PIT 数据，只有满足下面的条件才能返回：
 
 ```text
 visible_at <= as_of
@@ -43,7 +44,8 @@ visible_at <= as_of
 盘后。`start/end` 可以使用接口规定的 `date` 或 `datetime`，但只表示数据范围，不能代替
 `as_of`。
 
-回测也是同一套规则，只是 `as_of` 由回测时钟提供，策略不能自行指定或修改。
+研究、回测和实盘使用同一套规则。研究由调用方指定 `as_of`，回测由模拟时钟提供，实盘由
+真实时钟提供；策略不能自行指定或修改引擎传入的时间。
 
 ## 默认时间约定
 
@@ -56,22 +58,23 @@ DAILY_READY       16:05
 DAILY_BASIC_READY 17:05
 ```
 
-这些是根据 Tushare 更新时间设置的保守边界。它们属于可见性策略，修改后必须提升
-`policy_version`，以便复现历史回测。
+这些是 Tushare 内置适配器使用的时间边界。可见性策略按“数据源 + 逻辑数据集”登记；QMT
+实时适配器可以使用 `received_at`，自定义来源也可以提供自己的可见时间规则。规则修改后必须
+提升 `policy_version`，以便复现历史回测。
 
 `next_session(D)` 表示严格晚于 D 的第一个交易日。周五公告的数据通常从下周一 09:25 可见。
 
-## 所有数据的可见约束
+## 内置数据源的可见约束
 
 | 数据集 | `visible_at` | 备注 |
 | --- | --- | --- |
 | QMT tick | `received_at` | 使用本系统实际收到该事件的时间，不使用行情自带时间冒充可见时间 |
 | QMT 实时 bar | `max(interval_end, received_at)` | 只返回本系统已经收到的完整 K 线 |
-| 历史分钟线 | `interval_end` | 仅适用于来源和区间语义已经验证的数据 |
+| 历史分钟线 | `interval_end` | 由适配器登记其区间语义 |
 | `daily.open` | 交易日 D 09:30 | 作为开盘事件，不作为完整日线 |
 | 完整 `daily` | D 16:05 | 此前禁止返回当日最终 high/low/close/volume/amount |
 | `daily_basic` | D 17:05 | 属于日终数据 |
-| `moneyflow` | `next_session(D)` 09:25 | 缺少可靠更新时间，延迟到下一次盘前决策 |
+| `moneyflow` | `next_session(D)` 09:25 | 内置策略统一在下一次盘前开放 |
 | `stk_limit` | D 09:25 | D 日开盘起同时作为撮合约束 |
 | `stock_st` | D 09:25 | D 日状态影响涨跌停规则 |
 | `adj_factor` | D 09:25 | 只能用当时已可见的因子复权 |
@@ -144,19 +147,21 @@ Tushare 财务数据大多只有公告日期，没有精确发布时间。因此
 严格 Reader 默认只返回 `imp_ann_date` 已公布的完整分红实施记录。若以后需要研究预案，应增加
 独立的预案接口，只返回预案阶段已经知道的字段，不能提前返回后来补入的登记日和除权日。
 
-价格以不复权日线为源。Reader 只能使用 `visible_at <= as_of` 的 `adj_factor` 现场复权，禁止
-直接使用以今天最新因子生成的前复权历史。
+`adjustment="forward"` 表示平台统一的前复权输出语义，不规定数据源必须采用哪一种计算方式。
+无论由哪个数据源实现，它都与其他查询一样遵守 PIT 规则，只能使用 `as_of` 时已经可见的数据。
 
-`adjustment="forward"` 表示前复权。它与其他查询一样遵守统一的 PIT 规则，以 `as_of` 当时
-最新可见因子为锚点：
+派生实现可以组合 `market.daily_bars` 路由的不复权日线与
+`corporate_actions.adjustment_factors` 路由中 `as_of` 当时可见的因子现场计算：
 
 ```text
 adjusted_price(t) = raw_price(t) * factor(t) / anchor_factor(as_of)
 ```
 
-这里只调整 OHLC 和前收盘价；`volume/amount` 保留实际成交口径。结果元数据记录锚点日期和
-因子；任一必要因子缺失时整个复权查询失败，调用方可以显式改查不复权价格，但 Reader 不返回
-一张混合了复权和未复权行的表，也不自动改用今天的因子。
+例如回测可以把上述两个路由都配置为 Tushare。QMT 适配器也可以直接选择已经接收的
+`front_ratio` 日线，无需读取复权因子路由；其他自定义
+数据源也可以实现同一能力。适配器必须把结果归一到平台 bar Schema：只调整 OHLC 和前收盘价，
+`volume/amount` 保留平台规定的实际成交口径。数据源不能完整满足该语义时，Reader 明确报
+“数据源不支持前复权”，不能返回一张混合了复权和未复权行的表，也不能静默切换来源。
 
 行业成员可以用 `in_date <= D < out_date` 计算 D 日有效分类，但返回结果不能包含未来
 `out_date` 或当前快照的 `is_new`。
@@ -167,17 +172,17 @@ adjusted_price(t) = raw_price(t) * factor(t) / anchor_factor(as_of)
 alpha 数据逐日解锁。策略只读取当前和历史 session；若要精确还原临时休市变更，需要另存
 日历公告时间和版本。
 
-## Tushare 数据使用前提
+## 已发布数据使用前提
 
-进入本地已发布快照的 Tushare 数据，视为已经由上游完成采集、清洗、校验和定版，是系统可以
-直接使用的自有研究数据。`DataReader` 不在查询时重新评估或质疑数据质量，不做跨源复核，不因
+进入任一已注册来源的已发布快照后，数据视为已经由上游完成采集、清洗、校验和定版，是系统
+可以直接使用的自有数据。`DataReader` 不在查询时重新评估或质疑数据质量，不做跨源复核，不因
 首次采集时间或供应商身份降级结果，也不向策略返回 `exact/source_declared/approximate` 等质量
 标签或相关警告。
 
-Tushare 提供的公告日、生效日、交易日和版本字段是本系统构造 PIT 视图的权威输入。Reader 按
-前文规则计算 `visible_at`、选择当时可见版本并直接返回结果，不猜测字段是否可靠，也不因为
-存在其他数据源而拒绝使用。数据异常和跨源核验属于快照发布前的上游流程；一旦快照发布，
-研究、回测和策略统一信任并使用该快照。
+每个数据源适配器登记的公告日、生效日、交易日、接收时间和版本字段，是本系统构造 PIT 视图
+的权威输入。Reader 按登记规则计算 `visible_at`、选择当时可见版本并直接返回结果，不猜测字段
+是否可靠，也不因为存在其他数据源而拒绝使用。数据异常和跨源核验属于快照发布前的上游流程；
+一旦快照发布，研究、回测、实盘和策略统一信任并使用该快照。
 
 这里仍需保证的是查询语义和运行一致性，而不是再次审查数据质量：
 
@@ -203,19 +208,118 @@ Tushare 提供的公告日、生效日、交易日和版本字段是本系统构
 - [RQAlpha DataSource](https://github.com/ricequant/rqalpha/blob/master/rqalpha/data/base_data_source/data_source.py)
   把 `history_bars`、`current_snapshot` 和基本面读取分开。
 
-本项目采用相同思路：公开接口按业务拆分，底层仍使用一个 PIT 查询规划器。
+本项目采用相同思路：公开接口按业务拆分，`DataReader` 出口统一为平台数据模型，底层由 PIT
+查询规划器和可替换的数据源适配器完成读取。
 
 ```text
-DataReader.at(as_of) -> DataSnapshot
-                          ├── market
-                          ├── fundamentals
-                          ├── corporate_actions
-                          ├── classification
-                          └── calendar
+策略 / 研究 / 回测 / 实盘
+          |
+DataReader.at(as_of) -> DataSnapshot -> 平台统一 Schema
+          |
+PIT 查询规划器 + SourceConfig 路由
+          |
+          ├── TushareAdapter
+          ├── QmtAdapter
+          └── CustomAdapter
 ```
 
 不公开 `query("tushare_table", ...)` 形式的万能策略接口。策略不需要知道源表名、可见日期列、
 版本键或 SQL；这些信息由内部数据集注册表管理。
+
+### 平台统一数据模型
+
+`DataReader` 是数据抽象的唯一出口。源数据在进入 Reader 结果前必须转换为平台定义的公共
+Schema；供应商原生结构不能穿透这个边界。例如 Tushare 的 `ts_code`、QMT 的 `code`、
+`front_ratio` 标记和嵌套 `quote` 都由适配器消化，策略只看到平台的
+`symbol/interval_start/interval_end/open/high/low/close/volume/amount` 等字段。
+
+平台模型统一规定：
+
+- 字段名称、Arrow 类型、可空性和身份键；
+- 证券代码、时区、时间区间和交易日口径；
+- 价格、成交量、成交额等单位以及复权后的字段含义；
+- PIT 可见性、版本选择、默认排序、截断和空结果语义。
+
+公共 Schema 由 platform 集中定义和版本化，适配器只能提供字段映射，不能自行增加、删除或改变
+公共字段。新增供应商专属字段必须先提升为平台业务字段并更新 Schema 版本，不能只对某一个
+数据源开放。
+
+同一个公共请求切换数据源后，返回的字段集合、类型、单位、排序和业务含义必须保持不变；允许
+变化的只有来源本身提供的数值。`QueryResult.sources` 只用于平台审计和排障，不能改变公共表
+结构，也不能成为策略分支条件。
+
+### 可替换的数据源适配器
+
+每个数据源适配器以唯一 `source_id` 注册，并声明自己能够实现的逻辑能力，例如不复权日线、
+前复权日线、分钟线、实时行情或财务报表。适配器负责：
+
+- 将原生表、文件或实时消息转换为平台内部标准记录；
+- 提供该来源的 `visible_at` 规则和快照边界；
+- 用原生数据或派生计算实现请求的业务语义；
+- 在能力不支持时明确失败，不向 Reader 返回半成品或供应商专属字段。
+
+概念上的扩展契约如下；具体数据源只能返回平台内部的 `SourceBatch`，最终 `QueryResult` 只能
+由 `DataReader` 构造：
+
+```python
+class DataSourceAdapter(Protocol):
+    source_id: str
+
+    def capabilities(self) -> frozenset[DataCapability]: ...
+    def open_snapshot(self, as_of: datetime) -> SourceSnapshot: ...
+    def read(self, request: SourceRequest, snapshot: SourceSnapshot) -> SourceBatch: ...
+```
+
+`SourceBatch` 使用平台内部标准字段并包含 PIT 规划所需的 `visible_at` 和版本键，但这些内部字段
+不会自动进入公共结果。自定义来源只需实现相同适配器契约并注册，无需仿造 Tushare 或 QMT 的
+物理 Schema。
+
+### 按逻辑数据集配置来源
+
+`SourceConfig.routes` 是“平台逻辑数据集 -> source_id”的不可变映射。路由粒度不能停留在笼统的
+`market` 或 `fundamentals`，每一类可独立读取或组合的数据都有自己的稳定键：
+
+| 路由键 | 对应数据或接口 |
+| --- | --- |
+| `market.daily_bars` | `market.bars(frequency="1d")` |
+| `market.intraday_bars` | `market.bars()` 的分钟周期 |
+| `market.realtime_quotes` | `market.current()` |
+| `market.daily_metrics` | `market.daily_metrics()` |
+| `market.moneyflow` | `market.moneyflow()` |
+| `market.suspensions` | `market.status()` 的停牌字段 |
+| `market.price_limits` | `market.status()` 的涨跌停字段 |
+| `market.st_status` | `market.status()` 的 ST 字段 |
+| `fundamentals.income` | 利润表 |
+| `fundamentals.balance_sheet` | 资产负债表 |
+| `fundamentals.cashflow` | 现金流量表 |
+| `fundamentals.indicators` | 财务指标 |
+| `fundamentals.forecast`、`fundamentals.express`、`fundamentals.audit` | 业绩预告、快报和审计意见 |
+| `corporate_actions.dividends` | 分红实施记录 |
+| `corporate_actions.adjustment_factors` | 复权因子 |
+| `classification.industry` | 行业分类和成员 |
+| `calendar.sessions` | 交易日历 |
+
+Reader 创建时校验所有已配置的 `source_id` 是否注册并支持对应基础数据集；每次查询再校验频率、
+复权方式和字段组合等具体能力。配置允许只包含当前运行需要的数据集，以便构造轻量 Reader；
+但是没有配置的路由没有默认来源，也不会从相邻类别推断来源或自动回退。每个路由只能绑定一个
+`source_id`，不接受候选列表；未知路由键、重复路由或空 `source_id` 在构造配置时直接报错。
+
+错误语义必须区分清楚：
+
+- 请求依赖的路由未配置：抛出 `DataSourceNotConfiguredError`；
+- 路由已配置，但适配器不支持请求能力且平台也无法用已配置依赖完成派生：抛出
+  `DataCapabilityNotSupportedError`；
+- 适配器无法打开已发布数据集、没有可用快照或其存储当前不可访问：抛出
+  `DataSourceUnavailableError`；
+- 已发布快照正常可读，只是指定证券或时间范围内没有记录：返回符合平台 Schema 的空
+  `QueryResult`。
+
+数据源在 Reader 创建时绑定，策略不能逐次选源。一个公共请求依赖多个逻辑数据集时，Reader
+只解析本次确实需要的路由：例如 `market.status(fields=("suspended",))` 只要求
+`market.suspensions`；Tushare 派生前复权同时要求 `market.daily_bars` 和
+`corporate_actions.adjustment_factors`，而 QMT 原生 `front_ratio` 只要求前者。
+多路由组合结果的 `QueryResult.sources` 记录本次实际使用的全部 `source_id`，但公共表 Schema
+不随来源数量变化。
 
 ### 创建时间快照
 
@@ -234,30 +338,52 @@ with DataCatalog(
     tushare_root="data/tushare",
     qmt_root="data/qmt",
 ) as catalog:
-    reader = DataReader(
+    backtest_reader = DataReader(
         catalog,
         sources=SourceConfig(
-            daily_bars="tushare",
-            intraday_bars="qmt",
-            fundamentals="tushare",
-            realtime_quotes="qmt",
+            routes={
+                "market.daily_bars": "tushare",
+                "corporate_actions.adjustment_factors": "tushare",
+                "fundamentals.income": "tushare",
+                "fundamentals.balance_sheet": "tushare",
+                "fundamentals.cashflow": "tushare",
+                "calendar.sessions": "tushare",
+            },
         ),
     )
-    data = reader.at(
+    live_reader = DataReader(
+        catalog,
+        sources=SourceConfig(
+            routes={
+                "market.daily_bars": "qmt",
+                "market.intraday_bars": "qmt",
+                "market.realtime_quotes": "qmt",
+                "market.suspensions": "tushare",
+                "market.price_limits": "tushare",
+                "market.st_status": "tushare",
+                "fundamentals.income": "tushare",
+                "fundamentals.balance_sheet": "tushare",
+                "fundamentals.cashflow": "tushare",
+                "calendar.sessions": "tushare",
+            },
+        ),
+    )
+    data = backtest_reader.at(
         datetime(2024, 4, 30, 9, 25, tzinfo=SHANGHAI)
     )
 ```
 
 `DataReader.at()` 拒绝无时区 `datetime`，并把其他时区的 aware datetime 归一到
-`Asia/Shanghai`。数据源在创建 Reader 时一次绑定，不允许策略逐次选择，也不在数据缺失时
-静默切换来源。只使用 Tushare 时，`intraday_bars` 和 `realtime_quotes` 都设为 `None`，相应
-方法明确报“数据源未配置”。
+`Asia/Shanghai`。上例的回测 Reader 使用 Tushare 日线，实盘 Reader 使用 QMT 日线；两者向
+策略提供完全相同的 `market.bars()` 结构和语义。示例只配置各自需要的数据集；调用未配置的
+数据集会抛出 `DataSourceNotConfiguredError`。
 
-当前物理表与公共接口的关系如下：
+当前内置适配器与公共接口的关系如下：
 
-| 公共接口 | 当前数据来源 |
+| 公共接口 | 内置实现 |
 | --- | --- |
-| `market.bars(frequency="1d")` | `tushare.daily`；也可显式配置 `qmt.daily` 中的不复权日线 |
+| `market.bars(frequency="1d", adjustment="none")` | Tushare `daily`；或 QMT `daily(adjustment="none")` |
+| `market.bars(frequency="1d", adjustment="forward")` | Tushare `daily + adj_factor` 现场计算；或直接使用 QMT `daily(adjustment="front_ratio")` |
 | `market.bars()` 分钟周期 | 当前只有已经实时接收并落盘的 `qmt.bars`；`tushare_data` 尚无分钟表 |
 | `market.current()` | QMT tick/bar；无实时源时仅提供 Tushare 日线的开盘事件 |
 | `market.daily_metrics()` | `tushare.daily_basic` |
@@ -267,14 +393,14 @@ with DataCatalog(
 | `fundamentals.indicators()` | `tushare.fina_indicator` |
 | `fundamentals.disclosures()` | `tushare.forecast`、`express`、`fina_audit` |
 | `corporate_actions.dividends()` | `tushare.dividend` |
-| `market.bars(adjustment="forward")` | 不复权价格与 `tushare.adj_factor` |
 | `classification.industry()` | `tushare.sw_industry` |
 | `calendar.*` | `tushare.trade_cal` |
 
 `qmt.financial` 和 `qmt.dividend_factors` 当前用于交叉验证，不作为第一版策略公共接口的数据源；
-前者的字段和披露时间语义还需逐表登记，后者不能替代分红公告。`qmt.daily` 中已经下载好的
-`front_ratio` 只用于数据校验，不能直接用于回测；`adjustment="forward"` 必须由不复权价格和
-`as_of` 当时可见的因子计算。
+它们以后可以在完成平台 Schema 映射和可见性规则登记后成为对应能力的实现。QMT `front_ratio`
+已经是 `adjustment="forward"` 的有效实现：当 `market.daily_bars="qmt"` 时适配器直接读取并
+归一化它；配置 Tushare 派生实现时，Reader 按显式路由组合 `market.daily_bars` 与
+`corporate_actions.adjustment_factors`，两个路由不要求来自同一个来源。
 
 ### 公共参数
 
@@ -287,7 +413,8 @@ with DataCatalog(
 - 业务时间的 `start/end` 和报告范围均为左闭右开 `[start, end)`；
 - `order` 只接受 `"asc"` 或 `"desc"`，不能传任意排序字段；
 - `limit` 默认 `None`；非空时必须是正整数且不超过配置上限，布尔值不视为整数；
-- 数据缺失返回空行或空表，不自动补数、换源或降低 PIT 规则。
+- 路由已正确配置但筛选范围没有记录时返回空行或空表，不自动补数、换源或降低 PIT 规则；
+- 路由未配置、来源不可用或能力不支持时抛出对应数据源错误，不解释为空数据。
 
 每类结果的身份字段始终返回，不能被 `fields` 删除。例如 bar 始终包含
 `symbol/interval_start/interval_end`，财报始终包含 `symbol/end_date/ann_date/f_ann_date`。
@@ -332,6 +459,7 @@ bars = data.market.bars(
 - `count` 与 `start` 互斥；范围模式要求 `start`，`end` 默认 `as_of`；
 - bar 的业务范围按 `interval_start` 判断，`end` 不得晚于 `as_of`；
 - `adjustment` 只允许 `"none"` 和 `"forward"`，分别表示不复权和前复权，默认 `"none"`；
+- `adjustment` 描述平台输出语义，不指定底层算法；所选适配器必须声明支持该语义；
 - `count=N` 时先对每个 symbol 选出最新 N 根，再按请求的输出顺序排序；
 - `limit` 可以与 `count` 同时使用，但它会截断合并结果，可能使某些股票不足 N 根。
 
@@ -451,8 +579,9 @@ indicators = data.fundamentals.indicators(
 )
 ```
 
-参数与报表类似，默认按 `end_date DESC, symbol ASC` 排序。结果元数据必须标记其来自 Tushare
-加工数据；需要严格复现的指标优先由 PIT 三张报表计算。
+参数与报表类似，默认按 `end_date DESC, symbol ASC` 排序。结果始终使用平台财务指标 Schema；
+当前内置实现来自 Tushare，来源信息只保留在 `QueryResult.sources` 审计元数据中。需要统一计算
+口径的指标由平台基于 PIT 三张报表计算，需要数据源既定指标口径时由所选适配器提供。
 
 ### 预告、快报和审计 `fundamentals.disclosures()`
 
@@ -543,13 +672,18 @@ class QueryResult:
     table: pyarrow.Table
     as_of: datetime
     snapshot_id: str
+    source_config_id: str
     policy_version: int
+    schema_version: int
     sources: tuple[str, ...]
     sort_keys: tuple[str, ...]
     truncated: bool
 
     def to_pandas(self) -> pandas.DataFrame: ...
 ```
+
+`DataReader` 在构造 `QueryResult` 前按平台公共 Schema 做严格校验；缺少字段、多出供应商字段、
+类型或单位无法归一时都视为适配器错误，不把不一致结果交给调用方。
 
 各接口的默认排序汇总如下：
 
@@ -580,7 +714,7 @@ class QueryResult:
 `iter_batches(batch_size=...)`；第一版不提供 `offset`，需要分页时使用包含 `snapshot_id` 和
 最后排序键的 keyset cursor。
 
-## 回测接口
+## 回测与实盘接口
 
 回测引擎从同一个 `DataReader` 创建绑定模拟时钟的快照：
 
@@ -602,7 +736,8 @@ def on_event(context, data):
 实盘：引擎使用真实当前时间创建快照
 ```
 
-三者复用完全相同的领域接口和 PIT 查询规划器。
+三者复用完全相同的领域接口、平台 Schema 和 PIT 查询规划器。回测与实盘可以绑定不同的
+`SourceConfig`，但传给策略的 `data` 对象不能因此改变类型或字段语义。
 
 ## 内部查询模型
 
@@ -614,6 +749,7 @@ ReadRequest
     as_of
     symbols
     business_range
+    semantic_options
     allowed_filters
     projection
     sort
@@ -623,14 +759,20 @@ ReadRequest
 执行顺序固定为：
 
 ```text
-固定 snapshot 文件并取得读取 lease
+根据请求解析主逻辑数据集
+-> 从 SourceConfig 解析主 source_id
+-> 根据主适配器能力选择原生实现或平台派生计划
+-> 解析派生计划依赖的其他路由
+-> 校验所有数据源能力
+-> 固定来源快照并取得读取 lease
 -> 校验参数和数据集策略
+-> 适配器读取候选数据并归一到平台内部结构
 -> 按 symbols/业务范围裁剪
 -> 过滤 visible_at <= as_of
 -> 在业务键内选择最新可见版本
--> 基于 as_of 可见数据计算前复权或安全派生字段
+-> 由适配器原生实现或基于可见数据完成请求语义
 -> 应用用户 payload 过滤
--> 投影公共字段
+-> 投影平台公共 Schema
 -> 稳定排序
 -> limit + 1
 -> QueryResult
@@ -639,12 +781,14 @@ ReadRequest
 身份和业务范围过滤可以安全地下推到版本选择之前；依赖 payload 值的过滤必须在版本选择之后。
 否则最新修订不符合条件时，查询可能错误地重新返回符合条件的旧版本。
 
-`DataCatalog` 只负责文件和 DuckDB 生命周期；`DataReader` 及其领域 Reader 负责可见性、版本、
-字段安全、排序和审计。策略代码不得持有 `catalog.connection`。
+`DataCatalog` 负责物理数据和 DuckDB 生命周期；数据源适配器负责来源接入和标准化；
+`DataReader` 及其领域 Reader 负责来源路由、PIT、版本、平台 Schema、排序和审计。策略代码
+不得持有 `catalog.connection` 或数据源客户端。
 
-实现 `snapshot_id` 时必须同时固定 Manifest 中的文件列表，并让压缩/垃圾回收在所有读取 lease
-释放前保留旧文件。只固定文件路径但允许后台删除文件，既不能保证一致读取，也不能保证查询
-一定成功。
+`source_config_id` 是完整不可变路由映射的稳定摘要，用于区分数据相同但来源配置不同的运行。
+实现 `snapshot_id` 时还必须覆盖本次 Reader 使用的全部来源。文件来源固定 Manifest 文件列表，
+实时来源固定已提交批次或接收序列上界；压缩/垃圾回收在所有读取 lease 释放前保留对应数据。
+只固定某一个来源或只记录文件路径，不能保证一次跨来源查询的一致性。
 
 ## 验收条件
 
@@ -654,7 +798,13 @@ ReadRequest
 
 此外至少验证：
 
-- 所有公共方法使用同一个快照 `as_of/snapshot_id/policy_version`；
+- 所有公共方法使用同一个 `as_of/snapshot_id/source_config_id/policy_version`；
+- 每个逻辑数据集都能独立绑定 Tushare、QMT 或自定义来源，组合查询只读取本次需要的路由；
+- 路由未配置、能力不支持、来源不可用和合法空结果分别产生约定的不同结果；
+- 同一公共请求切换 Tushare、QMT 或自定义适配器后，结果 Schema、类型、单位和排序完全一致；
+- 回测用 Tushare 计算前复权、实盘用 QMT `front_ratio` 时，策略调用和平台 bar 结构完全一致；
+- 数据源缺少请求能力时明确失败，不返回供应商字段、不生成半成品且不静默换源；
+- 适配器返回缺列、多列或错误类型时在 Reader 边界失败，不能生成 `QueryResult`；
 - 相同参数的结果字段、排序和 `truncated` 完全稳定；
 - `limit` 只在 PIT 过滤、版本选择和排序后执行；
 - `count=N` 对每个 symbol 生效，`limit=N` 对合并结果生效；

@@ -70,7 +70,8 @@ agent 保留 XtData 原始 `quote.time`。receiver 落盘时才生成业务字�
 
 `sync.py` 将 agent 的直接查询结果写入 `QmtDataStore`：
 
-- `sync_daily()`：同步日线，`adjustment` 区分 `none` 与 `front`；默认增量下载。
+- `sync_daily()`：同步日线，`adjustment` 区分 `none` 与 `front_ratio`；默认增量下载。两种原生
+  结构都由数据源适配器归一化后再从 `DataReader` 输出。
 - `sync_financial()`：同步八类具体财务记录。
 - `sync_dividend_factors()`：同步具体 `DividendFactor` 记录。
 - `sync_all()`：依次完成上述三类，并接受关键字参数 `force=False`。
