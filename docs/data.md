@@ -9,7 +9,8 @@
 `DataCatalog` 注册物理数据，`DataReader` 通过数据源适配器提供统一业务语义；策略只能使用
 带 PIT 约束的 `DataReader`，不能直接访问原始表、行情连接或 DuckDB connection。
 
-当前 `DataCatalog` 的 `*_as_of` 宏是过渡实现，不代表本文定义的最终语义。
+`DataCatalog` 只负责原始物理视图和 Manifest 文件快照，不提供另一套 `*_as_of` 查询入口；
+PIT 语义统一由 adapter 和 `DataReader` 实现。
 
 最常见的用法只有两步：先固定“站在哪个时间看”，再按业务领域取数。
 
@@ -136,7 +137,7 @@ Tushare 财务数据大多只有公告日期，没有精确发布时间。因此
 
 ```text
 先过滤 visible_at <= as_of
-再按 ts_code、end_date、report_type、comp_type 选择最新版本
+适配器在 Tushare 原始表中筛选合并口径，再按 ts_code、end_date、comp_type 选择最新版本
 ```
 
 不能先选择今天看到的最终版本，再向过去过滤。需要统一计算口径的重要财务因子从 PIT 三张
@@ -240,6 +241,17 @@ Schema；供应商原生结构不能穿透这个边界。例如 Tushare 的 `ts_
 - 价格、成交量、成交额等单位以及复权后的字段含义；
 - PIT 可见性、版本选择、默认排序、截断和空结果语义。
 
+单位采用平台全局约定：
+
+- 金额统一为人民币元，价格和每股金额为人民币元/股；
+- 成交量、股本统一为股；送转比例表示每一原有股对应的新增股数；
+- 百分比、收益率、利润率和增长率统一使用小数，`0.125` 表示 `12.5%`；
+- PE、PB、周转率等倍数直接保留倍数值，`15.0` 表示 15 倍；
+- 复权因子是无量纲相对值，只有同一序列内的相对关系有意义。
+
+Reader 在统一入口根据 `CAPABILITY_SCHEMAS` 校验字段名称、顺序、类型和可空性；单位正确性由
+适配器换算和对应数值测试保证。
+
 公共 Schema 由 platform 集中定义和版本化，适配器只能提供字段映射，不能自行增加、删除或改变
 公共字段。新增供应商专属字段必须先提升为平台业务字段并更新 Schema 版本，不能只对某一个
 数据源开放。
@@ -258,8 +270,8 @@ Schema；供应商原生结构不能穿透这个边界。例如 Tushare 的 `ts_
 - 用原生数据或派生计算实现请求的业务语义；
 - 在能力不支持时明确失败，不向 Reader 返回半成品或供应商专属字段。
 
-概念上的扩展契约如下；具体数据源只能返回平台内部的 `SourceBatch`，最终 `QueryResult` 只能
-由 `DataReader` 构造：
+概念上的扩展契约如下；具体数据源直接返回符合平台 Schema 的 `pyarrow.Table`，最终
+`QueryResult` 只能由 `DataReader` 构造：
 
 ```python
 class DataSourceAdapter(Protocol):
@@ -267,12 +279,12 @@ class DataSourceAdapter(Protocol):
 
     def capabilities(self) -> frozenset[DataCapability]: ...
     def open_snapshot(self, as_of: datetime) -> SourceSnapshot: ...
-    def read(self, request: SourceRequest, snapshot: SourceSnapshot) -> SourceBatch: ...
+    def read(self, request: SourceRequest, snapshot: SourceSnapshot) -> pa.Table: ...
 ```
 
-`SourceBatch` 使用平台内部标准字段并包含 PIT 规划所需的 `visible_at` 和版本键，但这些内部字段
-不会自动进入公共结果。自定义来源只需实现相同适配器契约并注册，无需仿造 Tushare 或 QMT 的
-物理 Schema。
+返回表使用平台标准字段，并包含该能力 Schema 规定的 PIT 字段和版本键；Reader 会严格校验字段、
+类型、顺序与可空性。自定义来源只需实现相同适配器契约并注册，无需仿造 Tushare 或 QMT
+的物理 Schema。
 
 ### 按逻辑数据集配置来源
 
@@ -417,7 +429,8 @@ with DataCatalog(
 - 路由未配置、来源不可用或能力不支持时抛出对应数据源错误，不解释为空数据。
 
 每类结果的身份字段始终返回，不能被 `fields` 删除。例如 bar 始终包含
-`symbol/interval_start/interval_end`，财报始终包含 `symbol/end_date/ann_date/f_ann_date`。
+`symbol/interval_start/interval_end`，财报始终包含
+`symbol/period_end/visible_at/announcement_date/actual_announcement_date/company_type`。
 
 ## 行情接口 `market`
 
@@ -525,7 +538,20 @@ flows = data.market.moneyflow(
 二者默认按 `trade_date ASC, symbol ASC` 排序；倒序只反转 `trade_date`。这两个字段组成当前
 两张源表的唯一业务键。
 
+行情价格为人民币元/股，成交量为股，成交额为人民币元。每日指标的
+`turnover_rate/turnover_rate_f/dv_ratio/dv_ttm` 使用小数；例如源数据的 `2.5%` 统一返回
+`0.025`。`pe/pb/ps/volume_ratio` 等保留倍数口径。
+
 ## 财务接口 `fundamentals`
+
+财务公共字段只由 `models/financial.py` 定义。Reader 不认识 `ts_code`、`f_ann_date`、
+`free_cashflow` 等供应商原始字段；每个适配器必须先把它们映射为平台 Schema，Reader 再严格校验
+字段名、顺序、Arrow 类型和非空约束。新增供应商不修改 `models` 或研究层调用。
+
+平台财务单位固定为：金额使用人民币元，每股金额使用人民币元/股，百分比来源的利润率、回报率
+和同比变化使用小数（例如 12.5% 返回 `0.125`）；流动比率和周转率等使用倍数。资产负债表的
+`share_capital` 是股，不是人民币金额。供应商使用万元或百分数值时由适配器转换。原始公告日与
+PIT 可见时间分开保存为 `announcement_date` 和 `visible_at`；`period_end` 表示报告期末。
 
 ### 三张报表 `fundamentals.statements()`
 
@@ -536,9 +562,8 @@ income = data.fundamentals.statements(
     report_start=date(2021, 1, 1),
     report_end=date(2024, 4, 1),
     periods=None,
-    report_type="1",
-    comp_type=None,
-    fields=("revenue", "operate_profit", "n_income"),
+    company_type="industrial",
+    fields=("operating_revenue", "operating_profit", "net_income"),
     order="desc",
     limit=100,
 )
@@ -551,20 +576,22 @@ income = data.fundamentals.statements(
     kind="income",
     symbols=("000001.SZ", "600000.SH"),
     periods=8,
-    fields=("revenue", "n_income"),
+    fields=("operating_revenue", "net_income_attributable_to_parent"),
     order="desc",
 )
 ```
 
+平台只公开合并口径报表，Tushare 的 `report_type/end_type` 等源编码不进入公共 Schema。
 `periods` 与 `report_start/report_end` 互斥；范围模式至少传 `report_start`，`report_end` 默认不设
-上界。`periods` 是每只股票最近 N 个不同的 `end_date`，选完报告期后再返回符合
-`report_type/comp_type` 的行；`limit` 仍是合并结果的全局上限。默认排序为：
+上界。`periods` 是每只股票最近 N 个不同的 `period_end`，选完报告期后再返回符合
+`company_type` 的行。`company_type` 使用平台枚举 `industrial/bank/insurance/securities`；`limit`
+仍是合并结果的全局上限。默认排序为：
 
 ```text
-end_date DESC, symbol ASC, report_type ASC, comp_type ASC
+period_end DESC, symbol ASC, company_type ASC
 ```
 
-`order="asc"` 只反转 `end_date`。在 SQL 中必须先过滤可见修订，再选每个业务键的最新版，最后
+`order="asc"` 只反转 `period_end`。在 SQL 中必须先过滤可见修订，再选每个业务键的最新版，最后
 应用用户字段过滤和 `limit`。
 
 ### 财务指标 `fundamentals.indicators()`
@@ -573,13 +600,13 @@ end_date DESC, symbol ASC, report_type ASC, comp_type ASC
 indicators = data.fundamentals.indicators(
     symbols=("000001.SZ",),
     periods=8,
-    fields=("eps", "roe", "grossprofit_margin"),
+    fields=("basic_earnings_per_share", "return_on_equity", "gross_margin"),
     order="desc",
     limit=100,
 )
 ```
 
-参数与报表类似，默认按 `end_date DESC, symbol ASC` 排序。结果始终使用平台财务指标 Schema；
+参数与报表类似，默认按 `period_end DESC, symbol ASC` 排序。结果始终使用平台财务指标 Schema；
 当前内置实现来自 Tushare，来源信息只保留在 `QueryResult.sources` 审计元数据中。需要统一计算
 口径的指标由平台基于 PIT 三张报表计算，需要数据源既定指标口径时由所选适配器提供。
 
@@ -603,7 +630,7 @@ reports = data.fundamentals.disclosures(
 默认排序为：
 
 ```text
-visible_at ASC, symbol ASC, end_date ASC, ann_date ASC
+visible_at ASC, symbol ASC, period_end ASC, announcement_date ASC
 ```
 
 ## 公司行动接口 `corporate_actions`
@@ -692,9 +719,9 @@ class QueryResult:
 | `market.bars()` | `interval_end ASC, symbol ASC, interval_start ASC` |
 | `market.current/status()` | `symbol ASC` |
 | `market.daily_metrics/moneyflow()` | `trade_date ASC, symbol ASC` |
-| `fundamentals.statements()` | `end_date DESC, symbol ASC, report_type ASC, comp_type ASC` |
-| `fundamentals.indicators()` | `end_date DESC, symbol ASC` |
-| `fundamentals.disclosures()` | `visible_at ASC, symbol ASC, end_date ASC, ann_date ASC` |
+| `fundamentals.statements()` | `period_end DESC, symbol ASC, company_type ASC` |
+| `fundamentals.indicators()` | `period_end DESC, symbol ASC` |
+| `fundamentals.disclosures()` | `visible_at ASC, symbol ASC, period_end ASC, announcement_date ASC` |
 | `corporate_actions.dividends()` | `visible_at ASC, symbol ASC, ex_date ASC, end_date ASC, ann_date ASC, div_proc ASC, imp_ann_date ASC` |
 | `classification.industry()` | `symbol ASC` |
 | `calendar.sessions()` | `cal_date ASC, exchange ASC` |

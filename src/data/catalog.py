@@ -3,6 +3,12 @@
 from __future__ import annotations
 
 import json
+import os
+import shutil
+import tempfile
+from collections.abc import Mapping
+from dataclasses import dataclass
+from hashlib import sha256
 from pathlib import Path
 
 import duckdb
@@ -22,22 +28,6 @@ from qmt_receiver import (
 )
 from tushare_data.schemas import TABLE_SCHEMAS
 
-_TUSHARE_MARKET_TABLES = (
-    "daily",
-    "daily_basic",
-    "adj_factor",
-    "suspend_d",
-    "stk_limit",
-    "stock_st",
-    "moneyflow",
-)
-_TUSHARE_STATEMENT_TABLES = ("income", "balancesheet", "cashflow")
-_TUSHARE_ANNOUNCEMENT_TABLES = (
-    "forecast",
-    "express",
-    "fina_audit",
-    "fina_indicator",
-)
 _QMT_SCHEMAS = {
     TICK_TABLE: TICK_SCHEMA,
     BAR_TABLE: BAR_SCHEMA,
@@ -47,20 +37,41 @@ _QMT_SCHEMAS = {
 }
 
 
+@dataclass(slots=True)
+class CatalogSnapshot:
+    """显式绑定 Manifest 文件集合的只读 DuckDB 快照。"""
+
+    connection: duckdb.DuckDBPyConnection
+    snapshot_id: str
+    _lease: tempfile.TemporaryDirectory[str]
+
+    def close(self) -> None:
+        try:
+            self.connection.close()
+        finally:
+            self._lease.cleanup()
+
+    def __enter__(self) -> CatalogSnapshot:
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.close()
+
+
 class DataCatalog:
-    """在一个 DuckDB 连接中公开 Tushare/QMT 原始视图和 PIT 表宏。"""
+    """注册 Tushare/QMT 原始视图并固定 Manifest 文件快照。"""
 
     def __init__(
         self,
         *,
         tushare_root: str | Path,
         qmt_root: str | Path,
-        connection: duckdb.DuckDBPyConnection | None = None,
     ) -> None:
-        self._tushare_root = Path(tushare_root).expanduser().resolve()
-        self._qmt_root = Path(qmt_root).expanduser().resolve()
-        self._connection = connection or duckdb.connect(":memory:")
-        self._owns_connection = connection is None
+        self._sources: dict[str, tuple[Path, Mapping[str, pa.Schema]]] = {
+            "tushare": (Path(tushare_root).expanduser().resolve(), TABLE_SCHEMAS),
+            "qmt": (Path(qmt_root).expanduser().resolve(), _QMT_SCHEMAS),
+        }
+        self._connection = duckdb.connect(":memory:")
         self.refresh()
 
     @property
@@ -69,130 +80,68 @@ class DataCatalog:
         return self._connection
 
     def refresh(self) -> None:
-        """根据最新 Manifest 重新注册原始视图和 as_of 表宏。"""
-        self._connection.execute('CREATE SCHEMA IF NOT EXISTS "tushare"')
-        self._connection.execute('CREATE SCHEMA IF NOT EXISTS "qmt"')
-        for table, schema in TABLE_SCHEMAS.items():
-            self._register_view("tushare", table, self._tushare_root, schema)
-        for table, schema in _QMT_SCHEMAS.items():
-            self._register_view("qmt", table, self._qmt_root, schema)
-        self._register_as_of_macros()
+        """根据最新 Manifest 重新注册原始视图。"""
+        for source, (root, schemas) in self._sources.items():
+            self._connection.execute(f"CREATE SCHEMA IF NOT EXISTS {_quote_identifier(source)}")
+            for table, schema in schemas.items():
+                _register_parquet_view(
+                    self._connection,
+                    source=source,
+                    table=table,
+                    files=_active_files(root / table),
+                    schema=schema,
+                )
+
+    def open_snapshot(self, source: str) -> CatalogSnapshot:
+        """按当前 Manifest 打开一个不随 `refresh()` 改变的来源快照。"""
+        try:
+            root, schemas = self._sources[source]
+        except KeyError:
+            raise ValueError(f"DataCatalog 不支持来源: {source!r}") from None
+
+        connection = duckdb.connect(":memory:")
+        connection.execute("SET TimeZone = 'Asia/Shanghai'")
+        lease = tempfile.TemporaryDirectory(prefix="fpro-data-snapshot-")
+        lease_root = Path(lease.name)
+        digest = sha256()
+        try:
+            connection.execute(f"CREATE SCHEMA {_quote_identifier(source)}")
+            for table, schema in schemas.items():
+                files = _active_files(root / table)
+                digest.update(source.encode())
+                digest.update(table.encode())
+                for path in files:
+                    digest.update(str(path).encode())
+                    stat = path.stat()
+                    digest.update(str(stat.st_size).encode())
+                    digest.update(str(stat.st_mtime_ns).encode())
+                leased_files = _lease_files(files, lease_root / table)
+                _register_parquet_view(
+                    connection,
+                    source=source,
+                    table=table,
+                    files=leased_files,
+                    schema=schema,
+                )
+        except BaseException:
+            connection.close()
+            lease.cleanup()
+            raise
+        return CatalogSnapshot(
+            connection=connection,
+            snapshot_id=digest.hexdigest()[:24],
+            _lease=lease,
+        )
 
     def close(self) -> None:
-        """关闭由本对象创建的 DuckDB 连接。"""
-        if self._owns_connection:
-            self._connection.close()
+        """关闭 DuckDB 连接。"""
+        self._connection.close()
 
     def __enter__(self) -> DataCatalog:
         return self
 
     def __exit__(self, *_: object) -> None:
         self.close()
-
-    def _register_view(
-        self,
-        source: str,
-        table: str,
-        root: Path,
-        schema: pa.Schema,
-    ) -> None:
-        files = _active_files(root / table)
-        qualified = f"{_quote_identifier(source)}.{_quote_identifier(table)}"
-        if files:
-            paths = ", ".join(_quote_string(str(path)) for path in files)
-            query = (
-                f"CREATE OR REPLACE VIEW {qualified} AS "
-                f"SELECT * FROM read_parquet([{paths}], "
-                "union_by_name = true, hive_partitioning = false)"
-            )
-        else:
-            registration = f"__data_empty_{source}_{table}"
-            self._connection.register(registration, schema.empty_table())
-            query = (
-                f"CREATE OR REPLACE VIEW {qualified} AS "
-                f"SELECT * FROM {_quote_identifier(registration)}"
-            )
-        self._connection.execute(query)
-
-    def _register_as_of_macros(self) -> None:
-        for table in _TUSHARE_MARKET_TABLES:
-            self._create_macro(
-                "tushare",
-                f"{table}_as_of",
-                "as_of_date",
-                f'SELECT * FROM "tushare".{_quote_identifier(table)} '
-                "WHERE trade_date <= CAST(as_of_date AS DATE)",
-            )
-
-        for table in _TUSHARE_STATEMENT_TABLES:
-            self._create_macro(
-                "tushare",
-                f"{table}_as_of",
-                "as_of_date",
-                f'SELECT * FROM "tushare".{_quote_identifier(table)} '
-                "WHERE f_ann_date <= CAST(as_of_date AS DATE) "
-                "QUALIFY row_number() OVER ("
-                "PARTITION BY ts_code, end_date, report_type, comp_type "
-                "ORDER BY f_ann_date DESC NULLS LAST, "
-                "try_cast(update_flag AS INTEGER) DESC NULLS LAST"
-                ") = 1",
-            )
-
-        for table in _TUSHARE_ANNOUNCEMENT_TABLES:
-            update_order = (
-                ", try_cast(update_flag AS INTEGER) DESC NULLS LAST"
-                if "update_flag" in TABLE_SCHEMAS[table].names
-                else ""
-            )
-            self._create_macro(
-                "tushare",
-                f"{table}_as_of",
-                "as_of_date",
-                f'SELECT * FROM "tushare".{_quote_identifier(table)} '
-                "WHERE ann_date <= CAST(as_of_date AS DATE) "
-                "QUALIFY row_number() OVER ("
-                "PARTITION BY ts_code, end_date "
-                f"ORDER BY ann_date DESC NULLS LAST{update_order}"
-                ") = 1",
-            )
-
-        self._create_macro(
-            "tushare",
-            "dividend_as_of",
-            "as_of_date",
-            'SELECT * FROM "tushare"."dividend" '
-            "WHERE imp_ann_date <= CAST(as_of_date AS DATE)",
-        )
-        self._create_macro(
-            "tushare",
-            "sw_industry_as_of",
-            "as_of_date",
-            "SELECT * REPLACE (NULL::DATE AS out_date, NULL::VARCHAR AS is_new) "
-            'FROM "tushare"."sw_industry" '
-            "WHERE in_date <= CAST(as_of_date AS DATE) "
-            "AND (out_date IS NULL OR out_date > CAST(as_of_date AS DATE))",
-        )
-        self._create_macro(
-            "tushare",
-            "trade_cal_as_of",
-            "as_of_date",
-            'SELECT * FROM "tushare"."trade_cal" WHERE cal_date <= CAST(as_of_date AS DATE)',
-        )
-
-        for table in (TICK_TABLE, BAR_TABLE):
-            self._create_macro(
-                "qmt",
-                f"{table}_as_of",
-                "as_of_us",
-                f'SELECT * FROM "qmt".{_quote_identifier(table)} '
-                "WHERE received_at <= CAST(as_of_us AS BIGINT)",
-            )
-
-    def _create_macro(self, schema: str, name: str, parameter: str, query: str) -> None:
-        self._connection.execute(
-            f"CREATE OR REPLACE MACRO {_quote_identifier(schema)}.{_quote_identifier(name)}"
-            f"({parameter}) AS TABLE ({query})"
-        )
 
 
 def _active_files(table_root: Path) -> list[Path]:
@@ -236,6 +185,45 @@ def _active_files(table_root: Path) -> list[Path]:
                 raise ValueError(f"Manifest 引用的 Parquet 文件不存在: {path}")
             files.append(path)
     return files
+
+
+def _register_parquet_view(
+    connection: duckdb.DuckDBPyConnection,
+    *,
+    source: str,
+    table: str,
+    files: list[Path],
+    schema: pa.Schema,
+) -> None:
+    """把一个确定的 Parquet 文件集合注册为视图。"""
+    qualified = f"{_quote_identifier(source)}.{_quote_identifier(table)}"
+    if files:
+        paths = ", ".join(_quote_string(str(path)) for path in files)
+        select = (
+            f"SELECT * FROM read_parquet([{paths}], "
+            "union_by_name = true, hive_partitioning = false)"
+        )
+    else:
+        registration = f"__empty_{source}_{table}"
+        connection.register(registration, schema.empty_table())
+        select = f"SELECT * FROM {_quote_identifier(registration)}"
+    connection.execute(f"CREATE OR REPLACE VIEW {qualified} AS {select}")
+
+
+def _lease_files(files: list[Path], target_root: Path) -> list[Path]:
+    """用硬链接保留快照文件；跨文件系统时退化为复制。"""
+    if not files:
+        return []
+    target_root.mkdir(parents=True, exist_ok=True)
+    leased: list[Path] = []
+    for index, source in enumerate(files):
+        target = target_root / f"{index:08d}-{source.name}"
+        try:
+            os.link(source, target)
+        except OSError:
+            shutil.copy2(source, target)
+        leased.append(target)
+    return leased
 
 
 def _quote_identifier(value: str) -> str:

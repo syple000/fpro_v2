@@ -72,6 +72,7 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = [
+    "src/models",
     "src/fpro_common",
     "src/data",
     "src/data_validation",

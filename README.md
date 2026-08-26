@@ -5,7 +5,7 @@
 ## 当前模块
 
 - `fpro_common`：全项目共用的微秒时间戳转换、北京时间日志格式等少量基础规则。
-- `data`：基于 DuckDB 的统一研究读取层，对外暴露 Tushare/QMT 原始视图和 PIT 查询。
+- `data`：基于 DuckDB 的统一读取层，由 `DataCatalog` 管理物理快照、`DataReader` 提供 PIT 查询。
 - `data_validation`：从 Tushare 随机抽股，拉取 QMT 日线、财务和除权数据并交叉复核。
 - `qmt_agent`：东北证券 miniQMT 行情接入服务，代码位于 `src/qmt_agent`。
 - `qmt_receiver`：供 platform 调用的实时接收、下载同步和 Parquet 存储组件，代码位于
@@ -20,7 +20,7 @@ WSL 实时接收组件的调用和测试说明见 [docs/qmt_receiver.md](docs/qm
 [docs/qmt_protocol.md](docs/qmt_protocol.md)。
 Parquet 存储的接口和最简示例见 [docs/parquet_store.md](docs/parquet_store.md)。
 Tushare 历史数据字段、增量规则和验证方式见 [docs/tushare_data.md](docs/tushare_data.md)。
-DuckDB 统一读取和 `as_of` 表宏见 [docs/data.md](docs/data.md)。
+统一 PIT Reader 见 [docs/data.md](docs/data.md)。
 跨源随机抽样复核见 [docs/data_validation.md](docs/data_validation.md)。
 
 ## 时间规范

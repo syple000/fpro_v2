@@ -1,0 +1,88 @@
+"""平台统一业务模型。"""
+
+from types import MappingProxyType
+
+from models.data import (
+    ADJUSTMENT_FACTOR_SCHEMA,
+    BAR_SCHEMA,
+    CURRENT_SCHEMA,
+    DAILY_METRICS_SCHEMA,
+    DIVIDEND_SCHEMA,
+    INDUSTRY_SCHEMA,
+    MONEYFLOW_SCHEMA,
+    PRICE_LIMIT_SCHEMA,
+    SESSION_SCHEMA,
+    ST_STATUS_SCHEMA,
+    STATUS_SCHEMA,
+    SUSPENSION_SCHEMA,
+    DataCapability,
+    DataSourceAdapter,
+    QueryParameter,
+    QueryResult,
+    SnapshotHandle,
+    SourceRequest,
+    SourceSnapshot,
+)
+from models.financial import (
+    AUDIT_SCHEMA,
+    BALANCE_SHEET_SCHEMA,
+    CASH_FLOW_STATEMENT_SCHEMA,
+    EXPRESS_SCHEMA,
+    FINANCIAL_INDICATOR_SCHEMA,
+    FORECAST_SCHEMA,
+    INCOME_STATEMENT_SCHEMA,
+)
+
+CAPABILITY_SCHEMAS = MappingProxyType(
+    {
+        DataCapability.DAILY_BARS: BAR_SCHEMA,
+        DataCapability.INTRADAY_BARS: BAR_SCHEMA,
+        DataCapability.REALTIME_QUOTES: CURRENT_SCHEMA,
+        DataCapability.DAILY_METRICS: DAILY_METRICS_SCHEMA,
+        DataCapability.MONEYFLOW: MONEYFLOW_SCHEMA,
+        DataCapability.SUSPENSIONS: SUSPENSION_SCHEMA,
+        DataCapability.PRICE_LIMITS: PRICE_LIMIT_SCHEMA,
+        DataCapability.ST_STATUS: ST_STATUS_SCHEMA,
+        DataCapability.INCOME: INCOME_STATEMENT_SCHEMA,
+        DataCapability.BALANCE_SHEET: BALANCE_SHEET_SCHEMA,
+        DataCapability.CASHFLOW: CASH_FLOW_STATEMENT_SCHEMA,
+        DataCapability.INDICATORS: FINANCIAL_INDICATOR_SCHEMA,
+        DataCapability.FORECAST: FORECAST_SCHEMA,
+        DataCapability.EXPRESS: EXPRESS_SCHEMA,
+        DataCapability.AUDIT: AUDIT_SCHEMA,
+        DataCapability.DIVIDENDS: DIVIDEND_SCHEMA,
+        DataCapability.ADJUSTMENT_FACTORS: ADJUSTMENT_FACTOR_SCHEMA,
+        DataCapability.INDUSTRY: INDUSTRY_SCHEMA,
+        DataCapability.SESSIONS: SESSION_SCHEMA,
+    }
+)
+
+__all__ = [
+    "ADJUSTMENT_FACTOR_SCHEMA",
+    "AUDIT_SCHEMA",
+    "BAR_SCHEMA",
+    "BALANCE_SHEET_SCHEMA",
+    "CASH_FLOW_STATEMENT_SCHEMA",
+    "CAPABILITY_SCHEMAS",
+    "CURRENT_SCHEMA",
+    "DAILY_METRICS_SCHEMA",
+    "DIVIDEND_SCHEMA",
+    "EXPRESS_SCHEMA",
+    "FINANCIAL_INDICATOR_SCHEMA",
+    "FORECAST_SCHEMA",
+    "INDUSTRY_SCHEMA",
+    "INCOME_STATEMENT_SCHEMA",
+    "MONEYFLOW_SCHEMA",
+    "PRICE_LIMIT_SCHEMA",
+    "SESSION_SCHEMA",
+    "ST_STATUS_SCHEMA",
+    "STATUS_SCHEMA",
+    "SUSPENSION_SCHEMA",
+    "DataCapability",
+    "DataSourceAdapter",
+    "QueryParameter",
+    "QueryResult",
+    "SnapshotHandle",
+    "SourceRequest",
+    "SourceSnapshot",
+]
