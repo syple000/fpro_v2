@@ -17,14 +17,14 @@ from qmt_protocol import (
     TickQuote,
     XtDataPeriod,
 )
-from qmt_receiver.storage import (
+from qmt_receiver.schemas import (
     BAR_SCHEMA,
     DAILY_TABLE,
     DIVIDEND_FACTOR_TABLE,
     FINANCIAL_TABLE,
     TICK_SCHEMA,
-    QmtDataStore,
 )
+from qmt_receiver.storage import QmtDataStore
 
 
 def _read_only_table(table_root: Path) -> pa.Table:

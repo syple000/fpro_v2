@@ -18,7 +18,8 @@ from qmt_protocol import (
     HistoryQueryResponse,
     XtDataPeriod,
 )
-from qmt_receiver.storage import _DAILY_FIELDS, QmtDataStore
+from qmt_receiver.schemas import DAILY_FIELDS
+from qmt_receiver.storage import QmtDataStore
 
 _FINANCIAL_TABLES: tuple[FinancialTable, ...] = (
     "Balance",
@@ -103,7 +104,7 @@ def sync_daily(
     for adjustment in ("none", "front_ratio"):
         response = client.query_history(
             stocks,
-            fields=_DAILY_FIELDS,
+            fields=DAILY_FIELDS,
             period="1d",
             start_time=start_time,
             end_time=end_time,

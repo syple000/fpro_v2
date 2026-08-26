@@ -12,6 +12,7 @@ from zoneinfo import ZoneInfo
 
 import pyarrow as pa
 
+import qmt_receiver.schemas as schemas
 from fpro_common import normalise_unix_timestamp_us, utc_us_to_datetime
 from parquet_store import ParquetStore, TableConfig
 from qmt_protocol import (
@@ -28,143 +29,6 @@ from qmt_protocol import (
 
 _QMT_TIMEZONE = ZoneInfo("Asia/Shanghai")
 
-TICK_TABLE = "ticks"
-BAR_TABLE = "bars"
-DAILY_TABLE = "daily"
-FINANCIAL_TABLE = "financial"
-DIVIDEND_FACTOR_TABLE = "dividend_factors"
-
-_DAILY_FIELDS = (
-    "time",
-    "open",
-    "high",
-    "low",
-    "close",
-    "volume",
-    "amount",
-    "settelementPrice",
-    "settlementPrice",
-    "openInterest",
-    "preClose",
-    "suspendFlag",
-    "dr",
-    "totaldr",
-)
-
-_ENVELOPE_FIELDS = (
-    pa.field("trading_date", pa.date32(), nullable=False),
-    pa.field("seq", pa.int64(), nullable=False),
-    pa.field("code", pa.string(), nullable=False),
-    pa.field("period", pa.string(), nullable=False),
-    pa.field("source", pa.string(), nullable=False),
-    pa.field("subscription", pa.string(), nullable=False),
-    pa.field("received_at", pa.int64(), nullable=False),
-    pa.field("event_time", pa.int64()),
-)
-
-_TICK_QUOTE_FIELDS = (
-    pa.field("time", pa.int64()),
-    pa.field("stime", pa.string()),
-    pa.field("timetag", pa.string()),
-    pa.field("lastPrice", pa.float64()),
-    pa.field("open", pa.float64()),
-    pa.field("high", pa.float64()),
-    pa.field("low", pa.float64()),
-    pa.field("lastClose", pa.float64()),
-    pa.field("amount", pa.float64()),
-    pa.field("volume", pa.int64()),
-    pa.field("pvolume", pa.int64()),
-    pa.field("stockStatus", pa.int64()),
-    pa.field("openInt", pa.int64()),
-    pa.field("transactionNum", pa.int64()),
-    pa.field("lastSettlementPrice", pa.float64()),
-    pa.field("settlementPrice", pa.float64()),
-    pa.field("pe", pa.float64()),
-    pa.field("askPrice", pa.list_(pa.float64())),
-    pa.field("bidPrice", pa.list_(pa.float64())),
-    pa.field("askVol", pa.list_(pa.int64())),
-    pa.field("bidVol", pa.list_(pa.int64())),
-    pa.field("volRatio", pa.float64()),
-    pa.field("speed1Min", pa.float64()),
-    pa.field("speed5Min", pa.float64()),
-)
-
-_BAR_QUOTE_FIELDS = (
-    pa.field("time", pa.int64()),
-    pa.field("open", pa.float64()),
-    pa.field("high", pa.float64()),
-    pa.field("low", pa.float64()),
-    pa.field("close", pa.float64()),
-    pa.field("volume", pa.int64()),
-    pa.field("amount", pa.float64()),
-    pa.field("settelementPrice", pa.float64()),
-    pa.field("settlementPrice", pa.float64()),
-    pa.field("openInterest", pa.float64()),
-    pa.field("preClose", pa.float64()),
-    pa.field("suspendFlag", pa.int64()),
-    pa.field("dr", pa.float64()),
-    pa.field("totaldr", pa.float64()),
-)
-
-# 行情主体与协议模型逐字段一致，不保留通用 JSON 扩展槽。
-_TICK_QUOTE_TYPE = pa.struct(_TICK_QUOTE_FIELDS)
-_BAR_QUOTE_TYPE = pa.struct(_BAR_QUOTE_FIELDS)
-TICK_SCHEMA = pa.schema([*_ENVELOPE_FIELDS, pa.field("quote", _TICK_QUOTE_TYPE, nullable=False)])
-BAR_SCHEMA = pa.schema([*_ENVELOPE_FIELDS, pa.field("quote", _BAR_QUOTE_TYPE, nullable=False)])
-
-DAILY_SCHEMA = pa.schema(
-    [
-        pa.field("trade_date", pa.date32(), nullable=False),
-        pa.field("code", pa.string(), nullable=False),
-        pa.field("adjustment", pa.string(), nullable=False),
-        pa.field("time", pa.int64()),
-        pa.field("open", pa.float64()),
-        pa.field("high", pa.float64()),
-        pa.field("low", pa.float64()),
-        pa.field("close", pa.float64()),
-        pa.field("volume", pa.int64()),
-        pa.field("amount", pa.float64()),
-        pa.field("settelementPrice", pa.float64()),
-        pa.field("openInterest", pa.float64()),
-        pa.field("preClose", pa.float64()),
-        pa.field("suspendFlag", pa.int64()),
-        pa.field("dr", pa.float64()),
-        pa.field("totaldr", pa.float64()),
-    ]
-)
-FINANCIAL_SCHEMA = pa.schema(
-    [
-        pa.field("report_date", pa.date32(), nullable=False),
-        pa.field("code", pa.string(), nullable=False),
-        pa.field("dataset", pa.string(), nullable=False),
-        pa.field("disclosure_date", pa.date32()),
-        pa.field("data_json", pa.large_string(), nullable=False),
-    ]
-)
-DIVIDEND_FACTOR_SCHEMA = pa.schema(
-    [
-        pa.field("ex_date", pa.date32(), nullable=False),
-        pa.field("event_time", pa.int64(), nullable=False),
-        pa.field("code", pa.string(), nullable=False),
-        pa.field("interest", pa.float64()),
-        pa.field("stockBonus", pa.float64()),
-        pa.field("stockGift", pa.float64()),
-        pa.field("allotNum", pa.float64()),
-        pa.field("allotPrice", pa.float64()),
-        pa.field("gugai", pa.float64()),
-        pa.field("dr", pa.float64()),
-    ]
-)
-
-_TICK_QUOTE_COLUMNS = tuple(field.name for field in _TICK_QUOTE_FIELDS)
-_BAR_QUOTE_COLUMNS = tuple(field.name for field in _BAR_QUOTE_FIELDS)
-
-_DOWNLOAD_PARTITION_BY = {
-    DAILY_TABLE: "trade_date",
-    FINANCIAL_TABLE: "report_date",
-    DIVIDEND_FACTOR_TABLE: "ex_date",
-}
-
 
 class QmtDataStore:
     """QMT 实时和下载数据共用的薄存储层。"""
@@ -172,47 +36,19 @@ class QmtDataStore:
     def __init__(self, root: str | Path, timezone: str = "Asia/Shanghai") -> None:
         self._timezone = ZoneInfo(timezone)
         self._store = ParquetStore(root)
-        for config in (
-            TableConfig(
-                name=TICK_TABLE,
-                schema=TICK_SCHEMA,
-                partition_by="trading_date",
-                sort_by="event_time",
-                primary_key=("code", "event_time"),
-                deduplicate_prefer_by="received_at",
-            ),
-            TableConfig(
-                name=BAR_TABLE,
-                schema=BAR_SCHEMA,
-                partition_by="trading_date",
-                sort_by="event_time",
-                primary_key=("code", "period", "event_time"),
-                deduplicate_prefer_by="received_at",
-            ),
-            TableConfig(
-                name=DAILY_TABLE,
-                schema=DAILY_SCHEMA,
-                partition_by="trade_date",
-                sort_by=("code", "adjustment"),
-                primary_key=("code", "adjustment"),
-            ),
-            TableConfig(
-                name=FINANCIAL_TABLE,
-                schema=FINANCIAL_SCHEMA,
-                partition_by="report_date",
-                sort_by=("code", "dataset"),
-                primary_key=("code", "dataset"),
-                deduplicate_prefer_by="disclosure_date",
-            ),
-            TableConfig(
-                name=DIVIDEND_FACTOR_TABLE,
-                schema=DIVIDEND_FACTOR_SCHEMA,
-                partition_by="ex_date",
-                sort_by="code",
-                primary_key="code",
-            ),
-        ):
-            self._store.register(config)
+        for table_name, schema in schemas.TABLE_SCHEMAS.items():
+            self._store.register(
+                TableConfig(
+                    name=table_name,
+                    schema=schema,
+                    partition_by=schemas.TABLE_PARTITION_BY[table_name],
+                    sort_by=schemas.TABLE_SORT_BY[table_name],
+                    primary_key=schemas.TABLE_PRIMARY_KEY[table_name],
+                    deduplicate_prefer_by=(
+                        schemas.TABLE_DEDUPLICATE_PREFER_BY[table_name] or None
+                    ),
+                )
+            )
 
     def append_quotes(self, records: Sequence[SequencedQuote]) -> list[QuoteEvent]:
         """追加实时行情，不立即 flush 或整理。"""
@@ -229,11 +65,11 @@ class QmtDataStore:
             if record.period == "tick":
                 if not isinstance(record.quote, TickQuote):
                     raise TypeError("tick 行情必须使用 TickQuote")
-                tick_rows.append(_quote_row(common, record.quote, _TICK_QUOTE_COLUMNS))
+                tick_rows.append(_quote_row(common, record.quote, schemas.TICK_QUOTE_COLUMNS))
             else:
                 if not isinstance(record.quote, BarQuote):
                     raise TypeError("bar 行情必须使用 BarQuote")
-                bar_rows.append(_quote_row(common, record.quote, _BAR_QUOTE_COLUMNS))
+                bar_rows.append(_quote_row(common, record.quote, schemas.BAR_QUOTE_COLUMNS))
             events.append(
                 QuoteEvent(
                     trading_date=trading_date,
@@ -243,9 +79,15 @@ class QmtDataStore:
             )
 
         if tick_rows:
-            self._store.append(TICK_TABLE, pa.Table.from_pylist(tick_rows, schema=TICK_SCHEMA))
+            self._store.append(
+                schemas.TICK_TABLE,
+                pa.Table.from_pylist(tick_rows, schema=schemas.TICK_SCHEMA),
+            )
         if bar_rows:
-            self._store.append(BAR_TABLE, pa.Table.from_pylist(bar_rows, schema=BAR_SCHEMA))
+            self._store.append(
+                schemas.BAR_TABLE,
+                pa.Table.from_pylist(bar_rows, schema=schemas.BAR_SCHEMA),
+            )
         return events
 
     def write_daily(
@@ -266,7 +108,7 @@ class QmtDataStore:
                     "code": code,
                     "adjustment": adjustment,
                 }
-                for field in _DAILY_FIELDS:
+                for field in schemas.DAILY_FIELDS:
                     value = values.get(field)
                     row[field] = (
                         _integer(value)
@@ -275,8 +117,8 @@ class QmtDataStore:
                     )
                 rows.append(row)
         return self._write(
-            DAILY_TABLE,
-            pa.Table.from_pylist(rows, schema=DAILY_SCHEMA),
+            schemas.DAILY_TABLE,
+            pa.Table.from_pylist(rows, schema=schemas.DAILY_SCHEMA),
         )
 
     def write_financial(
@@ -307,8 +149,8 @@ class QmtDataStore:
                         }
                     )
         return self._write(
-            FINANCIAL_TABLE,
-            pa.Table.from_pylist(rows, schema=FINANCIAL_SCHEMA),
+            schemas.FINANCIAL_TABLE,
+            pa.Table.from_pylist(rows, schema=schemas.FINANCIAL_SCHEMA),
         )
 
     def write_dividend_factors(
@@ -337,12 +179,12 @@ class QmtDataStore:
                     }
                 )
         return self._write(
-            DIVIDEND_FACTOR_TABLE,
-            pa.Table.from_pylist(rows, schema=DIVIDEND_FACTOR_SCHEMA),
+            schemas.DIVIDEND_FACTOR_TABLE,
+            pa.Table.from_pylist(rows, schema=schemas.DIVIDEND_FACTOR_SCHEMA),
         )
 
     def _write(self, dataset: str, data: pa.Table) -> int:
-        partition_by = _DOWNLOAD_PARTITION_BY[dataset]
+        partition_by = schemas.TABLE_PARTITION_BY[dataset]
         partitions: set[date] = set()
         for value in data.column(partition_by).to_pylist():
             if not isinstance(value, date):
@@ -357,7 +199,10 @@ class QmtDataStore:
 
     def compact_realtime(self) -> dict[str, int]:
         """扫描实时表，合并文件并按业务键去重。"""
-        return {table: self._store.compact_table(table) for table in (TICK_TABLE, BAR_TABLE)}
+        return {
+            table: self._store.compact_table(table)
+            for table in (schemas.TICK_TABLE, schemas.BAR_TABLE)
+        }
 
     def close(self) -> None:
         self._store.close()

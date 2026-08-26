@@ -25,7 +25,7 @@ from qmt_protocol import (
 )
 from qmt_receiver.client import QmtAgentClient, QmtAgentError
 from qmt_receiver.receiver import QmtReceiver, ReceiveResult
-from qmt_receiver.storage import (
+from qmt_receiver.schemas import (
     BAR_SCHEMA,
     BAR_TABLE,
     DAILY_SCHEMA,
@@ -36,8 +36,8 @@ from qmt_receiver.storage import (
     FINANCIAL_TABLE,
     TICK_SCHEMA,
     TICK_TABLE,
-    QmtDataStore,
 )
+from qmt_receiver.storage import QmtDataStore
 from qmt_receiver.sync import (
     SyncResult,
     sync_all,

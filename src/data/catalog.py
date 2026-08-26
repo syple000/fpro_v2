@@ -14,27 +14,8 @@ from pathlib import Path
 import duckdb
 import pyarrow as pa
 
-from qmt_receiver import (
-    BAR_SCHEMA,
-    BAR_TABLE,
-    DAILY_SCHEMA,
-    DAILY_TABLE,
-    DIVIDEND_FACTOR_SCHEMA,
-    DIVIDEND_FACTOR_TABLE,
-    FINANCIAL_SCHEMA,
-    FINANCIAL_TABLE,
-    TICK_SCHEMA,
-    TICK_TABLE,
-)
+from qmt_receiver.schemas import TABLE_SCHEMAS as QMT_TABLE_SCHEMAS
 from tushare_data.schemas import TABLE_SCHEMAS
-
-_QMT_SCHEMAS = {
-    TICK_TABLE: TICK_SCHEMA,
-    BAR_TABLE: BAR_SCHEMA,
-    DAILY_TABLE: DAILY_SCHEMA,
-    FINANCIAL_TABLE: FINANCIAL_SCHEMA,
-    DIVIDEND_FACTOR_TABLE: DIVIDEND_FACTOR_SCHEMA,
-}
 
 
 @dataclass(slots=True)
@@ -69,7 +50,7 @@ class DataCatalog:
     ) -> None:
         self._sources: dict[str, tuple[Path, Mapping[str, pa.Schema]]] = {
             "tushare": (Path(tushare_root).expanduser().resolve(), TABLE_SCHEMAS),
-            "qmt": (Path(qmt_root).expanduser().resolve(), _QMT_SCHEMAS),
+            "qmt": (Path(qmt_root).expanduser().resolve(), QMT_TABLE_SCHEMAS),
         }
         self._connection = duckdb.connect(":memory:")
         self.refresh()
