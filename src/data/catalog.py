@@ -3,12 +3,7 @@
 from __future__ import annotations
 
 import json
-import os
-import shutil
-import tempfile
 from collections.abc import Mapping
-from dataclasses import dataclass
-from hashlib import sha256
 from pathlib import Path
 
 import duckdb
@@ -18,29 +13,8 @@ from qmt_receiver.schemas import TABLE_SCHEMAS as QMT_TABLE_SCHEMAS
 from tushare_data.schemas import TABLE_SCHEMAS
 
 
-@dataclass(slots=True)
-class CatalogSnapshot:
-    """显式绑定 Manifest 文件集合的只读 DuckDB 快照。"""
-
-    connection: duckdb.DuckDBPyConnection
-    snapshot_id: str
-    _lease: tempfile.TemporaryDirectory[str]
-
-    def close(self) -> None:
-        try:
-            self.connection.close()
-        finally:
-            self._lease.cleanup()
-
-    def __enter__(self) -> CatalogSnapshot:
-        return self
-
-    def __exit__(self, *_: object) -> None:
-        self.close()
-
-
 class DataCatalog:
-    """注册 Tushare/QMT 原始视图并固定 Manifest 文件快照。"""
+    """把 Tushare/QMT 当前有效的 Parquet 文件注册为 DuckDB 视图。"""
 
     def __init__(
         self,
@@ -72,47 +46,6 @@ class DataCatalog:
                     files=_active_files(root / table),
                     schema=schema,
                 )
-
-    def open_snapshot(self, source: str) -> CatalogSnapshot:
-        """按当前 Manifest 打开一个不随 `refresh()` 改变的来源快照。"""
-        try:
-            root, schemas = self._sources[source]
-        except KeyError:
-            raise ValueError(f"DataCatalog 不支持来源: {source!r}") from None
-
-        connection = duckdb.connect(":memory:")
-        connection.execute("SET TimeZone = 'Asia/Shanghai'")
-        lease = tempfile.TemporaryDirectory(prefix="fpro-data-snapshot-")
-        lease_root = Path(lease.name)
-        digest = sha256()
-        try:
-            connection.execute(f"CREATE SCHEMA {_quote_identifier(source)}")
-            for table, schema in schemas.items():
-                files = _active_files(root / table)
-                digest.update(source.encode())
-                digest.update(table.encode())
-                for path in files:
-                    digest.update(str(path).encode())
-                    stat = path.stat()
-                    digest.update(str(stat.st_size).encode())
-                    digest.update(str(stat.st_mtime_ns).encode())
-                leased_files = _lease_files(files, lease_root / table)
-                _register_parquet_view(
-                    connection,
-                    source=source,
-                    table=table,
-                    files=leased_files,
-                    schema=schema,
-                )
-        except BaseException:
-            connection.close()
-            lease.cleanup()
-            raise
-        return CatalogSnapshot(
-            connection=connection,
-            snapshot_id=digest.hexdigest()[:24],
-            _lease=lease,
-        )
 
     def close(self) -> None:
         """关闭 DuckDB 连接。"""
@@ -189,22 +122,6 @@ def _register_parquet_view(
         connection.register(registration, schema.empty_table())
         select = f"SELECT * FROM {_quote_identifier(registration)}"
     connection.execute(f"CREATE OR REPLACE VIEW {qualified} AS {select}")
-
-
-def _lease_files(files: list[Path], target_root: Path) -> list[Path]:
-    """用硬链接保留快照文件；跨文件系统时退化为复制。"""
-    if not files:
-        return []
-    target_root.mkdir(parents=True, exist_ok=True)
-    leased: list[Path] = []
-    for index, source in enumerate(files):
-        target = target_root / f"{index:08d}-{source.name}"
-        try:
-            os.link(source, target)
-        except OSError:
-            shutil.copy2(source, target)
-        leased.append(target)
-    return leased
 
 
 def _quote_identifier(value: str) -> str:

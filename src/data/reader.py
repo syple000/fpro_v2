@@ -5,7 +5,6 @@ from __future__ import annotations
 import re
 from collections.abc import Mapping, Sequence
 from datetime import date, datetime, time, timedelta
-from hashlib import sha256
 from typing import Literal, cast
 from zoneinfo import ZoneInfo
 
@@ -13,7 +12,7 @@ import duckdb
 import pyarrow as pa
 import pyarrow.compute as pc
 
-from data.adapters import QmtAdapter, TushareAdapter
+from data.adapters import AdapterRequest, QmtAdapter, QueryParameter, TushareAdapter
 from data.catalog import DataCatalog
 from data.config import SourceConfig
 from data.errors import (
@@ -27,16 +26,10 @@ from models import (
     CAPABILITY_SCHEMAS,
     STATUS_SCHEMA,
     DataCapability,
-    DataSourceAdapter,
-    QueryParameter,
     QueryResult,
-    SourceRequest,
-    SourceSnapshot,
 )
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
-POLICY_VERSION = 1
-SCHEMA_VERSION = 4
 SUPPORTED_FREQUENCIES = frozenset({"1m", "5m", "15m", "30m", "60m", "1d"})
 _SYMBOL = re.compile(r"^[A-Z0-9][A-Z0-9._-]{1,31}$")
 
@@ -52,157 +45,74 @@ ALL_SYMBOLS = _AllSymbols()
 Symbols = Sequence[str] | _AllSymbols
 SortDirection = Literal["ascending", "descending"]
 CompanyType = Literal["industrial", "bank", "insurance", "securities"]
+Adapter = TushareAdapter | QmtAdapter
 
 
 class DataReader:
-    """以固定来源配置创建不可变时间快照。
-
-    `mode="backtest"` 在第一次 `at()` 时固定所有来源的物理快照；后续时钟推进只改变
-    PIT 时间。`mode="live"` 每次 `at()` 重新取得已经提交的数据边界。
-    """
+    """按固定来源配置创建指定 PIT 时间的数据视图。"""
 
     def __init__(
         self,
         catalog: DataCatalog,
         *,
         sources: SourceConfig,
-        adapters: Sequence[DataSourceAdapter] = (),
-        mode: Literal["backtest", "live"] = "backtest",
         max_limit: int = 1_000_000,
     ) -> None:
-        if mode not in {"backtest", "live"}:
-            raise ValueError("mode 只允许 'backtest' 或 'live'")
         if isinstance(max_limit, bool) or not isinstance(max_limit, int) or max_limit < 1:
             raise ValueError("max_limit 必须是正整数")
-        registered: dict[str, DataSourceAdapter] = {
+        adapters: dict[str, Adapter] = {
             "tushare": TushareAdapter(catalog),
             "qmt": QmtAdapter(catalog),
         }
-        for adapter in adapters:
-            if not isinstance(adapter.source_id, str) or not adapter.source_id:
-                raise ValueError("适配器 source_id 不能为空")
-            if adapter.source_id in registered:
-                raise ValueError(f"适配器 source_id 已注册: {adapter.source_id!r}")
-            registered[adapter.source_id] = adapter
 
         for route, source_id in sources.routes.items():
-            adapter = registered.get(source_id)
+            adapter = adapters.get(source_id)
             if adapter is None:
                 raise DataSourceNotConfiguredError(f"路由 {route!r} 配置了未注册来源 {source_id!r}")
-            if DataCapability(route) not in adapter.capabilities():
+            if DataCapability(route) not in adapter.capabilities:
                 raise DataCapabilityNotSupportedError(f"来源 {source_id!r} 不支持路由 {route!r}")
 
         self._sources = sources
-        self._adapters = registered
-        self._mode = mode
+        self._adapters = adapters
         self._max_limit = max_limit
-        self._fixed_snapshots: dict[str, SourceSnapshot] | None = None
-        self._closed = False
 
-    def at(self, as_of: datetime) -> DataSnapshot:
-        """创建绑定带时区具体时间和物理来源边界的数据快照。"""
-        if self._closed:
-            raise RuntimeError("DataReader 已关闭")
-        normalized = _aware_datetime(as_of, "as_of")
-        owns_snapshots = self._mode == "live"
-        if self._mode == "backtest" and self._fixed_snapshots is not None:
-            snapshots = self._fixed_snapshots
-        else:
-            snapshots = self._open_snapshots(normalized)
-            if self._mode == "backtest":
-                self._fixed_snapshots = snapshots
-                owns_snapshots = False
-
-        digest = sha256()
-        digest.update(self._sources.source_config_id.encode())
-        for source_id, snapshot in sorted(snapshots.items()):
-            digest.update(source_id.encode())
-            digest.update(snapshot.snapshot_id.encode())
-        return DataSnapshot(
-            as_of=normalized,
-            snapshots=snapshots,
+    def at(self, as_of: datetime) -> DataView:
+        """创建绑定带时区具体时间的数据视图。"""
+        return DataView(
+            as_of=_aware_datetime(as_of, "as_of"),
             adapters=self._adapters,
             source_config=self._sources,
-            snapshot_id=digest.hexdigest()[:24],
             max_limit=self._max_limit,
-            owns_snapshots=owns_snapshots,
         )
 
-    def close(self) -> None:
-        """释放回测模式固定持有的来源快照。"""
-        if self._closed:
-            return
-        if self._fixed_snapshots is not None:
-            for snapshot in self._fixed_snapshots.values():
-                snapshot.close()
-        self._fixed_snapshots = None
-        self._closed = True
 
-    def __enter__(self) -> DataReader:
-        return self
-
-    def __exit__(self, *_: object) -> None:
-        self.close()
-
-    def _open_snapshots(self, as_of: datetime) -> dict[str, SourceSnapshot]:
-        snapshots: dict[str, SourceSnapshot] = {}
-        try:
-            for source_id in sorted(set(self._sources.routes.values())):
-                snapshot = self._adapters[source_id].open_snapshot(as_of)
-                snapshots[source_id] = snapshot
-                if snapshot.source_id != source_id or not snapshot.snapshot_id:
-                    raise DataAdapterError(f"来源 {source_id!r} 返回了无效快照")
-        except BaseException:
-            for snapshot in snapshots.values():
-                snapshot.close()
-            raise
-        return snapshots
-
-
-class DataSnapshot:
-    """策略实际接收的不可变 PIT 数据视图。"""
+class DataView:
+    """策略实际接收的指定 PIT 时间数据视图。"""
 
     __slots__ = (
         "_as_of",
-        "_snapshot_id",
-        "_source_config_id",
-        "_policy_version",
-        "_schema_version",
         "market",
         "fundamentals",
         "corporate_actions",
         "classification",
         "calendar",
-        "_snapshots",
         "_adapters",
         "_source_config",
         "_max_limit",
-        "_owns_snapshots",
-        "_closed",
     )
 
     def __init__(
         self,
         *,
         as_of: datetime,
-        snapshots: Mapping[str, SourceSnapshot],
-        adapters: Mapping[str, DataSourceAdapter],
+        adapters: Mapping[str, Adapter],
         source_config: SourceConfig,
-        snapshot_id: str,
         max_limit: int,
-        owns_snapshots: bool,
     ) -> None:
         self._as_of = as_of
-        self._snapshot_id = snapshot_id
-        self._source_config_id = source_config.source_config_id
-        self._policy_version = POLICY_VERSION
-        self._schema_version = SCHEMA_VERSION
-        self._snapshots = dict(snapshots)
         self._adapters = adapters
         self._source_config = source_config
         self._max_limit = max_limit
-        self._owns_snapshots = owns_snapshots
-        self._closed = False
         self.market = MarketReader(self)
         self.fundamentals = FundamentalsReader(self)
         self.corporate_actions = CorporateActionsReader(self)
@@ -213,36 +123,6 @@ class DataSnapshot:
     def as_of(self) -> datetime:
         return self._as_of
 
-    @property
-    def snapshot_id(self) -> str:
-        return self._snapshot_id
-
-    @property
-    def source_config_id(self) -> str:
-        return self._source_config_id
-
-    @property
-    def policy_version(self) -> int:
-        return self._policy_version
-
-    @property
-    def schema_version(self) -> int:
-        return self._schema_version
-
-    def close(self) -> None:
-        if self._closed:
-            return
-        if self._owns_snapshots:
-            for snapshot in self._snapshots.values():
-                snapshot.close()
-        self._closed = True
-
-    def __enter__(self) -> DataSnapshot:
-        return self
-
-    def __exit__(self, *_: object) -> None:
-        self.close()
-
     def _read(
         self,
         route: str,
@@ -250,15 +130,13 @@ class DataSnapshot:
         symbols: tuple[str, ...] | None,
         parameters: Mapping[str, QueryParameter],
     ) -> tuple[pa.Table, str]:
-        if self._closed:
-            raise RuntimeError("DataSnapshot 已关闭")
         source_id = self._source_config.routes.get(route)
         if source_id is None:
             raise DataSourceNotConfiguredError(f"逻辑数据集 {route!r} 未配置来源") from None
         adapter = self._adapters[source_id]
-        request = SourceRequest(DataCapability(route), self.as_of, symbols, parameters)
+        request = AdapterRequest(DataCapability(route), self.as_of, symbols, parameters)
         try:
-            table = adapter.read(request, self._snapshots[source_id])
+            table = adapter.read(request)
         except (
             DataCapabilityNotSupportedError,
             DataSourceUnavailableError,
@@ -303,12 +181,7 @@ class DataSnapshot:
         return QueryResult(
             table=projected,
             as_of=self.as_of,
-            snapshot_id=self.snapshot_id,
-            source_config_id=self.source_config_id,
-            policy_version=self.policy_version,
-            schema_version=self.schema_version,
             sources=tuple(dict.fromkeys(sources)),
-            sort_keys=tuple(name for name, _ in sort),
             truncated=truncated,
         )
 
@@ -316,7 +189,7 @@ class DataSnapshot:
 class MarketReader:
     __slots__ = ("_data",)
 
-    def __init__(self, data: DataSnapshot) -> None:
+    def __init__(self, data: DataView) -> None:
         self._data = data
 
     def bars(
@@ -565,7 +438,7 @@ class FundamentalsReader:
         "audit": "fundamentals.audit",
     }
 
-    def __init__(self, data: DataSnapshot) -> None:
+    def __init__(self, data: DataView) -> None:
         self._data = data
 
     def statements(
@@ -698,7 +571,7 @@ class FundamentalsReader:
 class CorporateActionsReader:
     __slots__ = ("_data",)
 
-    def __init__(self, data: DataSnapshot) -> None:
+    def __init__(self, data: DataView) -> None:
         self._data = data
 
     def dividends(
@@ -785,7 +658,7 @@ class CorporateActionsReader:
 class ClassificationReader:
     __slots__ = ("_data",)
 
-    def __init__(self, data: DataSnapshot) -> None:
+    def __init__(self, data: DataView) -> None:
         self._data = data
 
     def industry(
@@ -817,7 +690,7 @@ class ClassificationReader:
 class CalendarReader:
     __slots__ = ("_data",)
 
-    def __init__(self, data: DataSnapshot) -> None:
+    def __init__(self, data: DataView) -> None:
         self._data = data
 
     def sessions(

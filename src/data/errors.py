@@ -14,7 +14,7 @@ class DataCapabilityNotSupportedError(DataReaderError):
 
 
 class DataSourceUnavailableError(DataReaderError):
-    """来源快照不存在或当前不可访问。"""
+    """已发布的数据当前不可访问。"""
 
 
 class DataAdapterError(DataReaderError):

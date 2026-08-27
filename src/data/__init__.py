@@ -9,16 +9,8 @@ from data.errors import (
     DataSourceNotConfiguredError,
     DataSourceUnavailableError,
 )
-from data.reader import ALL_SYMBOLS, DataReader, DataSnapshot
-from models import (
-    DataCapability,
-    DataSourceAdapter,
-    QueryParameter,
-    QueryResult,
-    SnapshotHandle,
-    SourceRequest,
-    SourceSnapshot,
-)
+from data.reader import ALL_SYMBOLS, DataReader, DataView
+from models import DataCapability, QueryResult
 
 __all__ = [
     "ALL_SYMBOLS",
@@ -28,14 +20,9 @@ __all__ = [
     "DataCatalog",
     "DataReader",
     "DataReaderError",
-    "DataSnapshot",
-    "DataSourceAdapter",
     "DataSourceNotConfiguredError",
     "DataSourceUnavailableError",
-    "QueryParameter",
+    "DataView",
     "QueryResult",
-    "SnapshotHandle",
     "SourceConfig",
-    "SourceRequest",
-    "SourceSnapshot",
 ]

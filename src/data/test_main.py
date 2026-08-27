@@ -26,10 +26,8 @@ def run(
             "market.realtime_quotes": "qmt",
         }
     )
-    with (
-        DataCatalog(tushare_root=tushare_dir, qmt_root=qmt_dir) as catalog,
-        DataReader(catalog, sources=sources) as reader,
-    ):
+    with DataCatalog(tushare_root=tushare_dir, qmt_root=qmt_dir) as catalog:
+        reader = DataReader(catalog, sources=sources)
         data = reader.at(as_of)
         cashflow = data.fundamentals.statements(
             kind="cash_flow",

@@ -2,14 +2,16 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from collections.abc import Mapping
+from dataclasses import dataclass
+from datetime import date, datetime
 from typing import cast
 
 import duckdb
 import pyarrow as pa
 import pyarrow.compute as pc
 
-from data.catalog import CatalogSnapshot, DataCatalog
+from data.catalog import DataCatalog
 from data.errors import DataCapabilityNotSupportedError, DataSourceUnavailableError
 from models import (
     ADJUSTMENT_FACTOR_SCHEMA,
@@ -31,9 +33,20 @@ from models import (
     ST_STATUS_SCHEMA,
     SUSPENSION_SCHEMA,
     DataCapability,
-    SourceRequest,
-    SourceSnapshot,
 )
+
+QueryParameter = str | int | float | bool | date | datetime | None
+
+
+@dataclass(frozen=True, slots=True)
+class AdapterRequest:
+    """Reader 传给内置数据适配器的查询参数。"""
+
+    dataset: DataCapability
+    as_of: datetime
+    symbols: tuple[str, ...] | None
+    parameters: Mapping[str, QueryParameter]
+
 
 _TZ = "Asia/Shanghai"
 
@@ -332,25 +345,14 @@ _AUDIT_SOURCE_FIELDS = {
 
 
 class TushareAdapter:
-    """把已发布的 Tushare Parquet 快照归一为平台字段。"""
+    """把已发布的 Tushare Parquet 数据归一为平台字段。"""
 
-    source_id = "tushare"
+    capabilities = _TUSHARE_CAPABILITIES
 
     def __init__(self, catalog: DataCatalog) -> None:
-        self._catalog = catalog
+        self._connection = catalog.connection
 
-    def capabilities(self) -> frozenset[DataCapability]:
-        return _TUSHARE_CAPABILITIES
-
-    def open_snapshot(self, as_of: datetime) -> SourceSnapshot:
-        try:
-            handle = self._catalog.open_snapshot(self.source_id)
-        except (OSError, ValueError, duckdb.Error) as exc:
-            raise DataSourceUnavailableError("无法打开 Tushare 已发布快照") from exc
-        return SourceSnapshot(self.source_id, handle.snapshot_id, handle)
-
-    def read(self, request: SourceRequest, snapshot: SourceSnapshot) -> pa.Table:
-        connection = _connection(snapshot, self.source_id)
+    def read(self, request: AdapterRequest) -> pa.Table:
         readers = {
             DataCapability.DAILY_BARS: self._daily_bars,
             DataCapability.REALTIME_QUOTES: self._current,
@@ -377,12 +379,12 @@ class TushareAdapter:
             raise DataCapabilityNotSupportedError(
                 f"Tushare 不支持逻辑数据集 {request.dataset!r}"
             ) from None
-        return reader(connection, request)
+        return reader(self._connection, request)
 
     def _daily_bars(
         self,
         connection: duckdb.DuckDBPyConnection,
-        request: SourceRequest,
+        request: AdapterRequest,
     ) -> pa.Table:
         if request.parameters["frequency"] != "1d":
             raise DataCapabilityNotSupportedError("Tushare 当前只支持平台日线")
@@ -413,7 +415,7 @@ class TushareAdapter:
     def _current(
         self,
         connection: duckdb.DuckDBPyConnection,
-        request: SourceRequest,
+        request: AdapterRequest,
     ) -> pa.Table:
         params: list[object] = [request.as_of.date(), request.as_of]
         symbol_sql = _symbol_filter("ts_code", request.symbols, params)
@@ -443,7 +445,7 @@ class TushareAdapter:
     def _daily_metrics(
         self,
         connection: duckdb.DuckDBPyConnection,
-        request: SourceRequest,
+        request: AdapterRequest,
     ) -> pa.Table:
         params: list[object] = [request.as_of]
         symbol_sql = _symbol_filter("ts_code", request.symbols, params)
@@ -476,7 +478,7 @@ class TushareAdapter:
     def _moneyflow(
         self,
         connection: duckdb.DuckDBPyConnection,
-        request: SourceRequest,
+        request: AdapterRequest,
     ) -> pa.Table:
         params: list[object] = [request.as_of]
         symbol_sql = _symbol_filter("ts_code", request.symbols, params)
@@ -522,7 +524,7 @@ class TushareAdapter:
     def _suspensions(
         self,
         connection: duckdb.DuckDBPyConnection,
-        request: SourceRequest,
+        request: AdapterRequest,
     ) -> pa.Table:
         interval_start = (
             "timezone('Asia/Shanghai', CAST(trade_date AS DATE) + "
@@ -557,7 +559,7 @@ class TushareAdapter:
     def _price_limits(
         self,
         connection: duckdb.DuckDBPyConnection,
-        request: SourceRequest,
+        request: AdapterRequest,
     ) -> pa.Table:
         params: list[object] = [request.as_of.date(), request.as_of]
         symbol_sql = _symbol_filter("ts_code", request.symbols, params)
@@ -572,7 +574,7 @@ class TushareAdapter:
     def _st_status(
         self,
         connection: duckdb.DuckDBPyConnection,
-        request: SourceRequest,
+        request: AdapterRequest,
     ) -> pa.Table:
         params: list[object] = [request.as_of.date(), request.as_of]
         symbol_sql = _symbol_filter("ts_code", request.symbols, params)
@@ -588,7 +590,7 @@ class TushareAdapter:
     def _statements(
         self,
         connection: duckdb.DuckDBPyConnection,
-        request: SourceRequest,
+        request: AdapterRequest,
     ) -> pa.Table:
         table, schema, source_fields = {
             DataCapability.INCOME: (
@@ -660,7 +662,7 @@ class TushareAdapter:
     def _indicators(
         self,
         connection: duckdb.DuckDBPyConnection,
-        request: SourceRequest,
+        request: AdapterRequest,
     ) -> pa.Table:
         expressions = _scale_expressions(
             _INDICATOR_SOURCE_FIELDS,
@@ -703,7 +705,7 @@ class TushareAdapter:
     def _disclosures(
         self,
         connection: duckdb.DuckDBPyConnection,
-        request: SourceRequest,
+        request: AdapterRequest,
     ) -> pa.Table:
         table, schema, source_fields = {
             DataCapability.FORECAST: ("forecast", FORECAST_SCHEMA, _FORECAST_SOURCE_FIELDS),
@@ -767,7 +769,7 @@ class TushareAdapter:
     def _dividends(
         self,
         connection: duckdb.DuckDBPyConnection,
-        request: SourceRequest,
+        request: AdapterRequest,
     ) -> pa.Table:
         visible = _next_session_time("imp_ann_date")
         params: list[object] = [request.as_of]
@@ -795,7 +797,7 @@ class TushareAdapter:
     def _adjustment_factors(
         self,
         connection: duckdb.DuckDBPyConnection,
-        request: SourceRequest,
+        request: AdapterRequest,
     ) -> pa.Table:
         params: list[object] = [request.as_of]
         symbol_sql = _symbol_filter("ts_code", request.symbols, params)
@@ -818,7 +820,7 @@ class TushareAdapter:
     def _industry(
         self,
         connection: duckdb.DuckDBPyConnection,
-        request: SourceRequest,
+        request: AdapterRequest,
     ) -> pa.Table:
         level = request.parameters["level"]
         params: list[object] = [request.as_of, request.as_of.date()]
@@ -839,7 +841,7 @@ class TushareAdapter:
     def _sessions(
         self,
         connection: duckdb.DuckDBPyConnection,
-        request: SourceRequest,
+        request: AdapterRequest,
     ) -> pa.Table:
         params: list[object] = [request.as_of.date()]
         range_sql = _range_filter(
@@ -864,35 +866,24 @@ class TushareAdapter:
 class QmtAdapter:
     """把 QMT 下载日线和已接收实时事件归一为平台字段。"""
 
-    source_id = "qmt"
+    capabilities = _QMT_CAPABILITIES
 
     def __init__(self, catalog: DataCatalog) -> None:
-        self._catalog = catalog
+        self._connection = catalog.connection
 
-    def capabilities(self) -> frozenset[DataCapability]:
-        return _QMT_CAPABILITIES
-
-    def open_snapshot(self, as_of: datetime) -> SourceSnapshot:
-        try:
-            handle = self._catalog.open_snapshot(self.source_id)
-        except (OSError, ValueError, duckdb.Error) as exc:
-            raise DataSourceUnavailableError("无法打开 QMT 已发布快照") from exc
-        return SourceSnapshot(self.source_id, handle.snapshot_id, handle)
-
-    def read(self, request: SourceRequest, snapshot: SourceSnapshot) -> pa.Table:
-        connection = _connection(snapshot, self.source_id)
+    def read(self, request: AdapterRequest) -> pa.Table:
         if request.dataset == DataCapability.DAILY_BARS:
-            return self._daily_bars(connection, request)
+            return self._daily_bars(self._connection, request)
         if request.dataset == DataCapability.INTRADAY_BARS:
-            return self._intraday_bars(connection, request)
+            return self._intraday_bars(self._connection, request)
         if request.dataset == DataCapability.REALTIME_QUOTES:
-            return self._current(connection, request)
+            return self._current(self._connection, request)
         raise DataCapabilityNotSupportedError(f"QMT 不支持逻辑数据集 {request.dataset!r}")
 
     def _daily_bars(
         self,
         connection: duckdb.DuckDBPyConnection,
-        request: SourceRequest,
+        request: AdapterRequest,
     ) -> pa.Table:
         if request.parameters["frequency"] != "1d":
             raise DataCapabilityNotSupportedError("QMT 下载日线只支持 1d")
@@ -922,7 +913,7 @@ class QmtAdapter:
     def _intraday_bars(
         self,
         connection: duckdb.DuckDBPyConnection,
-        request: SourceRequest,
+        request: AdapterRequest,
     ) -> pa.Table:
         frequency = cast(str, request.parameters["frequency"])
         minutes = {"1m": 1, "5m": 5, "15m": 15, "30m": 30, "60m": 60}.get(frequency)
@@ -959,7 +950,7 @@ class QmtAdapter:
     def _current(
         self,
         connection: duckdb.DuckDBPyConnection,
-        request: SourceRequest,
+        request: AdapterRequest,
     ) -> pa.Table:
         params: list[object] = [request.as_of]
         tick_symbols = _symbol_filter("code", request.symbols, params)
@@ -992,12 +983,6 @@ class QmtAdapter:
         return _fetch(connection, query, params, CURRENT_SCHEMA)
 
 
-def _connection(snapshot: SourceSnapshot, expected_source: str) -> duckdb.DuckDBPyConnection:
-    if snapshot.source_id != expected_source or not isinstance(snapshot.handle, CatalogSnapshot):
-        raise DataSourceUnavailableError(f"{expected_source} 快照句柄无效")
-    return snapshot.handle.connection
-
-
 def _fetch(
     connection: duckdb.DuckDBPyConnection,
     query: str,
@@ -1007,7 +992,7 @@ def _fetch(
     try:
         table = connection.execute(query, params).to_arrow_table()
     except duckdb.Error as exc:
-        raise DataSourceUnavailableError("读取已发布数据快照失败") from exc
+        raise DataSourceUnavailableError("读取已发布数据失败") from exc
     return _coerce_schema(table, schema) if schema is not None else table
 
 

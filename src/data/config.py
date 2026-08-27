@@ -2,10 +2,8 @@
 
 from __future__ import annotations
 
-import json
 from collections.abc import Mapping
-from dataclasses import dataclass, field
-from hashlib import sha256
+from dataclasses import dataclass
 from types import MappingProxyType
 
 from models import DataCapability
@@ -18,7 +16,6 @@ class SourceConfig:
     """一个运行期固定使用的逻辑数据来源配置。"""
 
     routes: Mapping[str, str]
-    source_config_id: str = field(init=False)
 
     def __post_init__(self) -> None:
         if not isinstance(self.routes, Mapping):
@@ -31,11 +28,4 @@ class SourceConfig:
                 raise ValueError(f"路由 {route!r} 的 source_id 不能为空")
             normalized[route] = source_id.strip()
         normalized = dict(sorted(normalized.items()))
-        encoded = json.dumps(
-            normalized,
-            ensure_ascii=True,
-            separators=(",", ":"),
-            sort_keys=True,
-        ).encode()
         object.__setattr__(self, "routes", MappingProxyType(normalized))
-        object.__setattr__(self, "source_config_id", sha256(encoded).hexdigest()[:24])

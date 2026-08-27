@@ -8,15 +8,12 @@ import pyarrow as pa
 import pytest
 
 from data import (
-    DataAdapterError,
     DataCapability,
     DataCatalog,
     DataReader,
-    DataSnapshot,
     DataSourceNotConfiguredError,
+    DataView,
     SourceConfig,
-    SourceRequest,
-    SourceSnapshot,
 )
 from models import CAPABILITY_SCHEMAS, CASH_FLOW_STATEMENT_SCHEMA
 from qmt_protocol import BarQuote, HistoryBar, SequencedQuote, TickQuote
@@ -70,13 +67,11 @@ def test_daily_bars_obey_pit_projection_and_limit(tmp_path: Path) -> None:
             ),
         )
 
-    with (
-        DataCatalog(tushare_root=tushare_root, qmt_root=tmp_path / "qmt") as catalog,
-        DataReader(
+    with DataCatalog(tushare_root=tushare_root, qmt_root=tmp_path / "qmt") as catalog:
+        reader = DataReader(
             catalog,
             sources=SourceConfig(routes={"market.daily_bars": "tushare"}),
-        ) as reader,
-    ):
+        )
         before = reader.at(_as_of(3, 16, 4)).market.bars(
             symbols=("000001.SZ",), frequency="1d", count=2
         )
@@ -125,13 +120,11 @@ def test_daily_metrics_normalize_percentages_shares_and_currency(tmp_path: Path)
             ),
         )
 
-    with (
-        DataCatalog(tushare_root=tushare_root, qmt_root=tmp_path / "qmt") as catalog,
-        DataReader(
+    with DataCatalog(tushare_root=tushare_root, qmt_root=tmp_path / "qmt") as catalog:
+        reader = DataReader(
             catalog,
             sources=SourceConfig(routes={"market.daily_metrics": "tushare"}),
-        ) as reader,
-    ):
+        )
         result = reader.at(_as_of(2, 18)).market.daily_metrics(
             symbols=("000001.SZ",),
             start=date(2024, 1, 2),
@@ -156,7 +149,7 @@ def test_daily_metrics_normalize_percentages_shares_and_currency(tmp_path: Path)
     assert result.to_pandas().attrs == {}
 
 
-def test_backtest_snapshot_keeps_old_revision_while_live_refreshes(tmp_path: Path) -> None:
+def test_reader_uses_refreshed_catalog_without_reopening_snapshots(tmp_path: Path) -> None:
     tushare_root = tmp_path / "tushare"
     common = {
         "ts_code": "000001.SZ",
@@ -198,44 +191,36 @@ def test_backtest_snapshot_keeps_old_revision_while_live_refreshes(tmp_path: Pat
 
     config = SourceConfig(routes={"fundamentals.cashflow": "tushare"})
     with DataCatalog(tushare_root=tushare_root, qmt_root=tmp_path / "qmt") as catalog:
-        with DataReader(catalog, sources=config, mode="backtest") as backtest:
-            first = backtest.at(_as_of(3, 10))
-            assert _cashflow_value(first) == 1.0
-            platform = first.fundamentals.statements(
-                kind="cash_flow",
-                symbols=("000001.SZ",),
-                periods=1,
-                company_type="industrial",
-            )
-            assert platform.table.schema.equals(CASH_FLOW_STATEMENT_SCHEMA)
-            assert "free_cash_flow" in platform.table.schema.names
-            assert "free_cashflow" not in platform.table.schema.names
-            assert platform.table.to_pylist()[0]["company_type"] == "industrial"
+        reader = DataReader(catalog, sources=config)
+        data = reader.at(_as_of(3, 10))
+        assert _cashflow_value(data) == 1.0
+        platform = data.fundamentals.statements(
+            kind="cash_flow",
+            symbols=("000001.SZ",),
+            periods=1,
+            company_type="industrial",
+        )
+        assert platform.table.schema.equals(CASH_FLOW_STATEMENT_SCHEMA)
+        assert "free_cash_flow" in platform.table.schema.names
+        assert "free_cashflow" not in platform.table.schema.names
+        assert platform.table.to_pylist()[0]["company_type"] == "industrial"
 
-            with TushareDataStore(tushare_root) as store:
-                store.write(
+        with TushareDataStore(tushare_root) as store:
+            store.write(
+                "cashflow",
+                _table(
                     "cashflow",
-                    _table(
-                        "cashflow",
-                        {
-                            **common,
-                            "f_ann_date": date(2024, 1, 3),
-                            "free_cashflow": 2.0,
-                            "update_flag": "1",
-                        },
-                    ),
-                )
-            catalog.refresh()
+                    {
+                        **common,
+                        "f_ann_date": date(2024, 1, 2),
+                        "free_cashflow": 2.0,
+                        "update_flag": "1",
+                    },
+                ),
+            )
+        catalog.refresh()
 
-            assert _cashflow_value(first) == 1.0
-            assert _cashflow_value(backtest.at(_as_of(4, 10))) == 1.0
-
-        with DataReader(catalog, sources=config, mode="live") as live:
-            current = live.at(_as_of(4, 10))
-            try:
-                assert _cashflow_value(current) == 2.0
-            finally:
-                current.close()
+        assert _cashflow_value(data) == 2.0
 
 
 def test_qmt_current_and_completed_intraday_bar_use_received_boundary(tmp_path: Path) -> None:
@@ -305,10 +290,8 @@ def test_qmt_current_and_completed_intraday_bar_use_received_boundary(tmp_path: 
             "market.intraday_bars": "qmt",
         }
     )
-    with (
-        DataCatalog(tushare_root=tmp_path / "tushare", qmt_root=qmt_root) as catalog,
-        DataReader(catalog, sources=config) as reader,
-    ):
+    with DataCatalog(tushare_root=tmp_path / "tushare", qmt_root=qmt_root) as catalog:
+        reader = DataReader(catalog, sources=config)
         before = reader.at(datetime(2024, 1, 2, 9, 30, 30, tzinfo=SHANGHAI)).market.bars(
             symbols=("000001.SZ",),
             frequency="1m",
@@ -362,13 +345,11 @@ def test_statement_without_actual_announcement_date_stays_invisible(tmp_path: Pa
             ),
         )
 
-    with (
-        DataCatalog(tushare_root=tushare_root, qmt_root=tmp_path / "qmt") as catalog,
-        DataReader(
+    with DataCatalog(tushare_root=tushare_root, qmt_root=tmp_path / "qmt") as catalog:
+        reader = DataReader(
             catalog,
             sources=SourceConfig(routes={"fundamentals.cashflow": "tushare"}),
-        ) as reader,
-    ):
+        )
         result = reader.at(_as_of(4, 10)).fundamentals.statements(
             kind="cash_flow",
             symbols=("000001.SZ",),
@@ -419,10 +400,8 @@ def test_financial_units_are_normalized_at_adapter_boundary(tmp_path: Path) -> N
             "fundamentals.forecast": "tushare",
         }
     )
-    with (
-        DataCatalog(tushare_root=tushare_root, qmt_root=tmp_path / "qmt") as catalog,
-        DataReader(catalog, sources=config) as reader,
-    ):
+    with DataCatalog(tushare_root=tushare_root, qmt_root=tmp_path / "qmt") as catalog:
+        reader = DataReader(catalog, sources=config)
         data = reader.at(_as_of(3, 10))
         indicator = data.fundamentals.indicators(
             symbols=("000001.SZ",),
@@ -468,13 +447,11 @@ def test_dividend_uses_reader_visibility_policy(tmp_path: Path) -> None:
             ),
         )
 
-    with (
-        DataCatalog(tushare_root=tushare_root, qmt_root=tmp_path / "qmt") as catalog,
-        DataReader(
+    with DataCatalog(tushare_root=tushare_root, qmt_root=tmp_path / "qmt") as catalog:
+        reader = DataReader(
             catalog,
             sources=SourceConfig(routes={"corporate_actions.dividends": "tushare"}),
-        ) as reader,
-    ):
+        )
         before = reader.at(_as_of(3, 9, 24)).corporate_actions.dividends(symbols=("000001.SZ",))
         after = reader.at(_as_of(3, 9, 25)).corporate_actions.dividends(symbols=("000001.SZ",))
 
@@ -515,13 +492,11 @@ def test_industry_reader_does_not_expose_future_membership_state(tmp_path: Path)
             ),
         )
 
-    with (
-        DataCatalog(tushare_root=tushare_root, qmt_root=tmp_path / "qmt") as catalog,
-        DataReader(
+    with DataCatalog(tushare_root=tushare_root, qmt_root=tmp_path / "qmt") as catalog:
+        reader = DataReader(
             catalog,
             sources=SourceConfig(routes={"classification.industry": "tushare"}),
-        ) as reader,
-    ):
+        )
         old = reader.at(_as_of(2, 10)).classification.industry(symbols=("000001.SZ",), level=3)
         new = reader.at(_as_of(3, 10)).classification.industry(symbols=("000001.SZ",), level=3)
 
@@ -531,106 +506,24 @@ def test_industry_reader_does_not_expose_future_membership_state(tmp_path: Path)
     assert "is_new" not in old.table.schema.names
 
 
-def test_snapshot_time_is_aware_normalized_and_read_only(tmp_path: Path) -> None:
-    with (
-        DataCatalog(
+def test_pit_view_time_is_aware_normalized_and_read_only(tmp_path: Path) -> None:
+    with DataCatalog(
             tushare_root=tmp_path / "tushare",
             qmt_root=tmp_path / "qmt",
-        ) as catalog,
-        DataReader(catalog, sources=SourceConfig(routes={})) as reader,
-    ):
+        ) as catalog:
+        reader = DataReader(catalog, sources=SourceConfig(routes={}))
         with pytest.raises(ValueError, match="时区"):
             reader.at(datetime(2024, 1, 1))
-        snapshot = reader.at(datetime(2024, 1, 1, tzinfo=ZoneInfo("UTC")))
-        assert snapshot.as_of == _as_of(1, 8)
+        data = reader.at(datetime(2024, 1, 1, tzinfo=ZoneInfo("UTC")))
+        assert data.as_of == _as_of(1, 8)
         with pytest.raises(AttributeError):
-            snapshot.as_of = _as_of(2, 8)  # type: ignore[misc]
+            data.as_of = _as_of(2, 8)  # type: ignore[misc]
         with pytest.raises(DataSourceNotConfiguredError):
-            snapshot.market.current(symbols=("000001.SZ",))
+            data.market.current(symbols=("000001.SZ",))
 
 
-def test_reader_rejects_provider_shaped_financial_schema(tmp_path: Path) -> None:
-    class ProviderTwoAdapter:
-        source_id = "provider_two"
-
-        def capabilities(self) -> frozenset[DataCapability]:
-            return frozenset({DataCapability.CASHFLOW})
-
-        def open_snapshot(self, as_of: datetime) -> SourceSnapshot:
-            return SourceSnapshot(self.source_id, as_of.isoformat())
-
-        def read(
-            self,
-            request: SourceRequest,
-            snapshot: SourceSnapshot,
-        ) -> pa.Table:
-            return pa.table({"vendor_cashflow": pa.array([], pa.float64())})
-
-    config = SourceConfig(routes={"fundamentals.cashflow": "provider_two"})
-    with (
-        DataCatalog(
-            tushare_root=tmp_path / "tushare",
-            qmt_root=tmp_path / "qmt",
-        ) as catalog,
-        DataReader(catalog, sources=config, adapters=(ProviderTwoAdapter(),)) as reader,
-        pytest.raises(DataAdapterError, match="平台 Schema 不匹配"),
-    ):
-        reader.at(_as_of(3, 10)).fundamentals.statements(
-            kind="cash_flow",
-            symbols=("000001.SZ",),
-            periods=1,
-        )
-
-
-def test_reader_rejects_financial_schema_with_wrong_type(tmp_path: Path) -> None:
-    fields = [
-        pa.field(
-            field.name,
-            pa.float32() if field.name == "free_cash_flow" else field.type,
-            nullable=field.nullable,
-        )
-        for field in CASH_FLOW_STATEMENT_SCHEMA
-    ]
-    wrong_schema = pa.schema(fields)
-    table_with_wrong_type = pa.Table.from_arrays(
-        [pa.array([], type=field.type) for field in fields],
-        schema=wrong_schema,
-    )
-
-    class ProviderTwoAdapter:
-        source_id = "provider_two"
-
-        def capabilities(self) -> frozenset[DataCapability]:
-            return frozenset({DataCapability.CASHFLOW})
-
-        def open_snapshot(self, as_of: datetime) -> SourceSnapshot:
-            return SourceSnapshot(self.source_id, as_of.isoformat())
-
-        def read(
-            self,
-            request: SourceRequest,
-            snapshot: SourceSnapshot,
-        ) -> pa.Table:
-            return table_with_wrong_type
-
-    config = SourceConfig(routes={"fundamentals.cashflow": "provider_two"})
-    with (
-        DataCatalog(
-            tushare_root=tmp_path / "tushare",
-            qmt_root=tmp_path / "qmt",
-        ) as catalog,
-        DataReader(catalog, sources=config, adapters=(ProviderTwoAdapter(),)) as reader,
-        pytest.raises(DataAdapterError, match="平台 Schema 不匹配"),
-    ):
-        reader.at(_as_of(3, 10)).fundamentals.statements(
-            kind="cash_flow",
-            symbols=("000001.SZ",),
-            periods=1,
-        )
-
-
-def _cashflow_value(snapshot: DataSnapshot) -> float:
-    result = snapshot.fundamentals.statements(
+def _cashflow_value(data: DataView) -> float:
+    result = data.fundamentals.statements(
         kind="cash_flow",
         symbols=("000001.SZ",),
         periods=1,

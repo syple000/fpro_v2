@@ -5,12 +5,10 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterator
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import datetime
 from enum import StrEnum
-from types import MappingProxyType
-from typing import Protocol
 
 import pandas as pd
 import pyarrow as pa
@@ -202,65 +200,13 @@ class DataCapability(StrEnum):
     SESSIONS = "calendar.sessions"
 
 
-QueryParameter = str | int | float | bool | date | datetime | None
-
-
-@dataclass(frozen=True, slots=True)
-class SourceRequest:
-    """Reader 传给来源适配器的已校验请求。"""
-
-    dataset: DataCapability
-    as_of: datetime
-    symbols: tuple[str, ...] | None
-    parameters: Mapping[str, QueryParameter]
-
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "parameters", MappingProxyType(dict(self.parameters)))
-
-
-class SnapshotHandle(Protocol):
-    """来源快照持有的可释放资源。"""
-
-    def close(self) -> None: ...
-
-
-@dataclass(frozen=True, slots=True)
-class SourceSnapshot:
-    """一次来源读取的固定物理边界；handle 只对对应适配器可见。"""
-
-    source_id: str
-    snapshot_id: str
-    handle: SnapshotHandle | None = None
-
-    def close(self) -> None:
-        if self.handle is not None:
-            self.handle.close()
-
-
-class DataSourceAdapter(Protocol):
-    """自定义来源需要实现的最小契约。"""
-
-    source_id: str
-
-    def capabilities(self) -> frozenset[DataCapability]: ...
-
-    def open_snapshot(self, as_of: datetime) -> SourceSnapshot: ...
-
-    def read(self, request: SourceRequest, snapshot: SourceSnapshot) -> pa.Table: ...
-
-
 @dataclass(frozen=True, slots=True)
 class QueryResult:
-    """所有有限数据查询的统一返回值。"""
+    """一次数据查询的结果及必要元数据。"""
 
     table: pa.Table
     as_of: datetime
-    snapshot_id: str
-    source_config_id: str
-    policy_version: int
-    schema_version: int
     sources: tuple[str, ...]
-    sort_keys: tuple[str, ...]
     truncated: bool
 
     def to_pandas(self) -> pd.DataFrame:

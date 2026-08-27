@@ -26,25 +26,6 @@ def test_catalog_exposes_only_raw_source_fields(tmp_path: Path) -> None:
     assert {"partition_date", "visible_at", "observed_at"}.isdisjoint(columns)
 
 
-def test_open_snapshot_uses_the_current_manifest_file_set(tmp_path: Path) -> None:
-    tushare_root = tmp_path / "tushare"
-    with TushareDataStore(tushare_root) as store:
-        store.write(
-            "daily",
-            _table("daily", {"ts_code": "000001.SZ", "trade_date": date(2024, 1, 2)}),
-        )
-
-    with (
-        DataCatalog(tushare_root=tushare_root, qmt_root=tmp_path / "qmt") as catalog,
-        catalog.open_snapshot("tushare") as snapshot,
-    ):
-        rows = snapshot.connection.execute(
-            "SELECT ts_code, trade_date FROM tushare.daily"
-        ).fetchall()
-
-    assert rows == [("000001.SZ", date(2024, 1, 2))]
-
-
 def test_refresh_reloads_exact_manifest_file_set(tmp_path: Path) -> None:
     tushare_root = tmp_path / "tushare"
     with TushareDataStore(tushare_root) as store:
