@@ -34,6 +34,8 @@ from qmt_receiver.schemas import (
     DIVIDEND_FACTOR_TABLE,
     FINANCIAL_SCHEMA,
     FINANCIAL_TABLE,
+    INTRADAY_SCHEMA,
+    INTRADAY_TABLE,
     TICK_SCHEMA,
     TICK_TABLE,
 )
@@ -44,6 +46,7 @@ from qmt_receiver.sync import (
     sync_daily,
     sync_dividend_factors,
     sync_financial,
+    sync_intraday,
 )
 
 __all__ = [
@@ -61,6 +64,8 @@ __all__ = [
     "FinancialQueryResponse",
     "FINANCIAL_SCHEMA",
     "FINANCIAL_TABLE",
+    "INTRADAY_SCHEMA",
+    "INTRADAY_TABLE",
     "HealthResponse",
     "HistoryDownloadResponse",
     "HistoryBar",
@@ -88,4 +93,5 @@ __all__ = [
     "sync_daily",
     "sync_dividend_factors",
     "sync_financial",
+    "sync_intraday",
 ]

@@ -12,7 +12,11 @@ import pyarrow as pa
 import pyarrow.compute as pc
 
 from data.catalog import DataCatalog
-from data.errors import DataCapabilityNotSupportedError, DataSourceUnavailableError
+from data.errors import (
+    DataAdapterError,
+    DataCapabilityNotSupportedError,
+    DataSourceUnavailableError,
+)
 from models import (
     ADJUSTMENT_FACTOR_SCHEMA,
     AUDIT_SCHEMA,
@@ -410,7 +414,19 @@ class TushareAdapter:
               {symbol_sql}
               {start_sql}
         """
-        return _fetch(connection, query, params, BAR_SCHEMA)
+        bars = _fetch(connection, query, params, BAR_SCHEMA)
+        if request.parameters["adjustment"] == "none" or bars.num_rows == 0:
+            return bars
+        factors = self._adjustment_factors(
+            connection,
+            AdapterRequest(
+                dataset=DataCapability.ADJUSTMENT_FACTORS,
+                as_of=request.as_of,
+                symbols=request.symbols,
+                parameters={},
+            ),
+        )
+        return _forward_adjust(bars, factors)
 
     def _current(
         self,
@@ -864,7 +880,7 @@ class TushareAdapter:
 
 
 class QmtAdapter:
-    """把 QMT 下载日线和已接收实时事件归一为平台字段。"""
+    """把 QMT 下载历史行情和已接收实时事件归一为平台字段。"""
 
     capabilities = _QMT_CAPABILITIES
 
@@ -916,13 +932,46 @@ class QmtAdapter:
         request: AdapterRequest,
     ) -> pa.Table:
         frequency = cast(str, request.parameters["frequency"])
-        minutes = {"1m": 1, "5m": 5, "15m": 15, "30m": 30, "60m": 60}.get(frequency)
-        if minutes is None:
+        period = {
+            "1m": ("1m", 1),
+            "5m": ("5m", 5),
+            "15m": ("15m", 15),
+            "30m": ("30m", 30),
+            "60m": ("1h", 60),
+        }.get(frequency)
+        if period is None:
             raise DataCapabilityNotSupportedError(f"QMT 不支持分钟周期 {frequency!r}")
+        qmt_period, minutes = period
         start_expr = _epoch_time("event_time")
         end_expr = f"{start_expr} + INTERVAL '{minutes} minutes'"
-        received_expr = _epoch_time("received_at")
-        params: list[object] = [frequency, request.as_of, request.as_of]
+        adjustment = request.parameters["adjustment"]
+        qmt_adjustment = "none" if adjustment == "none" else "front_ratio"
+        if qmt_adjustment == "front_ratio":
+            params: list[object] = [qmt_period, qmt_adjustment, request.as_of]
+            source_sql = """
+                SELECT code, event_time, open, high, low, close, preClose,
+                       CAST(volume * 100.0 AS DOUBLE) AS volume, amount,
+                       CAST(NULL AS BIGINT) AS received_at, CAST(0 AS BIGINT) AS seq
+                FROM qmt.intraday
+                WHERE period = ? AND adjustment = ?
+            """
+        else:
+            params = [qmt_period, qmt_adjustment, qmt_period, request.as_of, request.as_of]
+            source_sql = f"""
+                SELECT code, event_time, open, high, low, close, preClose,
+                       CAST(volume * 100.0 AS DOUBLE) AS volume, amount,
+                       CAST(NULL AS BIGINT) AS received_at, CAST(0 AS BIGINT) AS seq
+                FROM qmt.intraday
+                WHERE period = ? AND adjustment = ?
+                UNION ALL
+                SELECT code, event_time,
+                       quote.open, quote.high, quote.low, quote.close, quote.preClose,
+                       {_qmt_share_volume("quote.volume")} AS volume, quote.amount,
+                       received_at, seq
+                FROM qmt.bars
+                WHERE period = ? AND event_time IS NOT NULL
+                  AND {_epoch_time("received_at")} <= ?
+            """
         symbol_sql = _symbol_filter("code", request.symbols, params)
         range_sql = _range_filter(
             start_expr,
@@ -931,18 +980,16 @@ class QmtAdapter:
             params,
         )
         query = f"""
+            WITH candidates AS ({source_sql})
             SELECT code AS symbol, {start_expr} AS interval_start, {end_expr} AS interval_end,
-                   quote.open AS open, quote.high AS high, quote.low AS low,
-                   quote.close AS close, quote.preClose AS pre_close,
-                   {_qmt_share_volume("quote.volume")} AS volume, quote.amount AS amount
-            FROM qmt.bars
-            WHERE period = ? AND event_time IS NOT NULL
-              AND {received_expr} <= ? AND {end_expr} <= ?
+                   open, high, low, close, preClose AS pre_close, volume, amount
+            FROM candidates
+            WHERE {end_expr} <= ?
               {symbol_sql}
               {range_sql}
             QUALIFY row_number() OVER (
-                PARTITION BY code, period, event_time
-                ORDER BY received_at DESC, seq DESC
+                PARTITION BY code, event_time
+                ORDER BY received_at DESC NULLS LAST, seq DESC
             ) = 1
         """
         return _fetch(connection, query, params, BAR_SCHEMA)
@@ -1001,6 +1048,65 @@ def _coerce_schema(table: pa.Table, schema: pa.Schema) -> pa.Table:
         raise ValueError(f"平台字段不匹配: 期望 {schema.names}，实际 {table.schema.names}")
     arrays = [pc.cast(table.column(field.name), field.type) for field in schema]
     return pa.Table.from_arrays(arrays, schema=schema)
+
+
+def _forward_adjust(bars: pa.Table, factors: pa.Table) -> pa.Table:
+    """按 Tushare 每日复权因子计算平台前复权价格。"""
+    if bars.num_rows == 0:
+        return bars
+    connection = duckdb.connect(":memory:")
+    try:
+        connection.execute("SET TimeZone = 'Asia/Shanghai'")
+        connection.register("bars", bars)
+        connection.register("factors", factors)
+        missing = connection.execute(
+            """
+            WITH anchors AS (
+                SELECT symbol, factor AS anchor
+                FROM factors
+                QUALIFY row_number() OVER (
+                    PARTITION BY symbol ORDER BY trade_date DESC NULLS LAST
+                ) = 1
+            )
+            SELECT count(*)
+            FROM bars b
+            LEFT JOIN factors f
+              ON f.symbol = b.symbol
+             AND f.trade_date = CAST(b.interval_start AS DATE)
+            LEFT JOIN anchors a ON a.symbol = b.symbol
+            WHERE f.factor IS NULL OR a.anchor IS NULL OR a.anchor = 0
+            """
+        ).fetchone()
+        if missing is None or missing[0]:
+            raise DataCapabilityNotSupportedError("Tushare 不能为全部行情提供 PIT 前复权因子")
+        adjusted = connection.execute(
+            """
+            WITH anchors AS (
+                SELECT symbol, factor AS anchor
+                FROM factors
+                QUALIFY row_number() OVER (
+                    PARTITION BY symbol ORDER BY trade_date DESC NULLS LAST
+                ) = 1
+            )
+            SELECT b.symbol, b.interval_start, b.interval_end,
+                   b.open * f.factor / a.anchor AS open,
+                   b.high * f.factor / a.anchor AS high,
+                   b.low * f.factor / a.anchor AS low,
+                   b.close * f.factor / a.anchor AS close,
+                   b.pre_close * f.factor / a.anchor AS pre_close,
+                   b.volume, b.amount
+            FROM bars b
+            JOIN factors f
+              ON f.symbol = b.symbol
+             AND f.trade_date = CAST(b.interval_start AS DATE)
+            JOIN anchors a ON a.symbol = b.symbol
+            """
+        ).to_arrow_table()
+    except duckdb.Error as exc:
+        raise DataAdapterError("Tushare 前复权计算失败") from exc
+    finally:
+        connection.close()
+    return _coerce_schema(adjusted, BAR_SCHEMA)
 
 
 def _mapped_select(

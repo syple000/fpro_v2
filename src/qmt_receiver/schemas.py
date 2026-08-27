@@ -7,6 +7,7 @@ import pyarrow as pa
 TICK_TABLE = "ticks"
 BAR_TABLE = "bars"
 DAILY_TABLE = "daily"
+INTRADAY_TABLE = "intraday"
 FINANCIAL_TABLE = "financial"
 DIVIDEND_FACTOR_TABLE = "dividend_factors"
 
@@ -113,6 +114,28 @@ DAILY_SCHEMA = pa.schema(
         pa.field("totaldr", pa.float64()),
     ]
 )
+INTRADAY_SCHEMA = pa.schema(
+    [
+        pa.field("trading_date", pa.date32(), nullable=False),
+        pa.field("code", pa.string(), nullable=False),
+        pa.field("period", pa.string(), nullable=False),
+        pa.field("adjustment", pa.string(), nullable=False),
+        pa.field("event_time", pa.int64(), nullable=False),
+        pa.field("time", pa.int64()),
+        pa.field("open", pa.float64()),
+        pa.field("high", pa.float64()),
+        pa.field("low", pa.float64()),
+        pa.field("close", pa.float64()),
+        pa.field("volume", pa.int64()),
+        pa.field("amount", pa.float64()),
+        pa.field("settelementPrice", pa.float64()),
+        pa.field("openInterest", pa.float64()),
+        pa.field("preClose", pa.float64()),
+        pa.field("suspendFlag", pa.int64()),
+        pa.field("dr", pa.float64()),
+        pa.field("totaldr", pa.float64()),
+    ]
+)
 FINANCIAL_SCHEMA = pa.schema(
     [
         pa.field("report_date", pa.date32(), nullable=False),
@@ -141,6 +164,7 @@ TABLE_SCHEMAS = {
     TICK_TABLE: TICK_SCHEMA,
     BAR_TABLE: BAR_SCHEMA,
     DAILY_TABLE: DAILY_SCHEMA,
+    INTRADAY_TABLE: INTRADAY_SCHEMA,
     FINANCIAL_TABLE: FINANCIAL_SCHEMA,
     DIVIDEND_FACTOR_TABLE: DIVIDEND_FACTOR_SCHEMA,
 }
@@ -149,6 +173,7 @@ TABLE_PARTITION_BY = {
     TICK_TABLE: "trading_date",
     BAR_TABLE: "trading_date",
     DAILY_TABLE: "trade_date",
+    INTRADAY_TABLE: "trading_date",
     FINANCIAL_TABLE: "report_date",
     DIVIDEND_FACTOR_TABLE: "ex_date",
 }
@@ -157,6 +182,7 @@ TABLE_SORT_BY = {
     TICK_TABLE: ("event_time",),
     BAR_TABLE: ("event_time",),
     DAILY_TABLE: ("code", "adjustment"),
+    INTRADAY_TABLE: ("code", "period", "adjustment", "event_time"),
     FINANCIAL_TABLE: ("code", "dataset"),
     DIVIDEND_FACTOR_TABLE: ("code",),
 }
@@ -165,6 +191,7 @@ TABLE_PRIMARY_KEY = {
     TICK_TABLE: ("code", "event_time"),
     BAR_TABLE: ("code", "period", "event_time"),
     DAILY_TABLE: ("code", "adjustment"),
+    INTRADAY_TABLE: ("code", "period", "adjustment", "event_time"),
     FINANCIAL_TABLE: ("code", "dataset"),
     DIVIDEND_FACTOR_TABLE: ("code",),
 }
@@ -173,6 +200,7 @@ TABLE_DEDUPLICATE_PREFER_BY = {
     TICK_TABLE: ("received_at",),
     BAR_TABLE: ("received_at",),
     DAILY_TABLE: (),
+    INTRADAY_TABLE: (),
     FINANCIAL_TABLE: ("disclosure_date",),
     DIVIDEND_FACTOR_TABLE: (),
 }

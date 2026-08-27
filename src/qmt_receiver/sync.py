@@ -27,6 +27,7 @@ _FINANCIAL_TABLES: tuple[FinancialTable, ...] = (
     "CashFlow",
     "Pershareindex",
 )
+_INTRADAY_PERIODS = frozenset({"1m", "5m", "15m", "30m", "1h"})
 
 
 class _SyncClient(Protocol):
@@ -79,6 +80,7 @@ class _SyncClient(Protocol):
 @dataclass(frozen=True, slots=True)
 class SyncResult:
     daily_rows: int
+    intraday_rows: int
     financial_rows: int
     dividend_factor_rows: int
 
@@ -112,6 +114,41 @@ def sync_daily(
             fill_data=False,
         )
         rows += store.write_daily(response.data, adjustment)
+    return rows
+
+
+def sync_intraday(
+    client: _SyncClient,
+    store: QmtDataStore,
+    stocks: Sequence[str],
+    start_time: str,
+    end_time: str,
+    *,
+    period: XtDataPeriod,
+    force: bool = False,
+) -> int:
+    """同步 QMT 原生不复权和等比前复权历史分钟线。"""
+    if period not in _INTRADAY_PERIODS:
+        raise ValueError(f"分钟线不支持周期 {period!r}")
+    client.download_history(
+        stocks,
+        period=period,
+        start_time=start_time,
+        end_time=end_time,
+        mode="full" if force else "incremental",
+    )
+    rows = 0
+    for adjustment in ("none", "front_ratio"):
+        response = client.query_history(
+            stocks,
+            fields=DAILY_FIELDS,
+            period=period,
+            start_time=start_time,
+            end_time=end_time,
+            dividend_type=adjustment,
+            fill_data=False,
+        )
+        rows += store.write_intraday(response.data, period, adjustment)
     return rows
 
 
@@ -156,7 +193,7 @@ def sync_all(
     *,
     force: bool = False,
 ) -> SyncResult:
-    """同步日线、财务和除权因子；force 时强制重新下载已有历史行情。"""
+    """同步日线、1 分钟线、财务和除权因子；force 时覆盖已有历史行情。"""
     return SyncResult(
         daily_rows=sync_daily(
             client,
@@ -164,6 +201,15 @@ def sync_all(
             stocks,
             start_time,
             end_time,
+            force=force,
+        ),
+        intraday_rows=sync_intraday(
+            client,
+            store,
+            stocks,
+            start_time,
+            end_time,
+            period="1m",
             force=force,
         ),
         financial_rows=sync_financial(client, store, stocks, start_time, end_time),

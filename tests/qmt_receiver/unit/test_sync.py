@@ -20,13 +20,14 @@ from qmt_protocol import (
     HistoryQueryResponse,
     XtDataPeriod,
 )
-from qmt_receiver import QmtDataStore, sync_all
+from qmt_receiver import QmtDataStore, sync_all, sync_intraday
 
 
 class FakeSyncClient:
     def __init__(self) -> None:
         self.adjustments: list[DividendType] = []
         self.history_modes: list[HistoryMode] = []
+        self.history_periods: list[XtDataPeriod] = []
 
     def download_history(
         self,
@@ -37,6 +38,7 @@ class FakeSyncClient:
         mode: HistoryMode = "incremental",
     ) -> HistoryDownloadResponse:
         self.history_modes.append(mode)
+        self.history_periods.append(period)
         return HistoryDownloadResponse(completed=True)
 
     def query_history(
@@ -52,12 +54,13 @@ class FakeSyncClient:
     ) -> HistoryQueryResponse:
         self.adjustments.append(dividend_type)
         close = 10.0 if dividend_type == "none" else 8.0
+        index = 20240102 if period == "1d" else 20240102093000
         return HistoryQueryResponse(
             period=period,
             data={
                 stocks[0]: [
                     HistoryBar(
-                        index=20240102,
+                        index=index,
                         time=1_704_153_600_000,
                         open=close,
                         high=close,
@@ -134,6 +137,9 @@ def test_sync_all_downloads_and_writes_all_sources(tmp_path: Path) -> None:
         daily = catalog.connection.execute(
             "SELECT adjustment, close FROM qmt.daily ORDER BY adjustment"
         ).fetchall()
+        intraday = catalog.connection.execute(
+            "SELECT period, adjustment, close FROM qmt.intraday ORDER BY adjustment"
+        ).fetchall()
         financial = catalog.connection.execute(
             "SELECT code, dataset, report_date, disclosure_date, data_json FROM qmt.financial"
         ).fetchone()
@@ -142,11 +148,14 @@ def test_sync_all_downloads_and_writes_all_sources(tmp_path: Path) -> None:
         ).fetchone()
 
     assert result.daily_rows == 2
+    assert result.intraday_rows == 2
     assert result.financial_rows == 1
     assert result.dividend_factor_rows == 1
-    assert client.history_modes == ["incremental"]
-    assert client.adjustments == ["none", "front_ratio"]
+    assert client.history_modes == ["incremental", "incremental"]
+    assert client.history_periods == ["1d", "1m"]
+    assert client.adjustments == ["none", "front_ratio", "none", "front_ratio"]
     assert daily == [("front_ratio", 8.0), ("none", 10.0)]
+    assert intraday == [("1m", "front_ratio", 8.0), ("1m", "none", 10.0)]
     assert financial is not None
     assert dividend is not None
     assert financial[:2] == ("000001.SZ", "Balance")
@@ -170,4 +179,30 @@ def test_sync_all_force_uses_full_history_download(tmp_path: Path) -> None:
             force=True,
         )
 
-    assert client.history_modes == ["full"]
+    assert client.history_modes == ["full", "full"]
+    assert client.history_periods == ["1d", "1m"]
+
+
+def test_sync_intraday_downloads_native_front_ratio(tmp_path: Path) -> None:
+    client = FakeSyncClient()
+    qmt_root = tmp_path / "qmt"
+    with QmtDataStore(qmt_root) as store:
+        rows = sync_intraday(
+            client,
+            store,
+            ["000001.SZ"],
+            "20240101",
+            "20240131",
+            period="1m",
+        )
+
+    with DataCatalog(tushare_root=tmp_path / "tushare", qmt_root=qmt_root) as catalog:
+        bars = catalog.connection.execute(
+            "SELECT period, adjustment, close FROM qmt.intraday ORDER BY adjustment"
+        ).fetchall()
+
+    assert rows == 2
+    assert client.history_modes == ["incremental"]
+    assert client.history_periods == ["1m"]
+    assert client.adjustments == ["none", "front_ratio"]
+    assert bars == [("1m", "front_ratio", 8.0), ("1m", "none", 10.0)]

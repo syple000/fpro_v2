@@ -8,7 +8,6 @@ from datetime import date, datetime, time, timedelta
 from typing import Literal, cast
 from zoneinfo import ZoneInfo
 
-import duckdb
 import pyarrow as pa
 import pyarrow.compute as pc
 
@@ -21,13 +20,7 @@ from data.errors import (
     DataSourceNotConfiguredError,
     DataSourceUnavailableError,
 )
-from models import (
-    BAR_SCHEMA,
-    CAPABILITY_SCHEMAS,
-    STATUS_SCHEMA,
-    DataCapability,
-    QueryResult,
-)
+from models import CAPABILITY_SCHEMAS, STATUS_SCHEMA, DataCapability, QueryResult
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 SUPPORTED_FREQUENCIES = frozenset({"1m", "5m", "15m", "30m", "60m", "1d"})
@@ -227,29 +220,16 @@ class MarketReader:
             if _as_datetime(normalized_end) > self._data.as_of:
                 raise ValueError("end 不得晚于 as_of")
         route = "market.daily_bars" if frequency == "1d" else "market.intraday_bars"
-        main_source = self._data._source_config.routes.get(route)
-        calculate_forward = adjustment == "forward" and (
-            frequency != "1d" or main_source == "tushare"
-        )
         table, source = self._data._read(
             route,
             symbols=normalized_symbols,
             parameters={
                 "frequency": frequency,
-                "adjustment": "none" if calculate_forward else adjustment,
+                "adjustment": adjustment,
                 "start": normalized_start,
                 "end": normalized_end,
             },
         )
-        used_sources = [source]
-        if calculate_forward:
-            factors, factor_source = self._data._read(
-                "corporate_actions.adjustment_factors",
-                symbols=normalized_symbols,
-                parameters={},
-            )
-            table = _forward_adjust(table, factors)
-            used_sources.append(factor_source)
         if count is not None:
             table = _latest_per_symbol(table, count, "interval_end")
         direction: SortDirection = "ascending" if order == "asc" else "descending"
@@ -264,7 +244,7 @@ class MarketReader:
             fields=fields,
             sort=sort,
             limit=limit,
-            sources=used_sources,
+            sources=(source,),
         )
 
     def current(
@@ -744,66 +724,6 @@ class CalendarReader:
             if row["is_open"]:
                 return cast(date, row["cal_date"])
         return None
-
-
-def _forward_adjust(bars: pa.Table, factors: pa.Table) -> pa.Table:
-    _validate_identity(factors, ("symbol", "trade_date"))
-    if "factor" not in factors.schema.names:
-        raise DataAdapterError("复权因子结果缺少 factor")
-    if bars.num_rows == 0:
-        return bars
-    connection = duckdb.connect(":memory:")
-    try:
-        connection.execute("SET TimeZone = 'Asia/Shanghai'")
-        connection.register("bars", bars)
-        connection.register("factors", factors)
-        missing = connection.execute(
-            """
-            WITH anchors AS (
-                SELECT symbol, factor AS anchor
-                FROM factors
-                QUALIFY row_number() OVER (
-                    PARTITION BY symbol ORDER BY trade_date DESC NULLS LAST
-                ) = 1
-            )
-            SELECT count(*)
-            FROM bars b
-            LEFT JOIN factors f
-              ON f.symbol = b.symbol
-             AND f.trade_date = CAST(b.interval_start AS DATE)
-            LEFT JOIN anchors a ON a.symbol = b.symbol
-            WHERE f.factor IS NULL OR a.anchor IS NULL OR a.anchor = 0
-            """
-        ).fetchone()
-        if missing is None or missing[0]:
-            raise DataCapabilityNotSupportedError("数据源不能为全部行情提供 PIT 前复权因子")
-        table = connection.execute(
-            """
-            WITH anchors AS (
-                SELECT symbol, factor AS anchor
-                FROM factors
-                QUALIFY row_number() OVER (
-                    PARTITION BY symbol ORDER BY trade_date DESC NULLS LAST
-                ) = 1
-            )
-            SELECT b.symbol, b.interval_start, b.interval_end,
-                   b.open * f.factor / a.anchor AS open,
-                   b.high * f.factor / a.anchor AS high,
-                   b.low * f.factor / a.anchor AS low,
-                   b.close * f.factor / a.anchor AS close,
-                   b.pre_close * f.factor / a.anchor AS pre_close,
-                   b.volume, b.amount
-            FROM bars b
-            JOIN factors f
-              ON f.symbol = b.symbol
-             AND f.trade_date = CAST(b.interval_start AS DATE)
-            JOIN anchors a ON a.symbol = b.symbol
-            """
-        ).to_arrow_table()
-    finally:
-        connection.close()
-    arrays = [pc.cast(table.column(field.name), field.type) for field in BAR_SCHEMA]
-    return pa.Table.from_arrays(arrays, schema=BAR_SCHEMA)
 
 
 def _latest_per_symbol(

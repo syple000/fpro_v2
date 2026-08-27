@@ -72,9 +72,10 @@ agent 保留 XtData 原始 `quote.time`。receiver 落盘时才生成业务字�
 
 - `sync_daily()`：同步日线，`adjustment` 区分 `none` 与 `front_ratio`；默认增量下载。两种原生
   结构都由数据源适配器归一化后再从 `DataReader` 输出。
+- `sync_intraday()`：按指定分钟周期同步 QMT 原生的 `none` 与 `front_ratio` 历史 K 线。
 - `sync_financial()`：同步八类具体财务记录。
 - `sync_dividend_factors()`：同步具体 `DividendFactor` 记录。
-- `sync_all()`：依次完成上述三类，并接受关键字参数 `force=False`。
+- `sync_all()`：依次同步日线、1 分钟线、财务和除权因子，并接受关键字参数 `force=False`。
 
 ```python
 from qmt_receiver import QmtAgentClient, QmtDataStore, sync_all
@@ -95,7 +96,8 @@ with (
 
 QMT 历史行情默认以 `incremental` 模式补齐本地缓存；`force=True` 改用 `full`，即使区间已经
 下载过也再次下载。财务下载和除权因子查询没有增量/完整模式，本来就会在每次同步时请求，
-所以 `force` 不改变这两类调用。命令行 `qmt-receiver-test sync` 同样支持 `--force`。
+所以 `force` 不改变这两类调用。`sync_all()` 默认包含 1 分钟线；其他分钟周期仍按实际需要调用
+`sync_intraday()`。命令行 `qmt-receiver-test sync` 同样支持 `--force`。
 
 历史、财务和除权返回在进入 receiver 时已经是具体行结构。存储层只做物理表映射，不再解析通用 DataFrame 或任意 JSON 单元。
 
@@ -106,6 +108,7 @@ QMT 历史行情默认以 `incremental` 模式补齐本地缓存；`force=True` 
 | `ticks` | `trading_date` | `(code, event_time)` |
 | `bars` | `trading_date` | `(code, period, event_time)` |
 | `daily` | `trade_date` | `(code, adjustment)` |
+| `intraday` | `trading_date` | `(code, period, adjustment, event_time)` |
 | `financial` | `report_date` | `(code, dataset)` |
 | `dividend_factors` | `ex_date` | `code` |
 

@@ -13,7 +13,7 @@ from zoneinfo import ZoneInfo
 import pyarrow as pa
 
 import qmt_receiver.schemas as schemas
-from fpro_common import normalise_unix_timestamp_us, utc_us_to_datetime
+from fpro_common import datetime_to_utc_us, normalise_unix_timestamp_us, utc_us_to_datetime
 from parquet_store import ParquetStore, TableConfig
 from qmt_protocol import (
     BarQuote,
@@ -25,6 +25,7 @@ from qmt_protocol import (
     QuoteEvent,
     SequencedQuote,
     TickQuote,
+    XtDataPeriod,
 )
 
 _QMT_TIMEZONE = ZoneInfo("Asia/Shanghai")
@@ -119,6 +120,49 @@ class QmtDataStore:
         return self._write(
             schemas.DAILY_TABLE,
             pa.Table.from_pylist(rows, schema=schemas.DAILY_SCHEMA),
+        )
+
+    def write_intraday(
+        self,
+        data: Mapping[str, Sequence[HistoryQuote]],
+        period: XtDataPeriod,
+        adjustment: DividendType,
+    ) -> int:
+        """写入 QMT 原生不复权或等比前复权历史分钟线。"""
+        if period not in {"1m", "5m", "15m", "30m", "1h"}:
+            raise ValueError(f"分钟线不支持周期 {period!r}")
+        if adjustment not in {"none", "front_ratio"}:
+            raise ValueError(f"分钟线不支持复权方式 {adjustment!r}")
+        rows: list[dict[str, object]] = []
+        for code, records in data.items():
+            for record in records:
+                if not isinstance(record, HistoryBar):
+                    raise TypeError("分钟线存储只接受 HistoryBar")
+                values = record.model_dump(mode="python", exclude_unset=True)
+                index = values.pop("index")
+                event_time = _history_index_timestamp_us(index, self._timezone)
+                if event_time is None:
+                    event_time = _xt_timestamp_us(values.get("time"))
+                if event_time is None:
+                    raise ValueError(f"{code} 分钟线包含无效时间: {index!r}")
+                row = {
+                    "trading_date": _trading_date(event_time, self._timezone),
+                    "code": code,
+                    "period": period,
+                    "adjustment": adjustment,
+                    "event_time": event_time,
+                }
+                for field in schemas.DAILY_FIELDS:
+                    value = values.get(field)
+                    row[field] = (
+                        _integer(value)
+                        if field in {"time", "volume", "suspendFlag"}
+                        else _number(value)
+                    )
+                rows.append(row)
+        return self._write(
+            schemas.INTRADAY_TABLE,
+            pa.Table.from_pylist(rows, schema=schemas.INTRADAY_SCHEMA),
         )
 
     def write_financial(
@@ -287,6 +331,19 @@ def _xt_timestamp_us(value: object) -> int | None:
             return None
         value = int(value)
     return normalise_unix_timestamp_us(value)
+
+
+def _history_index_timestamp_us(value: object, timezone: ZoneInfo) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    text = str(value)
+    if len(text) != 14:
+        return None
+    try:
+        local_time = datetime.strptime(text, "%Y%m%d%H%M%S").replace(tzinfo=timezone)
+    except ValueError:
+        return None
+    return datetime_to_utc_us(local_time)
 
 
 def _number(value: object) -> float | None:

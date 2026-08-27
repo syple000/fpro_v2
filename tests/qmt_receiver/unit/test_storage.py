@@ -22,6 +22,8 @@ from qmt_receiver.schemas import (
     DAILY_TABLE,
     DIVIDEND_FACTOR_TABLE,
     FINANCIAL_TABLE,
+    INTRADAY_SCHEMA,
+    INTRADAY_TABLE,
     TICK_SCHEMA,
 )
 from qmt_receiver.storage import QmtDataStore
@@ -172,6 +174,25 @@ def test_download_write_immediately_deduplicates_partition(tmp_path: Path) -> No
     table = _read_only_table(tmp_path / DAILY_TABLE)
     assert table.num_rows == 1
     assert table.column("close").to_pylist() == [11.0]
+
+
+def test_store_keeps_native_intraday_adjustments_separate(tmp_path: Path) -> None:
+    raw = [HistoryBar(index=20240102093000, close=10.0)]
+    adjusted = [HistoryBar(index=20240102093000, close=8.0)]
+    latest = [HistoryBar(index=20240102093000, close=8.5)]
+
+    with QmtDataStore(tmp_path) as store:
+        store.write_intraday({"000001.SZ": raw}, "1m", "none")
+        store.write_intraday({"000001.SZ": adjusted}, "1m", "front_ratio")
+        store.write_intraday({"000001.SZ": latest}, "1m", "front_ratio")
+
+    table = _read_only_table(tmp_path / INTRADAY_TABLE)
+    assert table.schema == INTRADAY_SCHEMA
+    assert table.num_rows == 2
+    assert table.select(("adjustment", "close")).sort_by("adjustment").to_pylist() == [
+        {"adjustment": "front_ratio", "close": 8.5},
+        {"adjustment": "none", "close": 10.0},
+    ]
 
 
 def test_financial_disclosure_date_is_an_attribute_not_a_key(tmp_path: Path) -> None:
