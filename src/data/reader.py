@@ -209,8 +209,6 @@ class MarketReader:
             raise ValueError(f"不支持的 frequency: {frequency!r}")
         if adjustment not in {"none", "forward"}:
             raise ValueError("adjustment 只允许 'none' 或 'forward'")
-        if frequency != "1d" and adjustment != "none":
-            raise DataCapabilityNotSupportedError("分钟线当前不支持前复权输出")
         order = _order(order)
         limit = _limit(limit, self._data._max_limit)
         normalized_symbols = _symbols(symbols, limit)
@@ -230,21 +228,21 @@ class MarketReader:
                 raise ValueError("end 不得晚于 as_of")
         route = "market.daily_bars" if frequency == "1d" else "market.intraday_bars"
         main_source = self._data._source_config.routes.get(route)
-        request_adjustment = adjustment
-        if adjustment == "forward" and main_source == "tushare":
-            request_adjustment = "none"
+        calculate_forward = adjustment == "forward" and (
+            frequency != "1d" or main_source == "tushare"
+        )
         table, source = self._data._read(
             route,
             symbols=normalized_symbols,
             parameters={
                 "frequency": frequency,
-                "adjustment": request_adjustment,
+                "adjustment": "none" if calculate_forward else adjustment,
                 "start": normalized_start,
                 "end": normalized_end,
             },
         )
         used_sources = [source]
-        if adjustment == "forward" and source == "tushare":
+        if calculate_forward:
             factors, factor_source = self._data._read(
                 "corporate_actions.adjustment_factors",
                 symbols=normalized_symbols,
@@ -778,7 +776,7 @@ def _forward_adjust(bars: pa.Table, factors: pa.Table) -> pa.Table:
             """
         ).fetchone()
         if missing is None or missing[0]:
-            raise DataCapabilityNotSupportedError("数据源不能为全部日线提供 PIT 前复权因子")
+            raise DataCapabilityNotSupportedError("数据源不能为全部行情提供 PIT 前复权因子")
         table = connection.execute(
             """
             WITH anchors AS (

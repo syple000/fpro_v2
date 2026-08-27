@@ -325,6 +325,77 @@ def test_qmt_current_and_completed_intraday_bar_use_received_boundary(tmp_path: 
     assert daily.table.to_pylist()[0]["amount"] == 1_000.0
 
 
+def test_qmt_intraday_bars_can_be_forward_adjusted(tmp_path: Path) -> None:
+    qmt_root = tmp_path / "qmt"
+    tushare_root = tmp_path / "tushare"
+    interval_start = _as_of(2, 9, 30)
+    with QmtDataStore(qmt_root) as store:
+        store.append_quotes(
+            [
+                SequencedQuote(
+                    seq=1,
+                    code="000001.SZ",
+                    period="1m",
+                    source="market",
+                    subscription="SZ",
+                    received_at=_us(_as_of(2, 9, 31)),
+                    quote=BarQuote(
+                        time=_us(interval_start),
+                        open=10.0,
+                        high=12.0,
+                        low=9.0,
+                        close=11.0,
+                        preClose=9.5,
+                        volume=100,
+                        amount=1_000.0,
+                    ),
+                )
+            ]
+        )
+    with TushareDataStore(tushare_root) as store:
+        store.write(
+            "adj_factor",
+            _table(
+                "adj_factor",
+                {
+                    "ts_code": "000001.SZ",
+                    "trade_date": date(2024, 1, 2),
+                    "adj_factor": 1.0,
+                },
+                {
+                    "ts_code": "000001.SZ",
+                    "trade_date": date(2024, 1, 3),
+                    "adj_factor": 2.0,
+                },
+            ),
+        )
+
+    config = SourceConfig(
+        routes={
+            "market.intraday_bars": "qmt",
+            "corporate_actions.adjustment_factors": "tushare",
+        }
+    )
+    with DataCatalog(tushare_root=tushare_root, qmt_root=qmt_root) as catalog:
+        result = DataReader(catalog, sources=config).at(_as_of(3, 10)).market.bars(
+            symbols=("000001.SZ",),
+            frequency="1m",
+            start=interval_start,
+            end=_as_of(2, 9, 31),
+            adjustment="forward",
+        )
+
+    row = result.table.to_pylist()[0]
+    assert row["open"] == 5.0
+    assert row["high"] == 6.0
+    assert row["low"] == 4.5
+    assert row["close"] == 5.5
+    assert row["pre_close"] == 4.75
+    assert row["volume"] == 10_000.0
+    assert row["amount"] == 1_000.0
+    assert result.sources == ("qmt", "tushare")
+
+
 def test_statement_without_actual_announcement_date_stays_invisible(tmp_path: Path) -> None:
     tushare_root = tmp_path / "tushare"
     with TushareDataStore(tushare_root) as store:

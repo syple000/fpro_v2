@@ -158,9 +158,9 @@ Tushare 财务数据大多只有公告日期，没有精确发布时间。因此
 adjusted_price(t) = raw_price(t) * factor(t) / anchor_factor(as_of)
 ```
 
-例如回测可以把上述两个路由都配置为 Tushare。QMT 适配器也可以直接选择已经接收的
-`front_ratio` 日线，无需读取复权因子路由。适配器必须把结果归一到平台 bar Schema：只调整
-OHLC 和前收盘价，
+例如回测可以把上述两个路由都配置为 Tushare。QMT 适配器可以直接选择已经接收的
+`front_ratio` 日线，无需读取复权因子路由；QMT 分钟线则与已配置的每日复权因子组合计算。
+适配器必须把结果归一到平台 bar Schema：只调整 OHLC 和前收盘价，
 `volume/amount` 保留平台规定的实际成交口径。数据源不能完整满足该语义时，Reader 明确报
 “数据源不支持前复权”，不能返回一张混合了复权和未复权行的表，也不能静默切换来源。
 
@@ -317,7 +317,8 @@ Reader 创建时校验所有已配置的 `source_id` 是否注册并支持对应
 数据源在 Reader 创建时绑定，策略不能逐次选源。一个公共请求依赖多个逻辑数据集时，Reader
 只解析本次确实需要的路由：例如 `market.status(fields=("suspended",))` 只要求
 `market.suspensions`；Tushare 派生前复权同时要求 `market.daily_bars` 和
-`corporate_actions.adjustment_factors`，而 QMT 原生 `front_ratio` 只要求前者。
+`corporate_actions.adjustment_factors`；QMT 原生 `front_ratio` 日线只要求前者，QMT 前复权分钟线
+同时要求 `market.intraday_bars` 和 `corporate_actions.adjustment_factors`。
 多路由组合结果的 `QueryResult.sources` 记录本次实际使用的全部 `source_id`，但公共表 Schema
 不随来源数量变化。
 
@@ -373,6 +374,7 @@ with DataCatalog(
 | `market.bars(frequency="1d", adjustment="none")` | Tushare `daily`；或 QMT `daily(adjustment="none")` |
 | `market.bars(frequency="1d", adjustment="forward")` | Tushare `daily + adj_factor` 现场计算；或直接使用 QMT `daily(adjustment="front_ratio")` |
 | `market.bars()` 分钟周期 | 当前只有已经实时接收并落盘的 `qmt.bars`；`tushare_data` 尚无分钟表 |
+| `market.bars()` 前复权分钟周期 | QMT `bars` 与 `corporate_actions.adjustment_factors` 路由提供的每日复权因子现场计算 |
 | `market.current()` | QMT tick/bar；无实时源时仅提供 Tushare 日线的开盘事件 |
 | `market.daily_metrics()` | `tushare.daily_basic` |
 | `market.moneyflow()` | `tushare.moneyflow` |
@@ -388,7 +390,8 @@ with DataCatalog(
 它们以后可以在完成平台 Schema 映射和可见性规则登记后成为对应能力的实现。QMT `front_ratio`
 已经是 `adjustment="forward"` 的有效实现：当 `market.daily_bars="qmt"` 时适配器直接读取并
 归一化它；配置 Tushare 派生实现时，Reader 按显式路由组合 `market.daily_bars` 与
-`corporate_actions.adjustment_factors`，两个路由不要求来自同一个来源。
+`corporate_actions.adjustment_factors`。前复权分钟线同样组合 `market.intraday_bars` 与复权因子，
+两个路由不要求来自同一个来源。
 
 ### 公共参数
 
@@ -785,6 +788,7 @@ AdapterRequest
 - 路由未配置、能力不支持、来源不可用和合法空结果分别产生约定的不同结果；
 - 同一公共请求切换 Tushare/QMT 后，结果 Schema、类型、单位和排序完全一致；
 - 回测用 Tushare 计算前复权、实盘用 QMT `front_ratio` 时，策略调用和平台 bar 结构完全一致；
+- QMT 分钟线可以使用 PIT 可见的每日复权因子生成前复权 OHLC，成交量和成交额保持原始口径；
 - 数据源缺少请求能力时明确失败，不返回供应商字段、不生成半成品且不静默换源；
 - 适配器返回缺列、多列或错误类型时在 Reader 边界失败，不能生成 `QueryResult`；
 - 相同参数的结果字段、排序和 `truncated` 完全稳定；
