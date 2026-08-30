@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
 from datetime import date, datetime
-from typing import cast
+from typing import Literal
+from zoneinfo import ZoneInfo
 
 import duckdb
 import pyarrow as pa
@@ -13,7 +13,6 @@ import pyarrow.compute as pc
 
 from data.catalog import DataCatalog
 from data.errors import (
-    DataAdapterError,
     DataCapabilityNotSupportedError,
     DataSourceUnavailableError,
 )
@@ -39,20 +38,10 @@ from models import (
     DataCapability,
 )
 
-QueryParameter = str | int | float | bool | date | datetime | None
-
-
-@dataclass(frozen=True, slots=True)
-class AdapterRequest:
-    """Reader 传给内置数据适配器的查询参数。"""
-
-    dataset: DataCapability
-    as_of: datetime
-    symbols: tuple[str, ...] | None
-    parameters: Mapping[str, QueryParameter]
-
-
 _TZ = "Asia/Shanghai"
+_FORWARD_BAR_SCHEMA = pa.schema(
+    [*BAR_SCHEMA, pa.field("__invalid_factor", pa.bool_(), nullable=False)]
+)
 
 _TUSHARE_COMPANY_TYPES = (
     ("1", "industrial"),
@@ -63,12 +52,6 @@ _TUSHARE_COMPANY_TYPES = (
 _PLATFORM_TO_TUSHARE_COMPANY_TYPE = {
     platform: source for source, platform in _TUSHARE_COMPANY_TYPES
 }
-_COMPANY_TYPE_SQL = (
-    "CASE comp_type "
-    + " ".join(f"WHEN '{source}' THEN '{platform}'" for source, platform in _TUSHARE_COMPANY_TYPES)
-    + " END"
-)
-
 _TUSHARE_CAPABILITIES = frozenset(
     {
         DataCapability.DAILY_BARS,
@@ -356,120 +339,190 @@ class TushareAdapter:
     def __init__(self, catalog: DataCatalog) -> None:
         self._connection = catalog.connection
 
-    def read(self, request: AdapterRequest) -> pa.Table:
-        readers = {
-            DataCapability.DAILY_BARS: self._daily_bars,
-            DataCapability.REALTIME_QUOTES: self._current,
-            DataCapability.DAILY_METRICS: self._daily_metrics,
-            DataCapability.MONEYFLOW: self._moneyflow,
-            DataCapability.SUSPENSIONS: self._suspensions,
-            DataCapability.PRICE_LIMITS: self._price_limits,
-            DataCapability.ST_STATUS: self._st_status,
-            DataCapability.INCOME: self._statements,
-            DataCapability.BALANCE_SHEET: self._statements,
-            DataCapability.CASHFLOW: self._statements,
-            DataCapability.INDICATORS: self._indicators,
-            DataCapability.FORECAST: self._disclosures,
-            DataCapability.EXPRESS: self._disclosures,
-            DataCapability.AUDIT: self._disclosures,
-            DataCapability.DIVIDENDS: self._dividends,
-            DataCapability.ADJUSTMENT_FACTORS: self._adjustment_factors,
-            DataCapability.INDUSTRY: self._industry,
-            DataCapability.SESSIONS: self._sessions,
-        }
-        try:
-            reader = readers[request.dataset]
-        except KeyError:
-            raise DataCapabilityNotSupportedError(
-                f"Tushare 不支持逻辑数据集 {request.dataset!r}"
-            ) from None
-        return reader(self._connection, request)
-
-    def _daily_bars(
+    def daily_bars(
         self,
-        connection: duckdb.DuckDBPyConnection,
-        request: AdapterRequest,
+        *,
+        as_of: datetime,
+        symbols: tuple[str, ...] | None,
+        start: date | datetime | None,
+        end: date | datetime,
+        count: int | None,
+        adjustment: Literal["none", "forward"],
+        order: Literal["asc", "desc"],
+        fetch_limit: int | None,
+        columns: tuple[str, ...] | None = None,
     ) -> pa.Table:
-        if request.parameters["frequency"] != "1d":
-            raise DataCapabilityNotSupportedError("Tushare 当前只支持平台日线")
-        params: list[object] = [request.as_of]
-        symbol_sql = _symbol_filter("ts_code", request.symbols, params)
-        start_sql = _range_filter(
-            _day_time("trade_date", "09:30"),
-            request.parameters.get("start"),
-            request.parameters.get("end"),
-            params,
+        direction = _sql_direction(order, default="asc")
+        if count is None:
+            params = _query_parameters(
+                as_of=as_of,
+                symbols=symbols,
+                start=start,
+                end=end,
+                fetch_limit=fetch_limit,
+            )
+            query = f"""
+                SELECT ts_code AS symbol,
+                       {_day_time("trade_date", "09:30")} AS interval_start,
+                       {_day_time("trade_date", "15:00")} AS interval_end,
+                       open, high, low, close, pre_close,
+                       CAST(vol * 100.0 AS DOUBLE) AS volume,
+                       CAST(amount * 1000.0 AS DOUBLE) AS amount
+                FROM tushare.daily
+                WHERE trade_date IS NOT NULL
+                  AND {_day_time("trade_date", "16:05")} <= $as_of
+                  AND ($symbols IS NULL OR ts_code IN (SELECT unnest($symbols)))
+                  AND {_day_time("trade_date", "09:30")} >= $start
+                  AND {_day_time("trade_date", "09:30")} < $end
+                ORDER BY interval_end {direction}, symbol, interval_start {direction}
+                LIMIT $fetch_limit
+            """
+        else:
+            if symbols is not None:
+                fetch_limit = None
+            params = _query_parameters(
+                as_of=as_of,
+                symbols=symbols,
+                count=count,
+                fetch_limit=fetch_limit,
+            )
+            query = f"""
+                SELECT ts_code AS symbol,
+                       {_day_time("trade_date", "09:30")} AS interval_start,
+                       {_day_time("trade_date", "15:00")} AS interval_end,
+                       open, high, low, close, pre_close,
+                       CAST(vol * 100.0 AS DOUBLE) AS volume,
+                       CAST(amount * 1000.0 AS DOUBLE) AS amount
+                FROM tushare.daily
+                WHERE trade_date IS NOT NULL
+                  AND {_day_time("trade_date", "16:05")} <= $as_of
+                  AND ($symbols IS NULL OR ts_code IN (SELECT unnest($symbols)))
+                QUALIFY row_number() OVER (
+                    PARTITION BY ts_code ORDER BY trade_date DESC
+                ) <= $count
+                ORDER BY interval_end {direction}, symbol, interval_start {direction}
+                LIMIT $fetch_limit
+            """
+
+        if adjustment == "none":
+            return _fetch(self._connection, query, params, BAR_SCHEMA, columns)
+        return self._forward_daily_bars(
+            raw_bars_sql=query,
+            params=params,
+            direction=direction,
+            columns=columns,
         )
+
+    def _forward_daily_bars(
+        self,
+        *,
+        raw_bars_sql: str,
+        params: Mapping[str, object],
+        direction: str,
+        columns: tuple[str, ...] | None,
+    ) -> pa.Table:
         query = f"""
-            SELECT
-                ts_code AS symbol,
-                {_day_time("trade_date", "09:30")} AS interval_start,
-                {_day_time("trade_date", "15:00")} AS interval_end,
-                open, high, low, close, pre_close,
-                CAST(vol * 100.0 AS DOUBLE) AS volume,
-                CAST(amount * 1000.0 AS DOUBLE) AS amount
-            FROM tushare.daily
-            WHERE trade_date IS NOT NULL
-              AND {_day_time("trade_date", "16:05")} <= ?
-              {symbol_sql}
-              {start_sql}
+            WITH raw_bars AS (
+                {raw_bars_sql}
+            ), visible_factors AS (
+                SELECT ts_code AS symbol,
+                       trade_date,
+                       adj_factor AS factor
+                FROM tushare.adj_factor
+                WHERE trade_date IS NOT NULL
+                  AND {_day_time("trade_date", "09:25")} <= $as_of
+                  AND ($symbols IS NULL OR ts_code IN (SELECT unnest($symbols)))
+            ), anchors AS (
+                SELECT symbol,
+                       factor AS anchor
+                FROM visible_factors
+                QUALIFY row_number() OVER (
+                    PARTITION BY symbol ORDER BY trade_date DESC
+                ) = 1
+            )
+            SELECT b.symbol,
+                   b.interval_start,
+                   b.interval_end,
+                   b.open * f.factor / a.anchor AS open,
+                   b.high * f.factor / a.anchor AS high,
+                   b.low * f.factor / a.anchor AS low,
+                   b.close * f.factor / a.anchor AS close,
+                   b.pre_close * f.factor / a.anchor AS pre_close,
+                   b.volume,
+                   b.amount,
+                   f.factor IS NULL OR a.anchor IS NULL OR a.anchor = 0
+                       AS __invalid_factor
+            FROM raw_bars b
+            LEFT JOIN visible_factors f
+              ON f.symbol = b.symbol
+             AND f.trade_date = CAST(
+                 timezone('{_TZ}', b.interval_start) AS DATE
+             )
+            LEFT JOIN anchors a ON a.symbol = b.symbol
+            ORDER BY b.interval_end {direction},
+                     b.symbol,
+                     b.interval_start {direction}
         """
-        bars = _fetch(connection, query, params, BAR_SCHEMA)
-        if request.parameters["adjustment"] == "none" or bars.num_rows == 0:
-            return bars
-        factors = self._adjustment_factors(
-            connection,
-            AdapterRequest(
-                dataset=DataCapability.ADJUSTMENT_FACTORS,
-                as_of=request.as_of,
-                symbols=request.symbols,
-                parameters={},
-            ),
-        )
-        return _forward_adjust(bars, factors)
+        adjusted = _fetch(self._connection, query, params, _FORWARD_BAR_SCHEMA)
+        if pc.any(adjusted.column("__invalid_factor")).as_py():
+            raise DataCapabilityNotSupportedError("Tushare 不能为全部行情提供 PIT 前复权因子")
+        return _project_table(adjusted.select(BAR_SCHEMA.names), columns)
 
-    def _current(
+    def current(
         self,
-        connection: duckdb.DuckDBPyConnection,
-        request: AdapterRequest,
+        *,
+        as_of: datetime,
+        symbols: tuple[str, ...] | None,
+        fetch_limit: int | None,
+        columns: tuple[str, ...] | None = None,
     ) -> pa.Table:
-        params: list[object] = [request.as_of.date(), request.as_of]
-        symbol_sql = _symbol_filter("ts_code", request.symbols, params)
+        params = _query_parameters(
+            as_of=as_of,
+            trade_date=as_of.date(),
+            symbols=symbols,
+            fetch_limit=fetch_limit,
+        )
         query = f"""
             SELECT
                 ts_code AS symbol,
                 {_day_time("trade_date", "09:30")} AS event_time,
                 open,
-                CASE WHEN {_day_time("trade_date", "16:05")} <= ? THEN high END AS high,
-                CASE WHEN {_day_time("trade_date", "16:05")} <= ? THEN low END AS low,
-                CASE WHEN {_day_time("trade_date", "16:05")} <= ? THEN close END AS last,
+                CASE WHEN {_day_time("trade_date", "16:05")} <= $as_of THEN high END AS high,
+                CASE WHEN {_day_time("trade_date", "16:05")} <= $as_of THEN low END AS low,
+                CASE WHEN {_day_time("trade_date", "16:05")} <= $as_of THEN close END AS last,
                 pre_close,
-                CASE WHEN {_day_time("trade_date", "16:05")} <= ?
+                CASE WHEN {_day_time("trade_date", "16:05")} <= $as_of
                      THEN CAST(vol * 100.0 AS DOUBLE) END AS volume,
-                CASE WHEN {_day_time("trade_date", "16:05")} <= ?
+                CASE WHEN {_day_time("trade_date", "16:05")} <= $as_of
                      THEN CAST(amount * 1000.0 AS DOUBLE) END AS amount
             FROM tushare.daily
-            WHERE trade_date = ?
-              AND {_day_time("trade_date", "09:30")} <= ?
-              {symbol_sql}
+            WHERE trade_date = $trade_date
+              AND {_day_time("trade_date", "09:30")} <= $as_of
+              AND ($symbols IS NULL OR ts_code IN (SELECT unnest($symbols)))
             QUALIFY row_number() OVER (PARTITION BY ts_code ORDER BY trade_date DESC) = 1
+            ORDER BY symbol
+            LIMIT $fetch_limit
         """
-        # The five repeated comparisons precede the date/as-of WHERE parameters.
-        params = [request.as_of] * 5 + params
-        return _fetch(connection, query, params, CURRENT_SCHEMA)
+        return _fetch(self._connection, query, params, CURRENT_SCHEMA, columns)
 
-    def _daily_metrics(
+    def daily_metrics(
         self,
-        connection: duckdb.DuckDBPyConnection,
-        request: AdapterRequest,
+        *,
+        as_of: datetime,
+        symbols: tuple[str, ...] | None,
+        start: date,
+        end: date,
+        order: Literal["asc", "desc"],
+        fetch_limit: int | None,
+        columns: tuple[str, ...] | None = None,
     ) -> pa.Table:
-        params: list[object] = [request.as_of]
-        symbol_sql = _symbol_filter("ts_code", request.symbols, params)
-        range_sql = _range_filter(
-            "trade_date",
-            request.parameters.get("start"),
-            request.parameters.get("end"),
-            params,
+        direction = _sql_direction(order, default="asc")
+        params = _query_parameters(
+            as_of=as_of,
+            symbols=symbols,
+            start=start,
+            end=end,
+            fetch_limit=fetch_limit,
         )
         query = f"""
             SELECT ts_code AS symbol, trade_date, close,
@@ -485,316 +538,585 @@ class TushareAdapter:
                    circ_mv * 10000.0 AS circ_mv
             FROM tushare.daily_basic
             WHERE trade_date IS NOT NULL
-              AND {_day_time("trade_date", "17:05")} <= ?
-              {symbol_sql}
-              {range_sql}
+              AND {_day_time("trade_date", "17:05")} <= $as_of
+              AND ($symbols IS NULL OR ts_code IN (SELECT unnest($symbols)))
+              AND trade_date >= $start
+              AND trade_date < $end
+            ORDER BY trade_date {direction}, symbol
+            LIMIT $fetch_limit
         """
-        return _fetch(connection, query, params, DAILY_METRICS_SCHEMA)
+        return _fetch(self._connection, query, params, DAILY_METRICS_SCHEMA, columns)
 
-    def _moneyflow(
+    def moneyflow(
         self,
-        connection: duckdb.DuckDBPyConnection,
-        request: AdapterRequest,
+        *,
+        as_of: datetime,
+        symbols: tuple[str, ...] | None,
+        start: date,
+        end: date,
+        order: Literal["asc", "desc"],
+        fetch_limit: int | None,
+        columns: tuple[str, ...] | None = None,
     ) -> pa.Table:
-        params: list[object] = [request.as_of]
-        symbol_sql = _symbol_filter("ts_code", request.symbols, params)
-        range_sql = _range_filter(
-            "trade_date",
-            request.parameters.get("start"),
-            request.parameters.get("end"),
-            params,
-        )
-        pairs = (
-            ("buy_sm_vol", "buy_sm_volume", 100.0),
-            ("buy_sm_amount", "buy_sm_amount", 10000.0),
-            ("sell_sm_vol", "sell_sm_volume", 100.0),
-            ("sell_sm_amount", "sell_sm_amount", 10000.0),
-            ("buy_md_vol", "buy_md_volume", 100.0),
-            ("buy_md_amount", "buy_md_amount", 10000.0),
-            ("sell_md_vol", "sell_md_volume", 100.0),
-            ("sell_md_amount", "sell_md_amount", 10000.0),
-            ("buy_lg_vol", "buy_lg_volume", 100.0),
-            ("buy_lg_amount", "buy_lg_amount", 10000.0),
-            ("sell_lg_vol", "sell_lg_volume", 100.0),
-            ("sell_lg_amount", "sell_lg_amount", 10000.0),
-            ("buy_elg_vol", "buy_elg_volume", 100.0),
-            ("buy_elg_amount", "buy_elg_amount", 10000.0),
-            ("sell_elg_vol", "sell_elg_volume", 100.0),
-            ("sell_elg_amount", "sell_elg_amount", 10000.0),
-            ("net_mf_vol", "net_volume", 100.0),
-            ("net_mf_amount", "net_amount", 10000.0),
-        )
-        values = ", ".join(
-            f"CAST({source} * {scale} AS DOUBLE) AS {target}" for source, target, scale in pairs
+        direction = _sql_direction(order, default="asc")
+        params = _query_parameters(
+            as_of=as_of,
+            symbols=symbols,
+            start=start,
+            end=end,
+            fetch_limit=fetch_limit,
         )
         query = f"""
-            SELECT ts_code AS symbol, trade_date, {values}
+            SELECT ts_code AS symbol, trade_date,
+                   CAST(buy_sm_vol * 100.0 AS DOUBLE) AS buy_sm_volume,
+                   CAST(buy_sm_amount * 10000.0 AS DOUBLE) AS buy_sm_amount,
+                   CAST(sell_sm_vol * 100.0 AS DOUBLE) AS sell_sm_volume,
+                   CAST(sell_sm_amount * 10000.0 AS DOUBLE) AS sell_sm_amount,
+                   CAST(buy_md_vol * 100.0 AS DOUBLE) AS buy_md_volume,
+                   CAST(buy_md_amount * 10000.0 AS DOUBLE) AS buy_md_amount,
+                   CAST(sell_md_vol * 100.0 AS DOUBLE) AS sell_md_volume,
+                   CAST(sell_md_amount * 10000.0 AS DOUBLE) AS sell_md_amount,
+                   CAST(buy_lg_vol * 100.0 AS DOUBLE) AS buy_lg_volume,
+                   CAST(buy_lg_amount * 10000.0 AS DOUBLE) AS buy_lg_amount,
+                   CAST(sell_lg_vol * 100.0 AS DOUBLE) AS sell_lg_volume,
+                   CAST(sell_lg_amount * 10000.0 AS DOUBLE) AS sell_lg_amount,
+                   CAST(buy_elg_vol * 100.0 AS DOUBLE) AS buy_elg_volume,
+                   CAST(buy_elg_amount * 10000.0 AS DOUBLE) AS buy_elg_amount,
+                   CAST(sell_elg_vol * 100.0 AS DOUBLE) AS sell_elg_volume,
+                   CAST(sell_elg_amount * 10000.0 AS DOUBLE) AS sell_elg_amount,
+                   CAST(net_mf_vol * 100.0 AS DOUBLE) AS net_volume,
+                   CAST(net_mf_amount * 10000.0 AS DOUBLE) AS net_amount
             FROM tushare.moneyflow
             WHERE trade_date IS NOT NULL
-              AND {_next_session_time("trade_date")} <= ?
-              {symbol_sql}
-              {range_sql}
+              AND {_next_session_time("trade_date")} <= $as_of
+              AND ($symbols IS NULL OR ts_code IN (SELECT unnest($symbols)))
+              AND trade_date >= $start
+              AND trade_date < $end
+            ORDER BY trade_date {direction}, symbol
+            LIMIT $fetch_limit
         """
-        return _fetch(connection, query, params, MONEYFLOW_SCHEMA)
+        return _fetch(self._connection, query, params, MONEYFLOW_SCHEMA, columns)
 
-    def _suspensions(
+    def suspensions(
         self,
-        connection: duckdb.DuckDBPyConnection,
-        request: AdapterRequest,
+        *,
+        as_of: datetime,
+        symbols: tuple[str, ...] | None,
+        fetch_limit: int | None,
+        columns: tuple[str, ...] | None = None,
     ) -> pa.Table:
-        interval_start = (
-            "timezone('Asia/Shanghai', CAST(trade_date AS DATE) + "
-            "CAST(try_strptime(regexp_extract(suspend_timing, "
-            "'([0-2][0-9]:[0-5][0-9])', 1), '%H:%M') AS TIME))"
+        params = _query_parameters(
+            as_of=as_of,
+            trade_date=as_of.date(),
+            symbols=symbols,
+            fetch_limit=fetch_limit,
         )
-        interval_end = (
-            "timezone('Asia/Shanghai', CAST(trade_date AS DATE) + "
-            "CAST(try_strptime(regexp_extract(suspend_timing, "
-            "'[0-2][0-9]:[0-5][0-9][^0-2]*([0-2][0-9]:[0-5][0-9])', 1), "
-            "'%H:%M') AS TIME))"
-        )
-        params: list[object] = [request.as_of, request.as_of.date(), request.as_of, request.as_of]
-        symbol_sql = _symbol_filter("ts_code", request.symbols, params)
         query = f"""
+            WITH suspensions AS (
+                SELECT *,
+                       timezone(
+                           '{_TZ}',
+                           CAST(trade_date AS DATE) + CAST(try_strptime(
+                               regexp_extract(
+                                   suspend_timing,
+                                   '([0-2][0-9]:[0-5][0-9])',
+                                   1
+                               ),
+                               '%H:%M'
+                           ) AS TIME)
+                       ) AS interval_start,
+                       timezone(
+                           '{_TZ}',
+                           CAST(trade_date AS DATE) + CAST(try_strptime(
+                               regexp_extract(
+                                   suspend_timing,
+                                   '[0-2][0-9]:[0-5][0-9][^0-2]*([0-2][0-9]:[0-5][0-9])',
+                                   1
+                               ),
+                               '%H:%M'
+                           ) AS TIME)
+                       ) AS interval_end
+                FROM tushare.suspend_d
+            )
             SELECT ts_code AS symbol,
-                   CASE WHEN suspend_type = 'S'
-                                  AND (suspend_timing IS NULL OR {interval_end} > ?)
-                             THEN TRUE
-                        WHEN suspend_type = 'R' THEN FALSE END AS suspended
-            FROM tushare.suspend_d
-            WHERE trade_date = ?
-              AND ((suspend_timing IS NULL AND {_day_time("trade_date", "09:25")} <= ?)
-                   OR (suspend_timing IS NOT NULL AND {interval_start} <= ?))
-              {symbol_sql}
+                   CASE
+                       WHEN suspend_type = 'S'
+                            AND (suspend_timing IS NULL OR interval_end > $as_of)
+                           THEN TRUE
+                       WHEN suspend_type = 'R' THEN FALSE
+                   END AS suspended
+            FROM suspensions
+            WHERE trade_date = $trade_date
+              AND (
+                  (suspend_timing IS NULL AND {_day_time("trade_date", "09:25")} <= $as_of)
+                  OR (suspend_timing IS NOT NULL AND interval_start <= $as_of)
+              )
+              AND ($symbols IS NULL OR ts_code IN (SELECT unnest($symbols)))
             QUALIFY row_number() OVER (
                 PARTITION BY ts_code ORDER BY suspend_timing DESC NULLS LAST, suspend_type
             ) = 1
+            ORDER BY symbol
+            LIMIT $fetch_limit
         """
-        return _fetch(connection, query, params, SUSPENSION_SCHEMA)
+        return _fetch(self._connection, query, params, SUSPENSION_SCHEMA, columns)
 
-    def _price_limits(
+    def price_limits(
         self,
-        connection: duckdb.DuckDBPyConnection,
-        request: AdapterRequest,
+        *,
+        as_of: datetime,
+        symbols: tuple[str, ...] | None,
+        fetch_limit: int | None,
+        columns: tuple[str, ...] | None = None,
     ) -> pa.Table:
-        params: list[object] = [request.as_of.date(), request.as_of]
-        symbol_sql = _symbol_filter("ts_code", request.symbols, params)
+        params = _query_parameters(
+            as_of=as_of,
+            trade_date=as_of.date(),
+            symbols=symbols,
+            fetch_limit=fetch_limit,
+        )
         query = f"""
             SELECT ts_code AS symbol, up_limit, down_limit
             FROM tushare.stk_limit
-            WHERE trade_date = ? AND {_day_time("trade_date", "09:25")} <= ?
-              {symbol_sql}
+            WHERE trade_date = $trade_date
+              AND {_day_time("trade_date", "09:25")} <= $as_of
+              AND ($symbols IS NULL OR ts_code IN (SELECT unnest($symbols)))
+            ORDER BY symbol
+            LIMIT $fetch_limit
         """
-        return _fetch(connection, query, params, PRICE_LIMIT_SCHEMA)
+        return _fetch(self._connection, query, params, PRICE_LIMIT_SCHEMA, columns)
 
-    def _st_status(
+    def st_status(
         self,
-        connection: duckdb.DuckDBPyConnection,
-        request: AdapterRequest,
+        *,
+        as_of: datetime,
+        symbols: tuple[str, ...] | None,
+        fetch_limit: int | None,
+        columns: tuple[str, ...] | None = None,
     ) -> pa.Table:
-        params: list[object] = [request.as_of.date(), request.as_of]
-        symbol_sql = _symbol_filter("ts_code", request.symbols, params)
+        params = _query_parameters(
+            as_of=as_of,
+            trade_date=as_of.date(),
+            symbols=symbols,
+            fetch_limit=fetch_limit,
+        )
         query = f"""
             SELECT ts_code AS symbol, coalesce(type_name, type) AS st_type
             FROM tushare.stock_st
-            WHERE trade_date = ? AND {_day_time("trade_date", "09:25")} <= ?
-              {symbol_sql}
+            WHERE trade_date = $trade_date
+              AND {_day_time("trade_date", "09:25")} <= $as_of
+              AND ($symbols IS NULL OR ts_code IN (SELECT unnest($symbols)))
             QUALIFY row_number() OVER (PARTITION BY ts_code ORDER BY type NULLS LAST) = 1
+            ORDER BY symbol
+            LIMIT $fetch_limit
         """
-        return _fetch(connection, query, params, ST_STATUS_SCHEMA)
+        return _fetch(self._connection, query, params, ST_STATUS_SCHEMA, columns)
 
-    def _statements(
+    def income_statements(
         self,
-        connection: duckdb.DuckDBPyConnection,
-        request: AdapterRequest,
+        *,
+        as_of: datetime,
+        symbols: tuple[str, ...] | None,
+        report_start: date | None,
+        report_end: date | None,
+        company_type: str | None,
+        periods: int | None,
+        order: Literal["asc", "desc"],
+        fetch_limit: int | None,
+        columns: tuple[str, ...] | None = None,
     ) -> pa.Table:
-        table, schema, source_fields = {
-            DataCapability.INCOME: (
-                "income",
-                INCOME_STATEMENT_SCHEMA,
-                _INCOME_SOURCE_FIELDS,
-            ),
-            DataCapability.BALANCE_SHEET: (
-                "balancesheet",
-                BALANCE_SHEET_SCHEMA,
-                _BALANCE_SHEET_SOURCE_FIELDS,
-            ),
-            DataCapability.CASHFLOW: (
-                "cashflow",
-                CASH_FLOW_STATEMENT_SCHEMA,
-                _CASH_FLOW_SOURCE_FIELDS,
-            ),
-        }[request.dataset]
-        expressions: dict[str, str] = {}
-        if request.dataset == DataCapability.BALANCE_SHEET:
-            expressions = {
+        return self._statements(
+            table="income",
+            schema=INCOME_STATEMENT_SCHEMA,
+            source_fields=_INCOME_SOURCE_FIELDS,
+            expressions={},
+            as_of=as_of,
+            symbols=symbols,
+            report_start=report_start,
+            report_end=report_end,
+            company_type=company_type,
+            periods=periods,
+            order=order,
+            fetch_limit=fetch_limit,
+            columns=columns,
+        )
+
+    def balance_sheets(
+        self,
+        *,
+        as_of: datetime,
+        symbols: tuple[str, ...] | None,
+        report_start: date | None,
+        report_end: date | None,
+        company_type: str | None,
+        periods: int | None,
+        order: Literal["asc", "desc"],
+        fetch_limit: int | None,
+        columns: tuple[str, ...] | None = None,
+    ) -> pa.Table:
+        return self._statements(
+            table="balancesheet",
+            schema=BALANCE_SHEET_SCHEMA,
+            source_fields=_BALANCE_SHEET_SOURCE_FIELDS,
+            expressions={
                 "other_receivables": "coalesce(oth_rcv_total, oth_receiv)",
                 "fixed_assets": "coalesce(fix_assets_total, fix_assets)",
                 "construction_in_progress": "coalesce(cip_total, cip)",
                 "other_payables": "coalesce(oth_pay_total, oth_payable)",
-            }
-        select_fields = _mapped_select(schema, 6, source_fields, expressions)
-        params: list[object] = [request.as_of]
-        symbol_sql = _symbol_filter("ts_code", request.symbols, params)
-        range_sql = _range_filter(
-            "end_date",
-            request.parameters.get("report_start"),
-            request.parameters.get("report_end"),
-            params,
+            },
+            as_of=as_of,
+            symbols=symbols,
+            report_start=report_start,
+            report_end=report_end,
+            company_type=company_type,
+            periods=periods,
+            order=order,
+            fetch_limit=fetch_limit,
+            columns=columns,
         )
-        company_type_sql = ""
-        if request.parameters.get("company_type") is not None:
-            company_type_sql = "AND comp_type = ?"
-            company_type = cast(str, request.parameters["company_type"])
-            params.append(_PLATFORM_TO_TUSHARE_COMPANY_TYPE[company_type])
+
+    def cash_flow_statements(
+        self,
+        *,
+        as_of: datetime,
+        symbols: tuple[str, ...] | None,
+        report_start: date | None,
+        report_end: date | None,
+        company_type: str | None,
+        periods: int | None,
+        order: Literal["asc", "desc"],
+        fetch_limit: int | None,
+        columns: tuple[str, ...] | None = None,
+    ) -> pa.Table:
+        return self._statements(
+            table="cashflow",
+            schema=CASH_FLOW_STATEMENT_SCHEMA,
+            source_fields=_CASH_FLOW_SOURCE_FIELDS,
+            expressions={},
+            as_of=as_of,
+            symbols=symbols,
+            report_start=report_start,
+            report_end=report_end,
+            company_type=company_type,
+            periods=periods,
+            order=order,
+            fetch_limit=fetch_limit,
+            columns=columns,
+        )
+
+    def _statements(
+        self,
+        *,
+        table: str,
+        schema: pa.Schema,
+        source_fields: Mapping[str, str],
+        expressions: Mapping[str, str],
+        as_of: datetime,
+        symbols: tuple[str, ...] | None,
+        report_start: date | None,
+        report_end: date | None,
+        company_type: str | None,
+        periods: int | None,
+        order: Literal["asc", "desc"],
+        fetch_limit: int | None,
+        columns: tuple[str, ...] | None = None,
+    ) -> pa.Table:
+        select_fields = _mapped_select(schema, 6, source_fields, expressions)
+        source_company_type: str | None = None
+        if company_type is not None:
+            source_company_type = _PLATFORM_TO_TUSHARE_COMPANY_TYPE[company_type]
+        direction = _sql_direction(order, default="desc")
+        if periods is not None and symbols is not None:
+            fetch_limit = None
+        params = _query_parameters(
+            as_of=as_of,
+            symbols=symbols,
+            start=report_start,
+            end=report_end,
+            company_type=source_company_type,
+            periods=periods,
+            fetch_limit=fetch_limit,
+        )
         query = f"""
             WITH visible AS (
                 SELECT *
                 FROM tushare.{table}
-                WHERE end_date IS NOT NULL AND f_ann_date IS NOT NULL
+                WHERE end_date IS NOT NULL
+                  AND f_ann_date IS NOT NULL
                   AND report_type = '1'
-                  AND {_next_session_time("f_ann_date")} <= ?
-                  {symbol_sql}
-                  {range_sql}
+                  AND {_next_session_time("f_ann_date")} <= $as_of
+                  AND ($symbols IS NULL OR ts_code IN (SELECT unnest($symbols)))
+                  AND ($start IS NULL OR end_date >= $start)
+                  AND ($end IS NULL OR end_date < $end)
             ), latest AS (
-                SELECT * FROM visible
+                SELECT *
+                FROM visible
                 QUALIFY row_number() OVER (
                     PARTITION BY ts_code, end_date, comp_type
-                    ORDER BY f_ann_date DESC NULLS LAST, ann_date DESC NULLS LAST,
+                    ORDER BY f_ann_date DESC NULLS LAST,
+                             ann_date DESC NULLS LAST,
                              try_cast(update_flag AS INTEGER) DESC NULLS LAST
                 ) = 1
             )
-            SELECT ts_code AS symbol, end_date AS period_end,
+            SELECT ts_code AS symbol,
+                   end_date AS period_end,
                    {_next_session_time("f_ann_date")} AS visible_at,
                    ann_date AS announcement_date,
                    f_ann_date AS actual_announcement_date,
-                   {_COMPANY_TYPE_SQL} AS company_type,
+                   CASE comp_type
+                       WHEN '1' THEN 'industrial'
+                       WHEN '2' THEN 'bank'
+                       WHEN '3' THEN 'insurance'
+                       WHEN '4' THEN 'securities'
+                   END AS company_type,
                    {select_fields}
             FROM latest
-            WHERE TRUE {company_type_sql}
+            WHERE $company_type IS NULL OR comp_type = $company_type
+            QUALIFY $periods IS NULL OR dense_rank() OVER (
+                PARTITION BY ts_code ORDER BY end_date DESC
+            ) <= $periods
+            ORDER BY period_end {direction}, symbol, company_type
+            LIMIT $fetch_limit
         """
-        return _fetch(connection, query, params, schema)
+        return _fetch(self._connection, query, params, schema, columns)
 
-    def _indicators(
+    def financial_indicators(
         self,
-        connection: duckdb.DuckDBPyConnection,
-        request: AdapterRequest,
+        *,
+        as_of: datetime,
+        symbols: tuple[str, ...] | None,
+        report_start: date | None,
+        report_end: date | None,
+        periods: int | None,
+        order: Literal["asc", "desc"],
+        fetch_limit: int | None,
+        columns: tuple[str, ...] | None = None,
     ) -> pa.Table:
         expressions = _scale_expressions(
             _INDICATOR_SOURCE_FIELDS,
             _INDICATOR_PERCENT_FIELDS,
             0.01,
         )
-        params: list[object] = [request.as_of]
-        symbol_sql = _symbol_filter("ts_code", request.symbols, params)
-        range_sql = _range_filter(
-            "end_date",
-            request.parameters.get("report_start"),
-            request.parameters.get("report_end"),
-            params,
+        select_fields = _mapped_select(
+            FINANCIAL_INDICATOR_SCHEMA,
+            4,
+            _INDICATOR_SOURCE_FIELDS,
+            expressions,
+        )
+        direction = _sql_direction(order, default="desc")
+        if periods is not None and symbols is not None:
+            fetch_limit = None
+        params = _query_parameters(
+            as_of=as_of,
+            symbols=symbols,
+            start=report_start,
+            end=report_end,
+            periods=periods,
+            fetch_limit=fetch_limit,
         )
         query = f"""
-            SELECT ts_code AS symbol, end_date AS period_end,
+            WITH latest AS (
+                SELECT *
+                FROM tushare.fina_indicator
+                WHERE end_date IS NOT NULL
+                  AND ann_date IS NOT NULL
+                  AND {_next_session_time("ann_date")} <= $as_of
+                  AND ($symbols IS NULL OR ts_code IN (SELECT unnest($symbols)))
+                  AND ($start IS NULL OR end_date >= $start)
+                  AND ($end IS NULL OR end_date < $end)
+                QUALIFY row_number() OVER (
+                    PARTITION BY ts_code, end_date
+                    ORDER BY ann_date DESC NULLS LAST,
+                             try_cast(update_flag AS INTEGER) DESC NULLS LAST
+                ) = 1
+            )
+            SELECT ts_code AS symbol,
+                   end_date AS period_end,
                    {_next_session_time("ann_date")} AS visible_at,
                    ann_date AS announcement_date,
-                   {
-            _mapped_select(
-                FINANCIAL_INDICATOR_SCHEMA,
-                4,
-                _INDICATOR_SOURCE_FIELDS,
-                expressions,
-            )
-        }
-            FROM tushare.fina_indicator
-            WHERE end_date IS NOT NULL AND ann_date IS NOT NULL
-              AND {_next_session_time("ann_date")} <= ?
-              {symbol_sql}
-              {range_sql}
-            QUALIFY row_number() OVER (
-                PARTITION BY ts_code, end_date
-                ORDER BY ann_date DESC NULLS LAST,
-                         try_cast(update_flag AS INTEGER) DESC NULLS LAST
-            ) = 1
+                   {select_fields}
+            FROM latest
+            QUALIFY $periods IS NULL OR dense_rank() OVER (
+                PARTITION BY ts_code ORDER BY end_date DESC
+            ) <= $periods
+            ORDER BY period_end {direction}, symbol
+            LIMIT $fetch_limit
         """
-        return _fetch(connection, query, params, FINANCIAL_INDICATOR_SCHEMA)
+        return _fetch(
+            self._connection,
+            query,
+            params,
+            FINANCIAL_INDICATOR_SCHEMA,
+            columns,
+        )
+
+    def forecasts(
+        self,
+        *,
+        as_of: datetime,
+        symbols: tuple[str, ...] | None,
+        visible_start: datetime | None,
+        visible_end: datetime,
+        order: Literal["asc", "desc"],
+        fetch_limit: int | None,
+        columns: tuple[str, ...] | None = None,
+    ) -> pa.Table:
+        expressions = _scale_expressions(
+            _FORECAST_SOURCE_FIELDS,
+            ("net_income_change_lower_bound", "net_income_change_upper_bound"),
+            0.01,
+        )
+        expressions.update(
+            _scale_expressions(
+                _FORECAST_SOURCE_FIELDS,
+                (
+                    "net_income_lower_bound",
+                    "net_income_upper_bound",
+                    "prior_period_net_income",
+                ),
+                10_000.0,
+            )
+        )
+        return self._disclosures(
+            table="forecast",
+            schema=FORECAST_SCHEMA,
+            source_fields=_FORECAST_SOURCE_FIELDS,
+            expressions=expressions,
+            has_update_flag=True,
+            as_of=as_of,
+            symbols=symbols,
+            visible_start=visible_start,
+            visible_end=visible_end,
+            order=order,
+            fetch_limit=fetch_limit,
+            columns=columns,
+        )
+
+    def express_reports(
+        self,
+        *,
+        as_of: datetime,
+        symbols: tuple[str, ...] | None,
+        visible_start: datetime | None,
+        visible_end: datetime,
+        order: Literal["asc", "desc"],
+        fetch_limit: int | None,
+        columns: tuple[str, ...] | None = None,
+    ) -> pa.Table:
+        expressions = _scale_expressions(
+            _EXPRESS_SOURCE_FIELDS,
+            _EXPRESS_PERCENT_FIELDS,
+            0.01,
+        )
+        expressions["is_audited"] = "CAST(is_audit AS BOOLEAN)"
+        return self._disclosures(
+            table="express",
+            schema=EXPRESS_SCHEMA,
+            source_fields=_EXPRESS_SOURCE_FIELDS,
+            expressions=expressions,
+            has_update_flag=True,
+            as_of=as_of,
+            symbols=symbols,
+            visible_start=visible_start,
+            visible_end=visible_end,
+            order=order,
+            fetch_limit=fetch_limit,
+            columns=columns,
+        )
+
+    def audit_reports(
+        self,
+        *,
+        as_of: datetime,
+        symbols: tuple[str, ...] | None,
+        visible_start: datetime | None,
+        visible_end: datetime,
+        order: Literal["asc", "desc"],
+        fetch_limit: int | None,
+        columns: tuple[str, ...] | None = None,
+    ) -> pa.Table:
+        return self._disclosures(
+            table="fina_audit",
+            schema=AUDIT_SCHEMA,
+            source_fields=_AUDIT_SOURCE_FIELDS,
+            expressions={},
+            has_update_flag=False,
+            as_of=as_of,
+            symbols=symbols,
+            visible_start=visible_start,
+            visible_end=visible_end,
+            order=order,
+            fetch_limit=fetch_limit,
+            columns=columns,
+        )
 
     def _disclosures(
         self,
-        connection: duckdb.DuckDBPyConnection,
-        request: AdapterRequest,
+        *,
+        table: str,
+        schema: pa.Schema,
+        source_fields: Mapping[str, str],
+        expressions: Mapping[str, str],
+        has_update_flag: bool,
+        as_of: datetime,
+        symbols: tuple[str, ...] | None,
+        visible_start: datetime | None,
+        visible_end: datetime,
+        order: Literal["asc", "desc"],
+        fetch_limit: int | None,
+        columns: tuple[str, ...] | None,
     ) -> pa.Table:
-        table, schema, source_fields = {
-            DataCapability.FORECAST: ("forecast", FORECAST_SCHEMA, _FORECAST_SOURCE_FIELDS),
-            DataCapability.EXPRESS: ("express", EXPRESS_SCHEMA, _EXPRESS_SOURCE_FIELDS),
-            DataCapability.AUDIT: ("fina_audit", AUDIT_SCHEMA, _AUDIT_SOURCE_FIELDS),
-        }[request.dataset]
         visible = _next_session_time("ann_date")
-        params: list[object] = [request.as_of]
-        symbol_sql = _symbol_filter("ts_code", request.symbols, params)
-        visible_sql = _inclusive_range_filter(
-            visible,
-            request.parameters.get("visible_start"),
-            request.parameters.get("visible_end"),
-            params,
-        )
         update_order = (
-            ", try_cast(update_flag AS INTEGER) DESC NULLS LAST"
-            if request.dataset != DataCapability.AUDIT
-            else ""
+            ", try_cast(update_flag AS INTEGER) DESC NULLS LAST" if has_update_flag else ""
         )
-        expressions: dict[str, str] = {}
-        if request.dataset == DataCapability.FORECAST:
-            expressions = _scale_expressions(
-                source_fields,
-                ("net_income_change_lower_bound", "net_income_change_upper_bound"),
-                0.01,
-            )
-            expressions.update(
-                _scale_expressions(
-                    source_fields,
-                    (
-                        "net_income_lower_bound",
-                        "net_income_upper_bound",
-                        "prior_period_net_income",
-                    ),
-                    10_000.0,
-                )
-            )
-        elif request.dataset == DataCapability.EXPRESS:
-            expressions = _scale_expressions(
-                source_fields,
-                _EXPRESS_PERCENT_FIELDS,
-                0.01,
-            )
-            expressions["is_audited"] = "CAST(is_audit AS BOOLEAN)"
+        select_fields = _mapped_select(schema, 4, source_fields, expressions)
+        direction = _sql_direction(order, default="asc")
+        params = _query_parameters(
+            as_of=as_of,
+            symbols=symbols,
+            start=visible_start,
+            end=visible_end,
+            fetch_limit=fetch_limit,
+        )
         query = f"""
             SELECT ts_code AS symbol, {visible} AS visible_at,
                    end_date AS period_end, ann_date AS announcement_date,
-                   {_mapped_select(schema, 4, source_fields, expressions)}
+                   {select_fields}
             FROM tushare.{table}
-            WHERE end_date IS NOT NULL AND ann_date IS NOT NULL AND {visible} <= ?
-              {symbol_sql}
-              {visible_sql}
+            WHERE end_date IS NOT NULL
+              AND ann_date IS NOT NULL
+              AND {visible} <= $as_of
+              AND ($symbols IS NULL OR ts_code IN (SELECT unnest($symbols)))
+              AND ($start IS NULL OR {visible} >= $start)
+              AND {visible} <= $end
             QUALIFY row_number() OVER (
                 PARTITION BY ts_code, end_date
                 ORDER BY ann_date DESC NULLS LAST {update_order}
             ) = 1
+            ORDER BY visible_at {direction}, symbol, period_end, announcement_date
+            LIMIT $fetch_limit
         """
-        return _fetch(connection, query, params, schema)
+        return _fetch(self._connection, query, params, schema, columns)
 
-    def _dividends(
+    def dividends(
         self,
-        connection: duckdb.DuckDBPyConnection,
-        request: AdapterRequest,
+        *,
+        as_of: datetime,
+        symbols: tuple[str, ...] | None,
+        visible_start: datetime | None,
+        visible_end: datetime,
+        order: Literal["asc", "desc"],
+        fetch_limit: int | None,
+        columns: tuple[str, ...] | None = None,
     ) -> pa.Table:
         visible = _next_session_time("imp_ann_date")
-        params: list[object] = [request.as_of]
-        symbol_sql = _symbol_filter("ts_code", request.symbols, params)
-        visible_sql = _inclusive_range_filter(
-            visible,
-            request.parameters.get("visible_start"),
-            request.parameters.get("visible_end"),
-            params,
+        direction = _sql_direction(order, default="asc")
+        params = _query_parameters(
+            as_of=as_of,
+            symbols=symbols,
+            start=visible_start,
+            end=visible_end,
+            fetch_limit=fetch_limit,
         )
         query = f"""
             SELECT ts_code AS symbol, {visible} AS visible_at, end_date, ann_date, div_proc,
@@ -804,79 +1126,135 @@ class TushareAdapter:
                    div_listdate AS listing_date, imp_ann_date AS implementation_ann_date,
                    base_date, base_share * 10000.0 AS base_share
             FROM tushare.dividend
-            WHERE imp_ann_date IS NOT NULL AND {visible} <= ?
-              {symbol_sql}
-              {visible_sql}
+            WHERE imp_ann_date IS NOT NULL
+              AND {visible} <= $as_of
+              AND ($symbols IS NULL OR ts_code IN (SELECT unnest($symbols)))
+              AND ($start IS NULL OR {visible} >= $start)
+              AND {visible} <= $end
+            ORDER BY visible_at {direction}, symbol, ex_date, end_date, ann_date,
+                     div_proc, implementation_ann_date
+            LIMIT $fetch_limit
         """
-        return _fetch(connection, query, params, DIVIDEND_SCHEMA)
+        return _fetch(self._connection, query, params, DIVIDEND_SCHEMA, columns)
 
-    def _adjustment_factors(
+    def adjustment_factors(
         self,
-        connection: duckdb.DuckDBPyConnection,
-        request: AdapterRequest,
+        *,
+        as_of: datetime,
+        symbols: tuple[str, ...] | None,
+        start: date | None,
+        end: date | None,
+        order: Literal["asc", "desc"],
+        fetch_limit: int | None,
+        columns: tuple[str, ...] | None = None,
     ) -> pa.Table:
-        params: list[object] = [request.as_of]
-        symbol_sql = _symbol_filter("ts_code", request.symbols, params)
-        range_sql = _range_filter(
-            "trade_date",
-            request.parameters.get("start"),
-            request.parameters.get("end"),
-            params,
+        direction = _sql_direction(order, default="asc")
+        params = _query_parameters(
+            as_of=as_of,
+            symbols=symbols,
+            start=start,
+            end=end,
+            fetch_limit=fetch_limit,
         )
         query = f"""
             SELECT ts_code AS symbol, trade_date, adj_factor AS factor
             FROM tushare.adj_factor
             WHERE trade_date IS NOT NULL
-              AND {_day_time("trade_date", "09:25")} <= ?
-              {symbol_sql}
-              {range_sql}
+              AND {_day_time("trade_date", "09:25")} <= $as_of
+              AND ($symbols IS NULL OR ts_code IN (SELECT unnest($symbols)))
+              AND ($start IS NULL OR trade_date >= $start)
+              AND ($end IS NULL OR trade_date < $end)
+            ORDER BY trade_date {direction}, symbol
+            LIMIT $fetch_limit
         """
-        return _fetch(connection, query, params, ADJUSTMENT_FACTOR_SCHEMA)
+        return _fetch(self._connection, query, params, ADJUSTMENT_FACTOR_SCHEMA, columns)
 
-    def _industry(
+    def industry(
         self,
-        connection: duckdb.DuckDBPyConnection,
-        request: AdapterRequest,
+        *,
+        as_of: datetime,
+        symbols: tuple[str, ...] | None,
+        level: Literal[1, 2, 3],
+        fetch_limit: int | None,
+        columns: tuple[str, ...] | None = None,
     ) -> pa.Table:
-        level = request.parameters["level"]
-        params: list[object] = [request.as_of, request.as_of.date()]
-        symbol_sql = _symbol_filter("ts_code", request.symbols, params)
+        params = _query_parameters(
+            as_of=as_of,
+            as_of_date=as_of.date(),
+            symbols=symbols,
+            fetch_limit=fetch_limit,
+        )
         query = f"""
             SELECT ts_code AS symbol, CAST({level} AS TINYINT) AS level,
                    l{level}_code AS industry_code, l{level}_name AS industry_name
             FROM tushare.sw_industry
-            WHERE {_day_time("in_date", "09:25")} <= ?
-              AND (out_date IS NULL OR out_date > ?)
-              {symbol_sql}
+            WHERE {_day_time("in_date", "09:25")} <= $as_of
+              AND (out_date IS NULL OR out_date > $as_of_date)
+              AND ($symbols IS NULL OR ts_code IN (SELECT unnest($symbols)))
             QUALIFY row_number() OVER (
                 PARTITION BY ts_code ORDER BY in_date DESC NULLS LAST
             ) = 1
+            ORDER BY symbol
+            LIMIT $fetch_limit
         """
-        return _fetch(connection, query, params, INDUSTRY_SCHEMA)
+        return _fetch(self._connection, query, params, INDUSTRY_SCHEMA, columns)
 
-    def _sessions(
+    def sessions(
         self,
-        connection: duckdb.DuckDBPyConnection,
-        request: AdapterRequest,
+        *,
+        as_of: datetime,
+        start: date,
+        end: date,
+        exchange: str | None,
+        order: Literal["asc", "desc"],
+        fetch_limit: int | None,
+        columns: tuple[str, ...] | None = None,
     ) -> pa.Table:
-        params: list[object] = [request.as_of.date()]
-        range_sql = _range_filter(
-            "cal_date",
-            request.parameters.get("start"),
-            request.parameters.get("end"),
-            params,
+        direction = _sql_direction(order, default="asc")
+        params = _query_parameters(
+            as_of_date=as_of.date(),
+            start=start,
+            end=end,
+            exchange=exchange,
+            fetch_limit=fetch_limit,
         )
-        exchange_sql = ""
-        if request.parameters.get("exchange") is not None:
-            exchange_sql = "AND exchange = ?"
-            params.append(request.parameters["exchange"])
         query = f"""
-            SELECT cal_date, exchange, CAST(is_open AS BOOLEAN) AS is_open,
+            SELECT cal_date,
+                   exchange,
+                   CAST(is_open AS BOOLEAN) AS is_open,
                    pretrade_date AS previous_session
             FROM tushare.trade_cal
-            WHERE cal_date <= ? {range_sql} {exchange_sql}
+            WHERE cal_date <= $as_of_date
+              AND cal_date >= $start
+              AND cal_date < $end
+              AND ($exchange IS NULL OR exchange = $exchange)
+            ORDER BY cal_date {direction}, exchange
+            LIMIT $fetch_limit
         """
-        return _fetch(connection, query, params, SESSION_SCHEMA)
+        return _fetch(self._connection, query, params, SESSION_SCHEMA, columns)
+
+    def previous_session(
+        self,
+        *,
+        end: date,
+        exchange: str,
+    ) -> pa.Table:
+        query = """
+            SELECT cal_date,
+                   exchange
+            FROM tushare.trade_cal
+            WHERE cal_date < $end
+              AND CAST(is_open AS BOOLEAN)
+              AND exchange = $exchange
+            ORDER BY cal_date DESC
+            LIMIT 1
+        """
+        return _fetch(
+            self._connection,
+            query,
+            {"end": end, "exchange": exchange},
+            pa.schema([SESSION_SCHEMA.field("cal_date"), SESSION_SCHEMA.field("exchange")]),
+        )
 
 
 class QmtAdapter:
@@ -887,51 +1265,113 @@ class QmtAdapter:
     def __init__(self, catalog: DataCatalog) -> None:
         self._connection = catalog.connection
 
-    def read(self, request: AdapterRequest) -> pa.Table:
-        if request.dataset == DataCapability.DAILY_BARS:
-            return self._daily_bars(self._connection, request)
-        if request.dataset == DataCapability.INTRADAY_BARS:
-            return self._intraday_bars(self._connection, request)
-        if request.dataset == DataCapability.REALTIME_QUOTES:
-            return self._current(self._connection, request)
-        raise DataCapabilityNotSupportedError(f"QMT 不支持逻辑数据集 {request.dataset!r}")
-
-    def _daily_bars(
+    def daily_bars(
         self,
-        connection: duckdb.DuckDBPyConnection,
-        request: AdapterRequest,
+        *,
+        as_of: datetime,
+        symbols: tuple[str, ...] | None,
+        start: date | datetime | None,
+        end: date | datetime,
+        count: int | None,
+        adjustment: Literal["none", "forward"],
+        order: Literal["asc", "desc"],
+        fetch_limit: int | None,
+        columns: tuple[str, ...] | None = None,
     ) -> pa.Table:
-        if request.parameters["frequency"] != "1d":
-            raise DataCapabilityNotSupportedError("QMT 下载日线只支持 1d")
-        adjustment = request.parameters["adjustment"]
-        qmt_adjustment = "none" if adjustment == "none" else "front_ratio"
-        params: list[object] = [qmt_adjustment, request.as_of]
-        symbol_sql = _symbol_filter("code", request.symbols, params)
-        range_sql = _range_filter(
-            _day_time("trade_date", "09:30"),
-            request.parameters.get("start"),
-            request.parameters.get("end"),
-            params,
-        )
-        query = f"""
-            SELECT code AS symbol,
-                   {_day_time("trade_date", "09:30")} AS interval_start,
-                   {_day_time("trade_date", "15:00")} AS interval_end,
-                   open, high, low, close, preClose AS pre_close,
-                   {_qmt_share_volume("volume")} AS volume, amount
-            FROM qmt.daily
-            WHERE adjustment = ? AND {_day_time("trade_date", "16:05")} <= ?
-              {symbol_sql}
-              {range_sql}
-        """
-        return _fetch(connection, query, params, BAR_SCHEMA)
+        qmt_adjustments = ("none",) if adjustment == "none" else ("front_ratio", "front")
+        direction = _sql_direction(order, default="asc")
+        if count is None:
+            params = _query_parameters(
+                adjustments=qmt_adjustments,
+                as_of=as_of,
+                symbols=symbols,
+                start=start,
+                end=end,
+                fetch_limit=fetch_limit,
+            )
+            query = f"""
+                WITH source_bars AS (
+                    SELECT *
+                    FROM qmt.daily
+                    WHERE adjustment IN (SELECT unnest($adjustments))
+                    QUALIFY row_number() OVER (
+                        PARTITION BY code, trade_date
+                        ORDER BY CASE adjustment
+                            WHEN 'front_ratio' THEN 1
+                            WHEN 'front' THEN 2
+                            ELSE 3
+                        END
+                    ) = 1
+                )
+                SELECT code AS symbol,
+                       {_day_time("trade_date", "09:30")} AS interval_start,
+                       {_day_time("trade_date", "15:00")} AS interval_end,
+                       open, high, low, close, preClose AS pre_close,
+                       {_qmt_share_volume("volume")} AS volume,
+                       amount
+                FROM source_bars
+                WHERE {_day_time("trade_date", "16:05")} <= $as_of
+                  AND ($symbols IS NULL OR code IN (SELECT unnest($symbols)))
+                  AND {_day_time("trade_date", "09:30")} >= $start
+                  AND {_day_time("trade_date", "09:30")} < $end
+                ORDER BY interval_end {direction}, symbol, interval_start {direction}
+                LIMIT $fetch_limit
+            """
+        else:
+            if symbols is not None:
+                fetch_limit = None
+            params = _query_parameters(
+                adjustments=qmt_adjustments,
+                as_of=as_of,
+                symbols=symbols,
+                count=count,
+                fetch_limit=fetch_limit,
+            )
+            query = f"""
+                WITH source_bars AS (
+                    SELECT *
+                    FROM qmt.daily
+                    WHERE adjustment IN (SELECT unnest($adjustments))
+                    QUALIFY row_number() OVER (
+                        PARTITION BY code, trade_date
+                        ORDER BY CASE adjustment
+                            WHEN 'front_ratio' THEN 1
+                            WHEN 'front' THEN 2
+                            ELSE 3
+                        END
+                    ) = 1
+                )
+                SELECT code AS symbol,
+                       {_day_time("trade_date", "09:30")} AS interval_start,
+                       {_day_time("trade_date", "15:00")} AS interval_end,
+                       open, high, low, close, preClose AS pre_close,
+                       {_qmt_share_volume("volume")} AS volume,
+                       amount
+                FROM source_bars
+                WHERE {_day_time("trade_date", "16:05")} <= $as_of
+                  AND ($symbols IS NULL OR code IN (SELECT unnest($symbols)))
+                QUALIFY row_number() OVER (
+                    PARTITION BY code ORDER BY trade_date DESC
+                ) <= $count
+                ORDER BY interval_end {direction}, symbol, interval_start {direction}
+                LIMIT $fetch_limit
+            """
+        return _fetch(self._connection, query, params, BAR_SCHEMA, columns)
 
-    def _intraday_bars(
+    def intraday_bars(
         self,
-        connection: duckdb.DuckDBPyConnection,
-        request: AdapterRequest,
+        *,
+        as_of: datetime,
+        symbols: tuple[str, ...] | None,
+        frequency: str,
+        start: date | datetime | None,
+        end: date | datetime,
+        count: int | None,
+        adjustment: Literal["none", "forward"],
+        order: Literal["asc", "desc"],
+        fetch_limit: int | None,
+        columns: tuple[str, ...] | None = None,
     ) -> pa.Table:
-        frequency = cast(str, request.parameters["frequency"])
         period = {
             "1m": ("1m", 1),
             "5m": ("5m", 5),
@@ -944,103 +1384,179 @@ class QmtAdapter:
         qmt_period, minutes = period
         start_expr = _epoch_time("event_time")
         end_expr = f"{start_expr} + INTERVAL '{minutes} minutes'"
-        adjustment = request.parameters["adjustment"]
         qmt_adjustment = "none" if adjustment == "none" else "front_ratio"
-        if qmt_adjustment == "front_ratio":
-            params: list[object] = [qmt_period, qmt_adjustment, request.as_of]
-            source_sql = """
-                SELECT code, event_time, open, high, low, close, preClose,
-                       CAST(volume * 100.0 AS DOUBLE) AS volume, amount,
-                       CAST(NULL AS BIGINT) AS received_at, CAST(0 AS BIGINT) AS seq
-                FROM qmt.intraday
-                WHERE period = ? AND adjustment = ?
-            """
-        else:
-            params = [qmt_period, qmt_adjustment, qmt_period, request.as_of, request.as_of]
-            source_sql = f"""
-                SELECT code, event_time, open, high, low, close, preClose,
-                       CAST(volume * 100.0 AS DOUBLE) AS volume, amount,
-                       CAST(NULL AS BIGINT) AS received_at, CAST(0 AS BIGINT) AS seq
-                FROM qmt.intraday
-                WHERE period = ? AND adjustment = ?
-                UNION ALL
-                SELECT code, event_time,
-                       quote.open, quote.high, quote.low, quote.close, quote.preClose,
-                       {_qmt_share_volume("quote.volume")} AS volume, quote.amount,
-                       received_at, seq
-                FROM qmt.bars
-                WHERE period = ? AND event_time IS NOT NULL
-                  AND {_epoch_time("received_at")} <= ?
-            """
-        symbol_sql = _symbol_filter("code", request.symbols, params)
-        range_sql = _range_filter(
-            start_expr,
-            request.parameters.get("start"),
-            request.parameters.get("end"),
-            params,
+        direction = _sql_direction(order, default="asc")
+        if count is not None and symbols is not None:
+            fetch_limit = None
+        as_of_us = _epoch_us(as_of)
+        assert as_of_us is not None
+        params = _query_parameters(
+            period=qmt_period,
+            adjustment=qmt_adjustment,
+            include_live=qmt_adjustment == "none",
+            as_of=as_of,
+            as_of_us=as_of_us,
+            latest_start_us=as_of_us - minutes * 60 * 1_000_000,
+            symbols=symbols,
+            start=start,
+            end=end,
+            start_us=_epoch_us(start),
+            end_us=_epoch_us(end),
+            count=count,
+            fetch_limit=fetch_limit,
         )
         query = f"""
-            WITH candidates AS ({source_sql})
-            SELECT code AS symbol, {start_expr} AS interval_start, {end_expr} AS interval_end,
-                   open, high, low, close, preClose AS pre_close, volume, amount
-            FROM candidates
-            WHERE {end_expr} <= ?
-              {symbol_sql}
-              {range_sql}
-            QUALIFY row_number() OVER (
-                PARTITION BY code, event_time
-                ORDER BY received_at DESC NULLS LAST, seq DESC
-            ) = 1
-        """
-        return _fetch(connection, query, params, BAR_SCHEMA)
+            WITH candidates AS (
+                SELECT code,
+                       event_time,
+                       open, high, low, close, preClose,
+                       CAST(volume * 100.0 AS DOUBLE) AS volume,
+                       amount,
+                       CAST(NULL AS BIGINT) AS received_at,
+                       CAST(0 AS BIGINT) AS seq
+                FROM qmt.intraday
+                WHERE period = $period
+                  AND adjustment = $adjustment
+                  AND event_time <= $latest_start_us
+                  AND ($start_us IS NULL OR event_time >= $start_us)
+                  AND ($end_us IS NULL OR event_time < $end_us)
 
-    def _current(
+                UNION ALL
+
+                SELECT code,
+                       event_time,
+                       quote.open, quote.high, quote.low, quote.close, quote.preClose,
+                       {_qmt_share_volume("quote.volume")} AS volume,
+                       quote.amount,
+                       received_at,
+                       seq
+                FROM qmt.bars
+                WHERE $include_live
+                  AND period = $period
+                  AND event_time IS NOT NULL
+                  AND received_at <= $as_of_us
+                  AND event_time <= $latest_start_us
+                  AND ($start_us IS NULL OR event_time >= $start_us)
+                  AND ($end_us IS NULL OR event_time < $end_us)
+            ), latest AS (
+                SELECT *
+                FROM candidates
+                QUALIFY row_number() OVER (
+                    PARTITION BY code, event_time
+                    ORDER BY received_at DESC NULLS LAST, seq DESC
+                ) = 1
+            ), platform_bars AS (
+                SELECT code AS symbol,
+                       {start_expr} AS interval_start,
+                       {end_expr} AS interval_end,
+                       open, high, low, close,
+                       preClose AS pre_close,
+                       volume,
+                       amount,
+                       event_time
+                FROM latest
+            )
+            SELECT symbol,
+                   interval_start,
+                   interval_end,
+                   open, high, low, close, pre_close, volume, amount
+            FROM platform_bars
+            WHERE interval_end <= $as_of
+              AND ($symbols IS NULL OR symbol IN (SELECT unnest($symbols)))
+              AND ($start IS NULL OR interval_start >= $start)
+              AND ($end IS NULL OR interval_start < $end)
+            QUALIFY $count IS NULL OR row_number() OVER (
+                PARTITION BY symbol ORDER BY event_time DESC
+            ) <= $count
+            ORDER BY interval_end {direction}, symbol, interval_start {direction}
+            LIMIT $fetch_limit
+        """
+        return _fetch(self._connection, query, params, BAR_SCHEMA, columns)
+
+    def current(
         self,
-        connection: duckdb.DuckDBPyConnection,
-        request: AdapterRequest,
+        *,
+        as_of: datetime,
+        symbols: tuple[str, ...] | None,
+        fetch_limit: int | None,
+        columns: tuple[str, ...] | None = None,
     ) -> pa.Table:
-        params: list[object] = [request.as_of]
-        tick_symbols = _symbol_filter("code", request.symbols, params)
-        params.append(request.as_of)
-        bar_symbols = _symbol_filter("code", request.symbols, params)
+        as_of_us = _epoch_us(as_of)
+        assert as_of_us is not None
+        params = _query_parameters(
+            as_of_us=as_of_us,
+            symbols=symbols,
+            fetch_limit=fetch_limit,
+        )
         query = f"""
             WITH candidates AS (
-                SELECT code AS symbol, event_time, received_at, seq,
-                       quote.open AS open, quote.high AS high, quote.low AS low,
-                       quote.lastPrice AS last, quote.lastClose AS pre_close,
+                SELECT code AS symbol,
+                       event_time,
+                       received_at,
+                       seq,
+                       quote.open AS open,
+                       quote.high AS high,
+                       quote.low AS low,
+                       quote.lastPrice AS last,
+                       quote.lastClose AS pre_close,
                        {_qmt_share_volume("quote.volume", "quote.pvolume")} AS volume,
                        quote.amount AS amount
                 FROM qmt.ticks
-                WHERE {_epoch_time("received_at")} <= ? {tick_symbols}
+                WHERE received_at <= $as_of_us
+                  AND ($symbols IS NULL OR code IN (SELECT unnest($symbols)))
+
                 UNION ALL
-                SELECT code AS symbol, event_time, received_at, seq,
-                       quote.open AS open, quote.high AS high, quote.low AS low,
-                       quote.close AS last, quote.preClose AS pre_close,
-                       {_qmt_share_volume("quote.volume")} AS volume, quote.amount AS amount
+
+                SELECT code AS symbol,
+                       event_time,
+                       received_at,
+                       seq,
+                       quote.open AS open,
+                       quote.high AS high,
+                       quote.low AS low,
+                       quote.close AS last,
+                       quote.preClose AS pre_close,
+                       {_qmt_share_volume("quote.volume")} AS volume,
+                       quote.amount AS amount
                 FROM qmt.bars
-                WHERE {_epoch_time("received_at")} <= ? {bar_symbols}
+                WHERE received_at <= $as_of_us
+                  AND ($symbols IS NULL OR code IN (SELECT unnest($symbols)))
             )
-            SELECT symbol, {_epoch_time("event_time")} AS event_time,
+            SELECT symbol,
+                   {_epoch_time("event_time")} AS event_time,
                    open, high, low, last, pre_close, volume, amount
             FROM candidates
             QUALIFY row_number() OVER (
                 PARTITION BY symbol ORDER BY received_at DESC, seq DESC
             ) = 1
+            ORDER BY symbol
+            LIMIT $fetch_limit
         """
-        return _fetch(connection, query, params, CURRENT_SCHEMA)
+        return _fetch(self._connection, query, params, CURRENT_SCHEMA, columns)
 
 
 def _fetch(
     connection: duckdb.DuckDBPyConnection,
     query: str,
-    params: list[object],
+    params: Mapping[str, object],
     schema: pa.Schema | None = None,
+    columns: tuple[str, ...] | None = None,
 ) -> pa.Table:
+    output_schema = schema
+    if columns is not None:
+        if schema is None:
+            raise ValueError("字段投影需要平台 Schema")
+        unknown = set(columns) - set(schema.names)
+        if unknown:
+            raise ValueError(f"投影包含未知平台字段: {unknown}")
+        selected = ", ".join(_quote(name) for name in columns)
+        query = f"SELECT {selected} FROM ({query}) AS platform_result"
+        output_schema = pa.schema(schema.field(name) for name in columns)
     try:
         table = connection.execute(query, params).to_arrow_table()
     except duckdb.Error as exc:
         raise DataSourceUnavailableError("读取已发布数据失败") from exc
-    return _coerce_schema(table, schema) if schema is not None else table
+    return _coerce_schema(table, output_schema) if output_schema is not None else table
 
 
 def _coerce_schema(table: pa.Table, schema: pa.Schema) -> pa.Table:
@@ -1050,70 +1566,15 @@ def _coerce_schema(table: pa.Table, schema: pa.Schema) -> pa.Table:
     return pa.Table.from_arrays(arrays, schema=schema)
 
 
-def _forward_adjust(bars: pa.Table, factors: pa.Table) -> pa.Table:
-    """按 Tushare 每日复权因子计算平台前复权价格。"""
-    if bars.num_rows == 0:
-        return bars
-    connection = duckdb.connect(":memory:")
-    try:
-        connection.execute("SET TimeZone = 'Asia/Shanghai'")
-        connection.register("bars", bars)
-        connection.register("factors", factors)
-        missing = connection.execute(
-            """
-            WITH anchors AS (
-                SELECT symbol, factor AS anchor
-                FROM factors
-                QUALIFY row_number() OVER (
-                    PARTITION BY symbol ORDER BY trade_date DESC NULLS LAST
-                ) = 1
-            )
-            SELECT count(*)
-            FROM bars b
-            LEFT JOIN factors f
-              ON f.symbol = b.symbol
-             AND f.trade_date = CAST(b.interval_start AS DATE)
-            LEFT JOIN anchors a ON a.symbol = b.symbol
-            WHERE f.factor IS NULL OR a.anchor IS NULL OR a.anchor = 0
-            """
-        ).fetchone()
-        if missing is None or missing[0]:
-            raise DataCapabilityNotSupportedError("Tushare 不能为全部行情提供 PIT 前复权因子")
-        adjusted = connection.execute(
-            """
-            WITH anchors AS (
-                SELECT symbol, factor AS anchor
-                FROM factors
-                QUALIFY row_number() OVER (
-                    PARTITION BY symbol ORDER BY trade_date DESC NULLS LAST
-                ) = 1
-            )
-            SELECT b.symbol, b.interval_start, b.interval_end,
-                   b.open * f.factor / a.anchor AS open,
-                   b.high * f.factor / a.anchor AS high,
-                   b.low * f.factor / a.anchor AS low,
-                   b.close * f.factor / a.anchor AS close,
-                   b.pre_close * f.factor / a.anchor AS pre_close,
-                   b.volume, b.amount
-            FROM bars b
-            JOIN factors f
-              ON f.symbol = b.symbol
-             AND f.trade_date = CAST(b.interval_start AS DATE)
-            JOIN anchors a ON a.symbol = b.symbol
-            """
-        ).to_arrow_table()
-    except duckdb.Error as exc:
-        raise DataAdapterError("Tushare 前复权计算失败") from exc
-    finally:
-        connection.close()
-    return _coerce_schema(adjusted, BAR_SCHEMA)
+def _project_table(table: pa.Table, columns: tuple[str, ...] | None) -> pa.Table:
+    return table if columns is None else table.select(columns)
 
 
 def _mapped_select(
     schema: pa.Schema,
     identity_count: int,
-    source_fields: dict[str, str],
-    expressions: dict[str, str] | None = None,
+    source_fields: Mapping[str, str],
+    expressions: Mapping[str, str] | None = None,
 ) -> str:
     """按平台 Schema 顺序生成供应商字段映射。"""
     targets = schema.names[identity_count:]
@@ -1164,44 +1625,29 @@ def _next_session_time(column: str) -> str:
     return f"timezone('{_TZ}', CAST({next_date} AS DATE) + TIME '09:25')"
 
 
-def _symbol_filter(
-    column: str,
-    symbols: tuple[str, ...] | None,
-    params: list[object],
-) -> str:
-    if symbols is None:
-        return ""
-    params.append(list(symbols))
-    return f"AND {column} IN (SELECT unnest(?))"
+def _query_parameters(**values: object | None) -> dict[str, object]:
+    """构造 DuckDB 具名参数；保留 None，让可选条件可以直接写在 SQL 里。"""
+    return {
+        name: list(value) if isinstance(value, tuple) else value for name, value in values.items()
+    }
 
 
-def _range_filter(
-    expression: str,
-    start: object,
-    end: object,
-    params: list[object],
-) -> str:
-    clauses: list[str] = []
-    if start is not None:
-        clauses.append(f"{expression} >= ?")
-        params.append(start)
-    if end is not None:
-        clauses.append(f"{expression} < ?")
-        params.append(end)
-    return "" if not clauses else "AND " + " AND ".join(clauses)
+def _epoch_us(value: object) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        instant = value
+    elif isinstance(value, date):
+        instant = datetime(value.year, value.month, value.day, tzinfo=ZoneInfo(_TZ))
+    else:
+        raise TypeError(f"无法转换为微秒时间戳: {value!r}")
+    return int(instant.timestamp() * 1_000_000)
 
 
-def _inclusive_range_filter(
-    expression: str,
-    start: object,
-    end: object,
-    params: list[object],
-) -> str:
-    clauses: list[str] = []
-    if start is not None:
-        clauses.append(f"{expression} >= ?")
-        params.append(start)
-    if end is not None:
-        clauses.append(f"{expression} <= ?")
-        params.append(end)
-    return "" if not clauses else "AND " + " AND ".join(clauses)
+def _sql_direction(value: object, *, default: str) -> str:
+    order = default if value is None else value
+    if order == "asc":
+        return "ASC"
+    if order == "desc":
+        return "DESC"
+    raise ValueError(f"无效 SQL 排序方向: {order!r}")

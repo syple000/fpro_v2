@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 from datetime import date, datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -8,13 +9,16 @@ import pyarrow as pa
 import pytest
 
 from data import (
+    ALL_SYMBOLS,
     DataCapability,
+    DataCapabilityNotSupportedError,
     DataCatalog,
     DataReader,
     DataSourceNotConfiguredError,
     DataView,
     SourceConfig,
 )
+from data.adapters import QmtAdapter, TushareAdapter
 from models import CAPABILITY_SCHEMAS, CASH_FLOW_STATEMENT_SCHEMA
 from qmt_protocol import BarQuote, HistoryBar, SequencedQuote, TickQuote
 from qmt_receiver import QmtDataStore
@@ -38,6 +42,41 @@ def _us(value: datetime) -> int:
 def test_every_capability_has_a_platform_schema() -> None:
     assert set(CAPABILITY_SCHEMAS) == set(DataCapability)
     assert all(isinstance(schema, pa.Schema) for schema in CAPABILITY_SCHEMAS.values())
+
+
+def test_adapters_expose_explicit_capability_parameters() -> None:
+    assert not hasattr(TushareAdapter, "read")
+    assert not hasattr(QmtAdapter, "read")
+    assert tuple(inspect.signature(TushareAdapter.daily_bars).parameters) == (
+        "self",
+        "as_of",
+        "symbols",
+        "start",
+        "end",
+        "count",
+        "adjustment",
+        "order",
+        "fetch_limit",
+        "columns",
+    )
+    assert tuple(inspect.signature(TushareAdapter.previous_session).parameters) == (
+        "self",
+        "end",
+        "exchange",
+    )
+    assert tuple(inspect.signature(QmtAdapter.intraday_bars).parameters) == (
+        "self",
+        "as_of",
+        "symbols",
+        "frequency",
+        "start",
+        "end",
+        "count",
+        "adjustment",
+        "order",
+        "fetch_limit",
+        "columns",
+    )
 
 
 def test_daily_bars_obey_pit_projection_and_limit(tmp_path: Path) -> None:
@@ -97,6 +136,140 @@ def test_daily_bars_obey_pit_projection_and_limit(tmp_path: Path) -> None:
     assert after.truncated is True
     assert before.table.to_pylist()[0]["volume"] == 10_000.0
     assert before.table.to_pylist()[0]["amount"] == 200_000.0
+
+
+def test_daily_bar_count_and_range_return_exact_rows(tmp_path: Path) -> None:
+    tushare_root = tmp_path / "tushare"
+    days = tuple(date(2024, 1, day) for day in range(2, 8))
+    with TushareDataStore(tushare_root) as store:
+        for day in days:
+            store.write(
+                "daily",
+                _table(
+                    "daily",
+                    {
+                        "ts_code": "000001.SZ",
+                        "trade_date": day,
+                        "close": float(day.day),
+                    },
+                ),
+            )
+        store.write(
+            "daily",
+            _table(
+                "daily",
+                {
+                    "ts_code": "000002.SZ",
+                    "trade_date": days[0],
+                    "close": 20.0,
+                },
+            ),
+        )
+
+    with DataCatalog(tushare_root=tushare_root, qmt_root=tmp_path / "qmt") as catalog:
+        reader = DataReader(
+            catalog,
+            sources=SourceConfig(routes={"market.daily_bars": "tushare"}),
+        )
+        latest = reader.at(_as_of(7, 17)).market.bars(
+            symbols=("000001.SZ",),
+            frequency="1d",
+            count=2,
+            fields=("close",),
+        )
+        ranged = reader.at(_as_of(7, 17)).market.bars(
+            symbols=("000001.SZ",),
+            frequency="1d",
+            start=date(2024, 1, 3),
+            end=date(2024, 1, 5),
+            fields=("close",),
+        )
+        sparse = reader.at(_as_of(7, 17)).market.bars(
+            symbols=("000001.SZ", "000002.SZ"),
+            frequency="1d",
+            count=1,
+            fields=("close",),
+        )
+
+    assert [row["close"] for row in latest.table.to_pylist()] == [6.0, 7.0]
+    assert [row["close"] for row in ranged.table.to_pylist()] == [3.0, 4.0]
+    assert [row["symbol"] for row in sparse.table.to_pylist()] == [
+        "000002.SZ",
+        "000001.SZ",
+    ]
+
+
+def test_previous_session_returns_latest_open_day(tmp_path: Path) -> None:
+    tushare_root = tmp_path / "tushare"
+    days = tuple(date(2024, 1, day) for day in range(1, 11))
+    with TushareDataStore(tushare_root) as store:
+        store.write(
+            "trade_cal",
+            _table(
+                "trade_cal",
+                *(
+                    {
+                        "exchange": "SSE",
+                        "cal_date": day,
+                        "is_open": int(day == date(2024, 1, 9)),
+                    }
+                    for day in days
+                ),
+            ),
+        )
+
+    with DataCatalog(tushare_root=tushare_root, qmt_root=tmp_path / "qmt") as catalog:
+        reader = DataReader(
+            catalog,
+            sources=SourceConfig(routes={"calendar.sessions": "tushare"}),
+        )
+        previous = reader.at(_as_of(11, 9)).calendar.previous_session(exchange="SSE")
+
+    assert previous == date(2024, 1, 9)
+
+
+def test_market_status_pushes_projection_and_limit(tmp_path: Path) -> None:
+    tushare_root = tmp_path / "tushare"
+    with TushareDataStore(tushare_root) as store:
+        store.write(
+            "stk_limit",
+            _table(
+                "stk_limit",
+                {
+                    "ts_code": "000001.SZ",
+                    "trade_date": date(2024, 1, 2),
+                    "up_limit": 11.0,
+                },
+                {
+                    "ts_code": "000002.SZ",
+                    "trade_date": date(2024, 1, 2),
+                    "up_limit": 12.0,
+                },
+                {
+                    "ts_code": "000003.SZ",
+                    "trade_date": date(2024, 1, 2),
+                    "up_limit": 13.0,
+                },
+            ),
+        )
+
+    with DataCatalog(tushare_root=tushare_root, qmt_root=tmp_path / "qmt") as catalog:
+        result = (
+            DataReader(
+                catalog,
+                sources=SourceConfig(routes={"market.price_limits": "tushare"}),
+            )
+            .at(_as_of(2, 10))
+            .market.status(
+                symbols=ALL_SYMBOLS,
+                fields=("up_limit",),
+                limit=1,
+            )
+        )
+
+    assert result.table.schema.names == ["symbol", "up_limit"]
+    assert result.table.to_pylist() == [{"symbol": "000001.SZ", "up_limit": 11.0}]
+    assert result.truncated is True
 
 
 def test_daily_metrics_normalize_percentages_shares_and_currency(tmp_path: Path) -> None:
@@ -386,6 +559,40 @@ def test_tushare_adapter_calculates_forward_adjustment_internally(tmp_path: Path
     assert result.sources == ("tushare",)
 
 
+def test_tushare_forward_adjustment_rejects_missing_factor_after_projection(
+    tmp_path: Path,
+) -> None:
+    tushare_root = tmp_path / "tushare"
+    with TushareDataStore(tushare_root) as store:
+        store.write(
+            "daily",
+            _table(
+                "daily",
+                {
+                    "ts_code": "000001.SZ",
+                    "trade_date": date(2024, 1, 2),
+                    "close": 11.0,
+                    "vol": 100.0,
+                },
+            ),
+        )
+
+    config = SourceConfig(routes={"market.daily_bars": "tushare"})
+    with DataCatalog(tushare_root=tushare_root, qmt_root=tmp_path / "qmt") as catalog:
+        reader = DataReader(catalog, sources=config)
+        with pytest.raises(
+            DataCapabilityNotSupportedError,
+            match="不能为全部行情提供 PIT 前复权因子",
+        ):
+            reader.at(_as_of(2, 17)).market.bars(
+                symbols=("000001.SZ",),
+                frequency="1d",
+                count=1,
+                adjustment="forward",
+                fields=("volume",),
+            )
+
+
 def test_qmt_adapter_reads_native_front_ratio_intraday_bars(tmp_path: Path) -> None:
     qmt_root = tmp_path / "qmt"
     raw = HistoryBar(
@@ -435,6 +642,83 @@ def test_qmt_adapter_reads_native_front_ratio_intraday_bars(tmp_path: Path) -> N
     assert row["volume"] == 10_000.0
     assert row["amount"] == 1_000.0
     assert result.sources == ("qmt",)
+
+
+def test_qmt_daily_forward_accepts_legacy_front_and_prefers_front_ratio(
+    tmp_path: Path,
+) -> None:
+    qmt_root = tmp_path / "qmt"
+    with QmtDataStore(qmt_root) as store:
+        store.write_daily(
+            {"000001.SZ": [HistoryBar(index=20240102, close=10.0)]},
+            "none",
+        )
+        store.write_daily(
+            {
+                "000001.SZ": [
+                    HistoryBar(index=20240102, close=8.0),
+                    HistoryBar(index=20240103, close=9.0),
+                ]
+            },
+            "front",
+        )
+        store.write_daily(
+            {"000001.SZ": [HistoryBar(index=20240103, close=7.0)]},
+            "front_ratio",
+        )
+
+    with DataCatalog(tushare_root=tmp_path / "tushare", qmt_root=qmt_root) as catalog:
+        result = (
+            DataReader(
+                catalog,
+                sources=SourceConfig(routes={"market.daily_bars": "qmt"}),
+            )
+            .at(_as_of(3, 17))
+            .market.bars(
+                symbols=("000001.SZ",),
+                frequency="1d",
+                count=2,
+                adjustment="forward",
+                fields=("close",),
+            )
+        )
+
+    assert [row["close"] for row in result.table.to_pylist()] == [8.0, 7.0]
+
+
+def test_qmt_intraday_count_returns_latest_bars(tmp_path: Path) -> None:
+    qmt_root = tmp_path / "qmt"
+    with QmtDataStore(qmt_root) as store:
+        store.write_intraday(
+            {
+                "000001.SZ": [
+                    HistoryBar(index=20240102093000, close=1.0),
+                    HistoryBar(index=20240102093100, close=2.0),
+                    HistoryBar(index=20240103093000, close=3.0),
+                    HistoryBar(index=20240103093100, close=4.0),
+                    HistoryBar(index=20240103093200, close=5.0),
+                ]
+            },
+            "1m",
+            "none",
+        )
+
+    with DataCatalog(tushare_root=tmp_path / "tushare", qmt_root=qmt_root) as catalog:
+        result = (
+            DataReader(
+                catalog,
+                sources=SourceConfig(routes={"market.intraday_bars": "qmt"}),
+            )
+            .at(_as_of(3, 10))
+            .market.bars(
+                symbols=("000001.SZ",),
+                frequency="1m",
+                count=2,
+                fields=("close",),
+            )
+        )
+
+    assert [row["close"] for row in result.table.to_pylist()] == [4.0, 5.0]
 
 
 def test_statement_without_actual_announcement_date_stays_invisible(tmp_path: Path) -> None:
@@ -537,6 +821,50 @@ def test_financial_units_are_normalized_at_adapter_boundary(tmp_path: Path) -> N
     assert forecast.table.to_pylist()[0]["net_income_lower_bound"] == 20_000.0
 
 
+def test_statement_periods_returns_latest_report_periods(tmp_path: Path) -> None:
+    tushare_root = tmp_path / "tushare"
+    periods = (
+        (date(2022, 12, 31), date(2023, 1, 2), 2.0),
+        (date(2023, 12, 31), date(2024, 1, 2), 3.0),
+        (date(2024, 12, 31), date(2025, 1, 2), 4.0),
+    )
+    with TushareDataStore(tushare_root) as store:
+        for period_end, announcement_date, value in periods:
+            store.write(
+                "cashflow",
+                _table(
+                    "cashflow",
+                    {
+                        "ts_code": "000001.SZ",
+                        "ann_date": announcement_date,
+                        "f_ann_date": announcement_date,
+                        "end_date": period_end,
+                        "report_type": "1",
+                        "comp_type": "1",
+                        "update_flag": "1",
+                        "free_cashflow": value,
+                    },
+                ),
+            )
+
+    with DataCatalog(tushare_root=tushare_root, qmt_root=tmp_path / "qmt") as catalog:
+        result = (
+            DataReader(
+                catalog,
+                sources=SourceConfig(routes={"fundamentals.cashflow": "tushare"}),
+            )
+            .at(datetime(2025, 1, 3, 10, tzinfo=SHANGHAI))
+            .fundamentals.statements(
+                kind="cash_flow",
+                symbols=("000001.SZ",),
+                periods=2,
+                fields=("free_cash_flow",),
+            )
+        )
+
+    assert [row["free_cash_flow"] for row in result.table.to_pylist()] == [4.0, 3.0]
+
+
 def test_dividend_uses_reader_visibility_policy(tmp_path: Path) -> None:
     tushare_root = tmp_path / "tushare"
     common = {
@@ -620,9 +948,9 @@ def test_industry_reader_does_not_expose_future_membership_state(tmp_path: Path)
 
 def test_pit_view_time_is_aware_normalized_and_read_only(tmp_path: Path) -> None:
     with DataCatalog(
-            tushare_root=tmp_path / "tushare",
-            qmt_root=tmp_path / "qmt",
-        ) as catalog:
+        tushare_root=tmp_path / "tushare",
+        qmt_root=tmp_path / "qmt",
+    ) as catalog:
         reader = DataReader(catalog, sources=SourceConfig(routes={}))
         with pytest.raises(ValueError, match="时区"):
             reader.at(datetime(2024, 1, 1))

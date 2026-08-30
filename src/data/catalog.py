@@ -27,6 +27,7 @@ class DataCatalog:
             "qmt": (Path(qmt_root).expanduser().resolve(), QMT_TABLE_SCHEMAS),
         }
         self._connection = duckdb.connect(":memory:")
+        self._connection.execute("SET parquet_metadata_cache = true")
         self.refresh()
 
     @property

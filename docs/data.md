@@ -157,7 +157,12 @@ Tushare 适配器在内部组合不复权日线与 `as_of` 当时可见的 `adj_
 adjusted_price(t) = raw_price(t) * factor(t) / anchor_factor(as_of)
 ```
 
-QMT 适配器直接选择同步时由 QMT 返回的 `front_ratio` 日线或分钟线，不自行重复计算。
+日线、当日因子和锚点因子在同一条 DuckDB 查询中完成关联，不生成中间 Arrow 表；任何行情缺少
+当日因子、锚点因子或锚点为零时，整次查询明确失败。
+
+QMT 适配器直接选择同步时由 QMT 返回的 `front_ratio` 日线或分钟线，不自行重复计算。为兼容
+已有 QMT 日线数据，日线也识别旧的 `front` 标记；两者同时存在时明确优先
+`front_ratio`，不会返回重复交易日。分钟存储只接受 `front_ratio`。
 Reader 只把 `adjustment` 语义传给当前行情适配器，不读取因子、不拼接数据源，也不要求配置
 `corporate_actions.adjustment_factors` 路由。
 适配器必须把结果归一到平台 bar Schema：只调整 OHLC 和前收盘价，
@@ -370,7 +375,7 @@ with DataCatalog(
 | 公共接口 | 内置实现 |
 | --- | --- |
 | `market.bars(frequency="1d", adjustment="none")` | Tushare `daily`；或 QMT `daily(adjustment="none")` |
-| `market.bars(frequency="1d", adjustment="forward")` | Tushare `daily + adj_factor` 现场计算；或直接使用 QMT `daily(adjustment="front_ratio")` |
+| `market.bars(frequency="1d", adjustment="forward")` | Tushare `daily + adj_factor` 现场计算；或使用 QMT `daily(adjustment="front_ratio")`，兼容旧 `front` 数据 |
 | `market.bars()` 不复权分钟周期 | QMT 同步的 `intraday(adjustment="none")` 与已经实时接收的原始 `bars`；`tushare_data` 尚无分钟表 |
 | `market.bars()` 前复权分钟周期 | 直接使用 QMT 同步的 `intraday(adjustment="front_ratio")` |
 | `market.current()` | QMT tick/bar；无实时源时仅提供 Tushare 日线的开盘事件 |
@@ -450,6 +455,17 @@ bars = data.market.bars(
 - `adjustment` 描述平台输出语义，不指定底层算法；所选适配器必须声明支持该语义；
 - `count=N` 时先对每个 symbol 选出最新 N 根，再按请求的输出顺序排序；
 - `limit` 可以与 `count` 同时使用，但它会截断合并结果，可能使某些股票不足 N 根。
+
+查询条件会直接交给 DuckDB：
+
+- 范围模式在 SQL 中直接应用 symbol、业务时间和 PIT 条件，由 DuckDB 对 Parquet 执行字段与过滤下推；
+- `count=N` 在 SQL 中按 symbol 执行窗口截断，不再把全部结果返回 Arrow 后由 Reader 计数；
+- `fields` 会下推为 DuckDB/Parquet 字段投影，`limit` 在不影响每 symbol 计数语义时下推为
+  `limit + 1`，额外一行用于设置 `truncated`；
+- 日指标、资金流、实时状态、财报 `periods`、复权因子和交易日历使用相同的 SQL 下推原则。
+
+Catalog 只根据 Manifest 注册当前有效的 Parquet 文件，不参与查询范围规划。`count` 和
+`periods` 查询为了保证精确语义，可能需要扫描历史候选行，但窗口计算会在 DuckDB 内完成。
 
 默认排序为：
 
@@ -737,15 +753,36 @@ def on_event(context, data):
 
 ## 内部查询模型
 
-公共领域方法转换为简单的内部 `AdapterRequest`，策略不能直接构造 SQL：
+Reader 不把不同查询强行压进统一的 `AdapterRequest` 或无类型的 `parameters` 字典。
+它在完成公共参数校验后，直接调用来源适配器的具名能力方法：
 
 ```text
-AdapterRequest
-    dataset
-    as_of
-    symbols
-    parameters
+market.bars(frequency="1d")
+-> TushareAdapter.daily_bars(
+       as_of=...,
+       symbols=...,
+       start=...,
+       end=...,
+       count=...,
+       adjustment=...,
+       order=...,
+   )
+
+fundamentals.statements(kind="cash_flow")
+-> TushareAdapter.cash_flow_statements(
+       as_of=...,
+       symbols=...,
+       report_start=...,
+       report_end=...,
+       periods=...,
+       company_type=...,
+       order=...,
+   )
 ```
+
+不同能力只声明自己真正需要的参数。例如 Tushare 日线没有 `frequency` 参数，
+`previous_session()` 也不会通过 `sessions(open_only=True)` 复用入口。统一保留在有实际价值的
+边界：Adapter 返回 Arrow 表，Reader 按逻辑数据集校验平台 Schema 并包装为 `QueryResult`。
 
 执行顺序固定为：
 

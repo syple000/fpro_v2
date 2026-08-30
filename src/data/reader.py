@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from datetime import date, datetime, time, timedelta
 from typing import Literal, cast
 from zoneinfo import ZoneInfo
@@ -11,7 +11,7 @@ from zoneinfo import ZoneInfo
 import pyarrow as pa
 import pyarrow.compute as pc
 
-from data.adapters import AdapterRequest, QmtAdapter, QueryParameter, TushareAdapter
+from data.adapters import QmtAdapter, TushareAdapter
 from data.catalog import DataCatalog
 from data.config import SourceConfig
 from data.errors import (
@@ -39,6 +39,18 @@ Symbols = Sequence[str] | _AllSymbols
 SortDirection = Literal["ascending", "descending"]
 CompanyType = Literal["industrial", "bank", "insurance", "securities"]
 Adapter = TushareAdapter | QmtAdapter
+
+
+def _tushare(adapter: Adapter) -> TushareAdapter:
+    if not isinstance(adapter, TushareAdapter):
+        raise DataCapabilityNotSupportedError("该逻辑数据集需要 Tushare 适配器")
+    return adapter
+
+
+def _qmt(adapter: Adapter) -> QmtAdapter:
+    if not isinstance(adapter, QmtAdapter):
+        raise DataCapabilityNotSupportedError("分钟行情需要 QMT 适配器")
+    return adapter
 
 
 class DataReader:
@@ -120,16 +132,15 @@ class DataView:
         self,
         route: str,
         *,
-        symbols: tuple[str, ...] | None,
-        parameters: Mapping[str, QueryParameter],
+        query: Callable[[Adapter], pa.Table],
+        columns: tuple[str, ...] | None = None,
     ) -> tuple[pa.Table, str]:
         source_id = self._source_config.routes.get(route)
         if source_id is None:
             raise DataSourceNotConfiguredError(f"逻辑数据集 {route!r} 未配置来源") from None
         adapter = self._adapters[source_id]
-        request = AdapterRequest(DataCapability(route), self.as_of, symbols, parameters)
         try:
-            table = adapter.read(request)
+            table = query(adapter)
         except (
             DataCapabilityNotSupportedError,
             DataSourceUnavailableError,
@@ -140,7 +151,10 @@ class DataView:
             raise DataAdapterError(f"来源 {source_id!r} 读取 {route!r} 失败") from exc
         if not isinstance(table, pa.Table):
             raise DataAdapterError(f"来源 {source_id!r} 未返回 pyarrow.Table")
-        _exact_schema(table, CAPABILITY_SCHEMAS[request.dataset], route)
+        expected_schema = CAPABILITY_SCHEMAS[DataCapability(route)]
+        if columns is not None:
+            expected_schema = pa.schema(expected_schema.field(name) for name in columns)
+        _exact_schema(table, expected_schema, route)
         return table, source_id
 
     def _result(
@@ -220,18 +234,42 @@ class MarketReader:
             if _as_datetime(normalized_end) > self._data.as_of:
                 raise ValueError("end 不得晚于 as_of")
         route = "market.daily_bars" if frequency == "1d" else "market.intraday_bars"
-        table, source = self._data._read(
-            route,
-            symbols=normalized_symbols,
-            parameters={
-                "frequency": frequency,
-                "adjustment": adjustment,
-                "start": normalized_start,
-                "end": normalized_end,
-            },
-        )
-        if count is not None:
-            table = _latest_per_symbol(table, count, "interval_end")
+        identity = ("symbol", "interval_start", "interval_end")
+        selected, columns = _projection(route, identity, fields)
+        fetch_limit = limit + 1 if limit is not None else None
+        if frequency == "1d":
+            table, source = self._data._read(
+                route,
+                query=lambda adapter: adapter.daily_bars(
+                    as_of=self._data.as_of,
+                    symbols=normalized_symbols,
+                    start=normalized_start,
+                    end=normalized_end,
+                    count=count,
+                    adjustment=adjustment,
+                    order=order,
+                    fetch_limit=fetch_limit,
+                    columns=columns,
+                ),
+                columns=columns,
+            )
+        else:
+            table, source = self._data._read(
+                route,
+                query=lambda adapter: _qmt(adapter).intraday_bars(
+                    as_of=self._data.as_of,
+                    symbols=normalized_symbols,
+                    frequency=frequency,
+                    start=normalized_start,
+                    end=normalized_end,
+                    count=count,
+                    adjustment=adjustment,
+                    order=order,
+                    fetch_limit=fetch_limit,
+                    columns=columns,
+                ),
+                columns=columns,
+            )
         direction: SortDirection = "ascending" if order == "asc" else "descending"
         sort: tuple[tuple[str, SortDirection], ...] = (
             ("interval_end", direction),
@@ -240,8 +278,8 @@ class MarketReader:
         )
         return self._data._result(
             table,
-            identity=("symbol", "interval_start", "interval_end"),
-            fields=fields,
+            identity=identity,
+            fields=selected,
             sort=sort,
             limit=limit,
             sources=(source,),
@@ -256,15 +294,22 @@ class MarketReader:
     ) -> QueryResult:
         limit = _limit(limit, self._data._max_limit)
         normalized_symbols = _symbols(symbols, limit)
+        identity = ("symbol",)
+        selected, columns = _projection("market.realtime_quotes", identity, fields)
         table, source = self._data._read(
             "market.realtime_quotes",
-            symbols=normalized_symbols,
-            parameters={},
+            query=lambda adapter: adapter.current(
+                as_of=self._data.as_of,
+                symbols=normalized_symbols,
+                fetch_limit=limit + 1 if limit is not None else None,
+                columns=columns,
+            ),
+            columns=columns,
         )
         return self._data._result(
             table,
-            identity=("symbol",),
-            fields=fields,
+            identity=identity,
+            fields=selected,
             sort=(("symbol", "ascending"),),
             limit=limit,
             sources=(source,),
@@ -296,7 +341,47 @@ class MarketReader:
             rows = {symbol: {"symbol": symbol} for symbol in normalized_symbols}
         sources: list[str] = []
         for route, route_fields in routes:
-            part, source = self._data._read(route, symbols=normalized_symbols, parameters={})
+            fetch_limit = limit + 1 if limit is not None else None
+            columns = ("symbol", *route_fields)
+            if route == "market.suspensions":
+                part, source = self._data._read(
+                    route,
+                    query=lambda adapter, fetch_limit=fetch_limit, columns=columns: _tushare(
+                        adapter
+                    ).suspensions(
+                        as_of=self._data.as_of,
+                        symbols=normalized_symbols,
+                        fetch_limit=fetch_limit,
+                        columns=columns,
+                    ),
+                    columns=columns,
+                )
+            elif route == "market.price_limits":
+                part, source = self._data._read(
+                    route,
+                    query=lambda adapter, fetch_limit=fetch_limit, columns=columns: _tushare(
+                        adapter
+                    ).price_limits(
+                        as_of=self._data.as_of,
+                        symbols=normalized_symbols,
+                        fetch_limit=fetch_limit,
+                        columns=columns,
+                    ),
+                    columns=columns,
+                )
+            else:
+                part, source = self._data._read(
+                    route,
+                    query=lambda adapter, fetch_limit=fetch_limit, columns=columns: _tushare(
+                        adapter
+                    ).st_status(
+                        as_of=self._data.as_of,
+                        symbols=normalized_symbols,
+                        fetch_limit=fetch_limit,
+                        columns=columns,
+                    ),
+                    columns=columns,
+                )
             sources.append(source)
             for item in part.to_pylist():
                 symbol = item["symbol"]
@@ -384,15 +469,41 @@ class MarketReader:
         order = _order(order)
         limit = _limit(limit, self._data._max_limit)
         normalized_symbols = _symbols(symbols, limit)
-        table, source = self._data._read(
-            route,
-            symbols=normalized_symbols,
-            parameters={"start": start, "end": end},
-        )
+        identity = ("symbol", "trade_date")
+        selected, columns = _projection(route, identity, fields)
+        fetch_limit = limit + 1 if limit is not None else None
+        if route == "market.daily_metrics":
+            table, source = self._data._read(
+                route,
+                query=lambda adapter: _tushare(adapter).daily_metrics(
+                    as_of=self._data.as_of,
+                    symbols=normalized_symbols,
+                    start=start,
+                    end=end,
+                    order=order,
+                    fetch_limit=fetch_limit,
+                    columns=columns,
+                ),
+                columns=columns,
+            )
+        else:
+            table, source = self._data._read(
+                route,
+                query=lambda adapter: _tushare(adapter).moneyflow(
+                    as_of=self._data.as_of,
+                    symbols=normalized_symbols,
+                    start=start,
+                    end=end,
+                    order=order,
+                    fetch_limit=fetch_limit,
+                    columns=columns,
+                ),
+                columns=columns,
+            )
         return self._data._result(
             table,
-            identity=("symbol", "trade_date"),
-            fields=fields,
+            identity=identity,
+            fields=selected,
             sort=(
                 ("trade_date", "ascending" if order == "asc" else "descending"),
                 ("symbol", "ascending"),
@@ -440,17 +551,6 @@ class FundamentalsReader:
         order = _order(order)
         limit = _limit(limit, self._data._max_limit)
         normalized_symbols = _symbols(symbols, limit)
-        table, source = self._data._read(
-            route,
-            symbols=normalized_symbols,
-            parameters={
-                "report_start": report_start,
-                "report_end": report_end,
-                "company_type": _company_type(company_type),
-            },
-        )
-        if periods is not None:
-            table = _latest_per_symbol(table, periods, "period_end", distinct=True)
         identity = (
             "symbol",
             "period_end",
@@ -459,10 +559,61 @@ class FundamentalsReader:
             "actual_announcement_date",
             "company_type",
         )
+        selected, columns = _projection(route, identity, fields)
+        normalized_company_type = _company_type(company_type)
+        fetch_limit = limit + 1 if limit is not None else None
+        if kind == "income":
+            table, source = self._data._read(
+                route,
+                query=lambda adapter: _tushare(adapter).income_statements(
+                    as_of=self._data.as_of,
+                    symbols=normalized_symbols,
+                    report_start=report_start,
+                    report_end=report_end,
+                    company_type=normalized_company_type,
+                    periods=periods,
+                    order=order,
+                    fetch_limit=fetch_limit,
+                    columns=columns,
+                ),
+                columns=columns,
+            )
+        elif kind == "balance_sheet":
+            table, source = self._data._read(
+                route,
+                query=lambda adapter: _tushare(adapter).balance_sheets(
+                    as_of=self._data.as_of,
+                    symbols=normalized_symbols,
+                    report_start=report_start,
+                    report_end=report_end,
+                    company_type=normalized_company_type,
+                    periods=periods,
+                    order=order,
+                    fetch_limit=fetch_limit,
+                    columns=columns,
+                ),
+                columns=columns,
+            )
+        else:
+            table, source = self._data._read(
+                route,
+                query=lambda adapter: _tushare(adapter).cash_flow_statements(
+                    as_of=self._data.as_of,
+                    symbols=normalized_symbols,
+                    report_start=report_start,
+                    report_end=report_end,
+                    company_type=normalized_company_type,
+                    periods=periods,
+                    order=order,
+                    fetch_limit=fetch_limit,
+                    columns=columns,
+                ),
+                columns=columns,
+            )
         return self._data._result(
             table,
             identity=identity,
-            fields=fields,
+            fields=selected,
             sort=(
                 ("period_end", "ascending" if order == "asc" else "descending"),
                 ("symbol", "ascending"),
@@ -487,17 +638,26 @@ class FundamentalsReader:
         order = _order(order)
         limit = _limit(limit, self._data._max_limit)
         normalized_symbols = _symbols(symbols, limit)
+        identity = ("symbol", "period_end", "visible_at", "announcement_date")
+        selected, columns = _projection("fundamentals.indicators", identity, fields)
         table, source = self._data._read(
             "fundamentals.indicators",
-            symbols=normalized_symbols,
-            parameters={"report_start": report_start, "report_end": report_end},
+            query=lambda adapter: _tushare(adapter).financial_indicators(
+                as_of=self._data.as_of,
+                symbols=normalized_symbols,
+                report_start=report_start,
+                report_end=report_end,
+                periods=periods,
+                order=order,
+                fetch_limit=limit + 1 if limit is not None else None,
+                columns=columns,
+            ),
+            columns=columns,
         )
-        if periods is not None:
-            table = _latest_per_symbol(table, periods, "period_end", distinct=True)
         return self._data._result(
             table,
-            identity=("symbol", "period_end", "visible_at", "announcement_date"),
-            fields=fields,
+            identity=identity,
+            fields=selected,
             sort=(
                 ("period_end", "ascending" if order == "asc" else "descending"),
                 ("symbol", "ascending"),
@@ -525,16 +685,56 @@ class FundamentalsReader:
         order = _order(order)
         limit = _limit(limit, self._data._max_limit)
         normalized_symbols = _symbols(symbols, limit)
-        table, source = self._data._read(
-            route,
-            symbols=normalized_symbols,
-            parameters={"visible_start": start, "visible_end": end},
-        )
+        identity = ("symbol", "visible_at", "period_end", "announcement_date")
+        selected, columns = _projection(route, identity, fields)
+        fetch_limit = limit + 1 if limit is not None else None
+        if kind == "forecast":
+            table, source = self._data._read(
+                route,
+                query=lambda adapter: _tushare(adapter).forecasts(
+                    as_of=self._data.as_of,
+                    symbols=normalized_symbols,
+                    visible_start=start,
+                    visible_end=end,
+                    order=order,
+                    fetch_limit=fetch_limit,
+                    columns=columns,
+                ),
+                columns=columns,
+            )
+        elif kind == "express":
+            table, source = self._data._read(
+                route,
+                query=lambda adapter: _tushare(adapter).express_reports(
+                    as_of=self._data.as_of,
+                    symbols=normalized_symbols,
+                    visible_start=start,
+                    visible_end=end,
+                    order=order,
+                    fetch_limit=fetch_limit,
+                    columns=columns,
+                ),
+                columns=columns,
+            )
+        else:
+            table, source = self._data._read(
+                route,
+                query=lambda adapter: _tushare(adapter).audit_reports(
+                    as_of=self._data.as_of,
+                    symbols=normalized_symbols,
+                    visible_start=start,
+                    visible_end=end,
+                    order=order,
+                    fetch_limit=fetch_limit,
+                    columns=columns,
+                ),
+                columns=columns,
+            )
         direction = "ascending" if order == "asc" else "descending"
         return self._data._result(
             table,
-            identity=("symbol", "visible_at", "period_end", "announcement_date"),
-            fields=fields,
+            identity=identity,
+            fields=selected,
             sort=(
                 ("visible_at", direction),
                 ("symbol", "ascending"),
@@ -566,24 +766,34 @@ class CorporateActionsReader:
         order = _order(order)
         limit = _limit(limit, self._data._max_limit)
         normalized_symbols = _symbols(symbols, limit)
+        identity = (
+            "symbol",
+            "visible_at",
+            "ex_date",
+            "end_date",
+            "ann_date",
+            "div_proc",
+            "implementation_ann_date",
+        )
+        selected, columns = _projection("corporate_actions.dividends", identity, fields)
         table, source = self._data._read(
             "corporate_actions.dividends",
-            symbols=normalized_symbols,
-            parameters={"visible_start": start, "visible_end": end},
+            query=lambda adapter: _tushare(adapter).dividends(
+                as_of=self._data.as_of,
+                symbols=normalized_symbols,
+                visible_start=start,
+                visible_end=end,
+                order=order,
+                fetch_limit=limit + 1 if limit is not None else None,
+                columns=columns,
+            ),
+            columns=columns,
         )
         direction = "ascending" if order == "asc" else "descending"
         return self._data._result(
             table,
-            identity=(
-                "symbol",
-                "visible_at",
-                "ex_date",
-                "end_date",
-                "ann_date",
-                "div_proc",
-                "implementation_ann_date",
-            ),
-            fields=fields,
+            identity=identity,
+            fields=selected,
             sort=(
                 ("visible_at", direction),
                 ("symbol", "ascending"),
@@ -617,8 +827,14 @@ class CorporateActionsReader:
         normalized_symbols = _symbols(symbols, limit)
         table, source = self._data._read(
             "corporate_actions.adjustment_factors",
-            symbols=normalized_symbols,
-            parameters={"start": start, "end": end},
+            query=lambda adapter: _tushare(adapter).adjustment_factors(
+                as_of=self._data.as_of,
+                symbols=normalized_symbols,
+                start=start,
+                end=end,
+                order=order,
+                fetch_limit=limit + 1 if limit is not None else None,
+            ),
         )
         return self._data._result(
             table,
@@ -652,8 +868,12 @@ class ClassificationReader:
         normalized_symbols = _symbols(symbols, limit)
         table, source = self._data._read(
             "classification.industry",
-            symbols=normalized_symbols,
-            parameters={"level": level},
+            query=lambda adapter: _tushare(adapter).industry(
+                as_of=self._data.as_of,
+                symbols=normalized_symbols,
+                level=level,
+                fetch_limit=limit + 1 if limit is not None else None,
+            ),
         )
         return self._data._result(
             table,
@@ -690,19 +910,25 @@ class CalendarReader:
         _range(start, end, "start", "end")
         order = _order(order)
         limit = _limit(limit, self._data._max_limit)
+        identity = ("cal_date", "exchange")
+        selected, columns = _projection("calendar.sessions", identity, fields)
         table, source = self._data._read(
             "calendar.sessions",
-            symbols=None,
-            parameters={
-                "start": start,
-                "end": end,
-                "exchange": _optional_code(exchange, "exchange"),
-            },
+            query=lambda adapter: _tushare(adapter).sessions(
+                as_of=self._data.as_of,
+                start=start,
+                end=end,
+                exchange=_optional_code(exchange, "exchange"),
+                order=order,
+                fetch_limit=limit + 1 if limit is not None else None,
+                columns=columns,
+            ),
+            columns=columns,
         )
         return self._data._result(
             table,
-            identity=("cal_date", "exchange"),
-            fields=fields,
+            identity=identity,
+            fields=selected,
             sort=(
                 ("cal_date", "ascending" if order == "asc" else "descending"),
                 ("exchange", "ascending"),
@@ -712,53 +938,19 @@ class CalendarReader:
         )
 
     def previous_session(self, *, exchange: str) -> date | None:
-        result = self.sessions(
-            start=date.min,
-            end=self._data.as_of.date(),
-            exchange=exchange,
-            fields=("is_open",),
-            order="desc",
-            limit=None,
+        normalized_exchange = _optional_code(exchange, "exchange")
+        assert normalized_exchange is not None
+        table, _ = self._data._read(
+            "calendar.sessions",
+            query=lambda adapter: _tushare(adapter).previous_session(
+                end=self._data.as_of.date(),
+                exchange=normalized_exchange,
+            ),
+            columns=("cal_date", "exchange"),
         )
-        for row in result.table.to_pylist():
-            if row["is_open"]:
-                return cast(date, row["cal_date"])
-        return None
-
-
-def _latest_per_symbol(
-    table: pa.Table,
-    count: int,
-    key: str,
-    *,
-    distinct: bool = False,
-) -> pa.Table:
-    _validate_identity(table, ("symbol", key))
-    if table.num_rows <= 1:
-        return table
-    ordering = pc.sort_indices(
-        table,
-        sort_keys=[("symbol", "ascending"), (key, "descending")],
-        null_placement="at_end",
-    )
-    ordered = table.take(ordering)
-    selected: list[int] = []
-    seen_count: dict[str, int] = {}
-    seen_keys: dict[str, set[object]] = {}
-    for index, row in enumerate(ordered.select(("symbol", key)).to_pylist()):
-        symbol = row["symbol"]
-        value = row[key]
-        if distinct:
-            values = seen_keys.setdefault(symbol, set())
-            if value not in values:
-                values.add(value)
-                seen_count[symbol] = seen_count.get(symbol, 0) + 1
-            if seen_count.get(symbol, 0) <= count:
-                selected.append(index)
-        elif seen_count.get(symbol, 0) < count:
-            selected.append(index)
-            seen_count[symbol] = seen_count.get(symbol, 0) + 1
-    return ordered.take(pa.array(selected, type=pa.int64()))
+        if table.num_rows == 0:
+            return None
+        return cast(date, table.column("cal_date")[0].as_py())
 
 
 def _validate_identity(table: pa.Table, identity: Sequence[str]) -> None:
@@ -799,6 +991,17 @@ def _fields(
     if invalid:
         raise ValueError(f"未知或不可投影字段: {invalid}")
     return selected
+
+
+def _projection(
+    route: str,
+    identity: tuple[str, ...],
+    fields: Sequence[str] | None,
+) -> tuple[list[str], tuple[str, ...]]:
+    schema = CAPABILITY_SCHEMAS[DataCapability(route)]
+    payload = [name for name in schema.names if name not in identity]
+    selected = _fields(fields, payload, identity)
+    return selected, (*identity, *selected)
 
 
 def _symbols(symbols: Symbols, limit: int | None) -> tuple[str, ...] | None:
