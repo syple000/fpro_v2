@@ -113,7 +113,7 @@ Content-Type: application/json
 | 单股订阅 | `subscribe_quote` |
 | 取消订阅 | `unsubscribe_quote` |
 | 快照 | `get_full_tick` |
-| 历史下载 | `download_history_data2`；兼容旧客户端不含 `incrementally` 的签名 |
+| 历史下载 | 逐证券调用 `download_history_data`；兼容旧客户端不含 `incrementally` 的签名，避免批量接口完成回调丢失后永久等待 |
 | 历史查询 | `get_local_data` |
 | 财务下载 | `download_financial_data2` |
 | 财务查询 | `get_financial_data` |

@@ -65,6 +65,9 @@ class FakeXtData:
         self.arguments = kwargs
         self.history_downloads.append(kwargs)
 
+    def download_history_data2(self, **kwargs: Any) -> None:
+        raise AssertionError(f"不应调用依赖完成回调的批量下载接口：{kwargs}")
+
     def get_local_data(self, **kwargs: Any) -> dict[str, Any]:
         self.method = "get_local_data"
         self.arguments = kwargs
