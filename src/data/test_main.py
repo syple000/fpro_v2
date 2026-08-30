@@ -51,6 +51,7 @@ def run(
     sources = SourceConfig(
         routes={
             "market.daily_bars": "tushare",
+            "market.intraday_bars": "qmt",
             "market.realtime_quotes": "qmt",
             "market.daily_metrics": "tushare",
             "market.moneyflow": "tushare",
@@ -80,6 +81,14 @@ def run(
                 lambda: data.market.bars(
                     symbols=symbols,
                     frequency="1d",
+                    count=periods,
+                ),
+            ),
+            (
+                "market.bars.intraday",
+                lambda: data.market.bars(
+                    symbols=symbols,
+                    frequency="1m",
                     count=periods,
                 ),
             ),
