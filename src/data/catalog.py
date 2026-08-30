@@ -36,7 +36,7 @@ class DataCatalog:
         return self._connection
 
     def refresh(self) -> None:
-        """根据最新 Manifest 重新注册原始视图。"""
+        """根据最新 Manifest 重新注册原始视图和小型参考表。"""
         for source, (root, schemas) in self._sources.items():
             self._connection.execute(f"CREATE SCHEMA IF NOT EXISTS {_quote_identifier(source)}")
             for table, schema in schemas.items():
@@ -47,6 +47,7 @@ class DataCatalog:
                     files=_active_files(root / table),
                     schema=schema,
                 )
+        _refresh_reference_tables(self._connection)
 
     def close(self) -> None:
         """关闭 DuckDB 连接。"""
@@ -123,6 +124,17 @@ def _register_parquet_view(
         connection.register(registration, schema.empty_table())
         select = f"SELECT * FROM {_quote_identifier(registration)}"
     connection.execute(f"CREATE OR REPLACE VIEW {qualified} AS {select}")
+
+
+def _refresh_reference_tables(connection: duckdb.DuckDBPyConnection) -> None:
+    """把高频读取的小表物化一次，避免每次查询重新打开数千个小文件。"""
+    connection.execute("CREATE SCHEMA IF NOT EXISTS data_internal")
+    connection.execute(
+        "CREATE OR REPLACE TABLE data_internal.trade_cal AS SELECT * FROM tushare.trade_cal"
+    )
+    connection.execute(
+        "CREATE OR REPLACE TABLE data_internal.sw_industry AS SELECT * FROM tushare.sw_industry"
+    )
 
 
 def _quote_identifier(value: str) -> str:
