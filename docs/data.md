@@ -171,6 +171,14 @@ QMT 原生 `front/front_ratio` 的价格锚点取决于查询区间，但当前�
 行情；已有 `front/front_ratio` 分区可保留用于离线复核，但 Reader 不读取它们，QMT 路由收到
 `adjustment="forward"` 时明确抛出 `DataCapabilityNotSupportedError`。只有在存储补齐原始价格、
 因子、因子生效日和可见时间后，才能重新启用 QMT 前复权。
+
+> TODO：补充 QMT 前复权能力。生产数据继续只落地 `adjustment="none"` 的日线，并保存带版本和
+> 可见时间的 QMT 除权因子；由 Adapter 按统一公式从不复权价格现场计算前复权价格，通过
+> `market.bars(adjustment="forward")` 透出。同步或数据复核流程另行拉取同一股票、区间和锚点的
+> QMT 原生 `front_ratio`，逐项校验计算结果的 OHLC 与前收盘价；成交量和成交额只校验保持实际
+> 成交口径。原生 `front_ratio` 仅作为校验基准，不与生产日线增量拼接，也不替代因子版本的 PIT
+> 约束。
+
 Reader 只把 `adjustment` 语义传给当前行情适配器，不读取因子、不拼接数据源，也不要求配置
 `corporate_actions.adjustment_factors` 路由。
 适配器必须把结果归一到平台 bar Schema：只调整 OHLC 和前收盘价，

@@ -79,6 +79,11 @@ agent 保留 XtData 原始 `quote.time`。receiver 落盘时才生成业务字�
 同步流程不再新增 `front/front_ratio` 行情。QMT 原生前复权缺少锚点及因子历史可见时间，不能
 直接作为严格 PIT 的 Reader 输出；旧分区仍可由存储层读取以便离线复核。
 
+TODO：在保持生产同步只落地不复权行情的前提下，为除权因子增加快照版本、采集时间、有效日期
+和完整覆盖范围；随后由数据适配器使用不复权日线和因子计算 `front_ratio` 并开放统一前复权
+接口。数据复核任务应单独拉取 QMT 原生 `front_ratio`，使用相同区间和锚点与平台计算结果比较，
+但不得把这份校验数据混入生产历史行情。
+
 ```python
 from qmt_receiver import QmtAgentClient, QmtDataStore, sync_all
 
