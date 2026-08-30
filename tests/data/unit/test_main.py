@@ -10,6 +10,7 @@ from data.test_main import run
 
 QUERY_NAMES = {
     "market.bars.daily",
+    "market.bars.intraday",
     "market.current",
     "market.status",
     "market.daily_metrics",
@@ -47,6 +48,7 @@ def test_run_calls_every_reader_method_and_writes_test_outputs(tmp_path: Path) -
     assert result.manifest_path == output_dir / "manifest.json"
     assert all(query.as_of == as_of for query in result.queries.values())
     assert result.queries["market.bars.daily"].sources == ("tushare",)
+    assert result.queries["market.bars.intraday"].sources == ("qmt",)
     assert result.queries["market.current"].sources == ("qmt",)
     assert result.queries["market.current"].table.num_rows == 0
     assert result.queries["market.status"].table.num_rows == 1

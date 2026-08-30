@@ -841,11 +841,10 @@ fundamentals.statements(kind="cash_flow")
 
 ## 全接口冒烟测试
 
-`data-test` 会以一个 symbol 调用 Reader 的全部公共查询方法。`bars()` 使用 Tushare 日线，
-`current()` 使用 QMT 实时事件（QMT 无数据时落空 CSV）；`statements()` 和 `disclosures()` 会覆盖
-所有 kind，其他方法各调用一次。每个查询结果写成独立 CSV，上一交易日也单独落盘，并生成记录
-参数、字段、来源和行数的 `manifest.json`。Tushare 当前没有分钟线能力，因此不额外调用同一个
-`bars()` 的分钟周期分支：
+`data-test` 会以一个 symbol 调用 Reader 的全部公共查询方法。`bars()` 分别使用 Tushare 日线和
+QMT 1 分钟线，`current()` 使用 QMT 实时事件（QMT 无数据时落空 CSV）；`statements()` 和
+`disclosures()` 会覆盖所有 kind，其他方法各调用一次。每个查询结果写成独立 CSV，上一交易日也
+单独落盘，并生成记录参数、字段、来源和行数的 `manifest.json`：
 
 ```bash
 uv run data-test \

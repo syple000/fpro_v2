@@ -20,6 +20,7 @@ from qmt_protocol import BalanceRecord, HistoryBar
 class FakeXtData:
     def __init__(self) -> None:
         self.arguments: dict[str, Any] = {}
+        self.history_downloads: list[dict[str, Any]] = []
         self.method: str | None = None
         self.history: dict[str, Any] = {
             "000001.SZ": pd.DataFrame({"close": [10.0]}, index=pd.Index([20250101]))
@@ -59,9 +60,10 @@ class FakeXtData:
         self.arguments = kwargs
         return {"000001.SZ": {"lastPrice": 10.0}}
 
-    def download_history_data2(self, **kwargs: Any) -> None:
-        self.method = "download_history_data2"
+    def download_history_data(self, **kwargs: Any) -> None:
+        self.method = "download_history_data"
         self.arguments = kwargs
+        self.history_downloads.append(kwargs)
 
     def get_local_data(self, **kwargs: Any) -> dict[str, Any]:
         self.method = "get_local_data"
@@ -271,20 +273,29 @@ def test_gateway_errors_do_not_expose_subscription_ids() -> None:
     assert "456" not in str(unsubscribe_error.value)
 
 
-def test_history_download_uses_official_batch_interface() -> None:
+def test_history_download_uses_non_callback_interface_per_stock() -> None:
     xtdata = FakeXtData()
     gateway = make_gateway(xtdata)
 
     gateway.download_history(["000001.SZ", "600000.SH"], "1d", "20250101", "20251231", False)
 
-    assert xtdata.method == "download_history_data2"
-    assert xtdata.arguments == {
-        "stock_list": ["000001.SZ", "600000.SH"],
-        "period": "1d",
-        "start_time": "20250101",
-        "end_time": "20251231",
-        "incrementally": False,
-    }
+    assert xtdata.method == "download_history_data"
+    assert xtdata.history_downloads == [
+        {
+            "stock_code": "000001.SZ",
+            "period": "1d",
+            "start_time": "20250101",
+            "end_time": "20251231",
+            "incrementally": False,
+        },
+        {
+            "stock_code": "600000.SH",
+            "period": "1d",
+            "start_time": "20250101",
+            "end_time": "20251231",
+            "incrementally": False,
+        },
+    ]
 
 
 def test_history_download_supports_legacy_client_without_incremental_argument() -> None:
@@ -292,16 +303,16 @@ def test_history_download_supports_legacy_client_without_incremental_argument() 
         def __init__(self) -> None:
             self.arguments: dict[str, Any] = {}
 
-        def download_history_data2(
+        def download_history_data(
             self,
-            stock_list: list[str],
+            stock_code: str,
             period: str,
             start_time: str,
             end_time: str,
         ) -> None:
-            self.method = "download_history_data2"
+            self.method = "download_history_data"
             self.arguments = {
-                "stock_list": stock_list,
+                "stock_code": stock_code,
                 "period": period,
                 "start_time": start_time,
                 "end_time": end_time,
@@ -313,7 +324,7 @@ def test_history_download_supports_legacy_client_without_incremental_argument() 
     gateway.download_history(["000001.SZ"], "1d", "", "", True)
 
     assert xtdata.arguments == {
-        "stock_list": ["000001.SZ"],
+        "stock_code": "000001.SZ",
         "period": "1d",
         "start_time": "",
         "end_time": "",

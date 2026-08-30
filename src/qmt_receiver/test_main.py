@@ -78,7 +78,7 @@ def main() -> None:
     parser.add_argument(
         "--force",
         action="store_true",
-        help="sync 模式下对历史行情使用 full 下载，覆盖已有的本地历史",
+        help="sync 模式下忽略 checkpoint，重新查询并覆盖请求区间",
     )
     args = parser.parse_args()
     configure_beijing_logging(logging.INFO)

@@ -110,7 +110,9 @@ with (
 QMT 日线、分钟线和除权因子的完成区间记录在 `<root>/_meta/sync/*.json`，键由数据集、证券代码
 以及分钟周期组成。一次查询和落盘全部成功后才原子提交区间；重叠或相邻区间自动合并，重复同步
 默认只补缺口。日线和分钟线缺口使用 XtData `incremental` 下载；`force=True` 忽略 meta，行情
-改用 `full` 下载，除权因子也重新查询。财务数据仍按每次请求刷新，不使用这组区间 checkpoint。
+请求 `full` 下载并覆盖 Parquet，除权因子也重新查询。当前券商内置 XtData 没有下载模式参数，
+因此 `incremental` / `full` 在上游缓存下载阶段等价；`force` 仍保证绕过本项目 checkpoint 并重写
+请求区间。财务数据仍按每次请求刷新，不使用这组区间 checkpoint。
 
 `sync_all()` 默认包含 1 分钟线；其他分钟周期按实际需要调用 `sync_intraday()`。同步 checkpoint
 使用 `YYYYMMDD` 日级闭区间。命令行 `qmt-receiver-test sync` 同样支持 `--force`。

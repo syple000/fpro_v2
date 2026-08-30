@@ -121,9 +121,9 @@ class _XtDataModule(Protocol):
 
     def get_full_tick(self, code_list: list[str]) -> object: ...
 
-    def download_history_data2(
+    def download_history_data(
         self,
-        stock_list: list[str],
+        stock_code: str,
         period: str,
         start_time: str,
         end_time: str,
@@ -256,22 +256,22 @@ class XtDataGateway:
     ) -> HistoryDownloadResponse:
         try:
             with self._call_lock:
-                arguments = {
-                    "stock_list": list(stocks),
-                    "period": period,
-                    "start_time": start_time,
-                    "end_time": end_time,
-                }
-                try:
-                    self._xtdata.download_history_data2(
-                        **arguments,
-                        incrementally=incrementally,
-                    )
-                except TypeError as exc:
-                    if "unexpected keyword argument 'incrementally'" not in str(exc):
-                        raise
-                    # 保留对旧券商客户端四参数版本的兼容。
-                    cast(Callable[..., None], self._xtdata.download_history_data2)(**arguments)
+                download = cast(Callable[..., None], self._xtdata.download_history_data)
+                for stock in stocks:
+                    arguments = {
+                        "stock_code": stock,
+                        "period": period,
+                        "start_time": start_time,
+                        "end_time": end_time,
+                    }
+                    try:
+                        download(**arguments, incrementally=incrementally)
+                    except TypeError as exc:
+                        if "unexpected keyword argument 'incrementally'" not in str(exc):
+                            raise
+                        # 券商内置版本没有下载模式参数；逐证券接口不会依赖
+                        # download_history_data2 容易丢失的完成回调。
+                        download(**arguments)
             return HistoryDownloadResponse(completed=True)
         except Exception as exc:
             raise QmtGatewayError(f"下载历史行情失败：{exc}") from exc
