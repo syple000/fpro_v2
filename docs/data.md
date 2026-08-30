@@ -260,7 +260,7 @@ Schema；供应商原生结构不能穿透这个边界。例如 Tushare 的 `ts_
 - 字段名称、Arrow 类型、可空性和身份键；
 - 证券代码、时区、时间区间和交易日口径；
 - 价格、成交量、成交额等单位以及复权后的字段含义；
-- PIT 可见性、版本选择、默认排序、截断和空结果语义。
+- PIT 可见性、版本选择、默认排序、安全上限和空结果语义。
 
 单位采用平台全局约定：
 
@@ -333,6 +333,8 @@ Reader 创建时校验所有已配置的 `source_id` 是否注册并支持对应
   `DataCapabilityNotSupportedError`；
 - 已发布数据的存储当前不可访问，或计算可见时间所需的交易日历覆盖不足：抛出
   `DataSourceUnavailableError`；
+- 查询结果超过 Reader 内部安全上限：抛出 `DataResultTooLargeError`，要求调用方缩小证券或
+  时间范围，不返回截断结果；
 - 已发布数据正常可读，只是指定证券或时间范围内没有记录：返回符合平台 Schema 的空
   `QueryResult`。
 
@@ -362,6 +364,7 @@ with DataCatalog(
 ) as catalog:
     reader = DataReader(
         catalog,
+        max_result_rows=1_000_000,
         sources=SourceConfig(
             routes={
                 "market.daily_bars": "qmt",
@@ -416,12 +419,11 @@ Reader 提供不复权历史行情和当日 tick；Tushare 适配器在内部使
 所有复数查询都使用仅限关键字参数，并共享以下约束：
 
 - `symbols` 必须显式传入；空序列返回空结果，不解释为全市场；
-- 全市场必须显式传 `ALL_SYMBOLS`，并同时提供 `limit` 或使用批量迭代接口；
+- 全市场必须显式传 `ALL_SYMBOLS`；结果仍受 Reader 内部安全上限保护；
 - 重复或格式错误的证券代码直接报错；
 - `fields=None` 表示该接口的全部公共字段；非空时只接受登记字段，不接受表达式或 SQL；
 - 业务时间的 `start/end` 和报告范围均为左闭右开 `[start, end)`；
 - `order` 只接受 `"asc"` 或 `"desc"`，不能传任意排序字段；
-- `limit` 默认 `None`；非空时必须是正整数且不超过配置上限，布尔值不视为整数；
 - 路由已正确配置但筛选范围没有记录时返回空行或空表，不自动补数、换源或降低 PIT 规则；
 - 路由未配置、来源不可用或能力不支持时抛出对应数据源错误，不解释为空数据。
 
@@ -443,7 +445,6 @@ bars = data.market.bars(
     fields=("open", "high", "low", "close", "volume"),
     adjustment="forward",
     order="asc",
-    limit=None,
 )
 ```
 
@@ -457,7 +458,6 @@ bars = data.market.bars(
     end=datetime(2024, 4, 30, 11, 30, tzinfo=SHANGHAI),
     fields=("open", "high", "low", "close", "volume"),
     order="asc",
-    limit=120,
 )
 ```
 
@@ -465,20 +465,19 @@ bars = data.market.bars(
 
 - `frequency` 初始支持 `1m/5m/15m/30m/60m/1d`，只有已登记源才能读取；
 - 第一版只读取源中明确记录的周期，不静默用 `1m` 数据合成其他周期；
-- `count` 表示每只股票最近 N 根，而 `limit` 表示合并结果的全局行数上限；
+- `count` 表示每只股票最近 N 根；
 - `count` 与 `start` 互斥；范围模式要求 `start`，`end` 默认 `as_of`；
 - bar 的业务范围按 `interval_start` 判断，`end` 不得晚于 `as_of`；
 - `adjustment` 只允许 `"none"` 和 `"forward"`，分别表示不复权和前复权，默认 `"none"`；
 - `adjustment` 描述平台输出语义，不指定底层算法；所选适配器必须声明支持该语义；
 - `count=N` 时先对每个 symbol 选出最新 N 根，再按请求的输出顺序排序；
-- `limit` 可以与 `count` 同时使用，但它会截断合并结果，可能使某些股票不足 N 根。
 
 查询条件会直接交给 DuckDB：
 
 - 范围模式在 SQL 中直接应用 symbol、业务时间和 PIT 条件，由 DuckDB 对 Parquet 执行字段与过滤下推；
 - `count=N` 在 SQL 中按 symbol 执行窗口截断，不再把全部结果返回 Arrow 后由 Reader 计数；
-- `fields` 会下推为 DuckDB/Parquet 字段投影，`limit` 在不影响每 symbol 计数语义时下推为
-  `limit + 1`，额外一行用于设置 `truncated`；
+- `fields` 会下推为 DuckDB/Parquet 字段投影；Reader 还会下推内部安全上限加一行，用于判断
+  结果是否过大；
 - 日指标、资金流、实时状态、财报 `periods`、复权因子和交易日历使用相同的 SQL 下推原则。
 
 Catalog 只根据 Manifest 注册当前有效的 Parquet 文件，不参与查询范围规划。`count` 和
@@ -502,7 +501,6 @@ interval_end DESC, symbol ASC, interval_start DESC
 current = data.market.current(
     symbols=("000001.SZ", "600000.SH"),
     fields=("open", "last"),
-    limit=100,
 )
 ```
 
@@ -516,7 +514,6 @@ current = data.market.current(
 status = data.market.status(
     symbols=("000001.SZ", "600000.SH"),
     fields=("suspended", "st_type", "up_limit", "down_limit"),
-    limit=100,
 )
 ```
 
@@ -532,7 +529,6 @@ metrics = data.market.daily_metrics(
     end=date(2024, 5, 1),
     fields=("turnover_rate", "pe", "pb", "total_mv"),
     order="asc",
-    limit=100,
 )
 
 flows = data.market.moneyflow(
@@ -540,7 +536,6 @@ flows = data.market.moneyflow(
     start=date(2024, 1, 1),
     end=date(2024, 5, 1),
     order="asc",
-    limit=100,
 )
 ```
 
@@ -574,7 +569,6 @@ income = data.fundamentals.statements(
     company_type="industrial",
     fields=("operating_revenue", "operating_profit", "net_income"),
     order="desc",
-    limit=100,
 )
 ```
 
@@ -595,15 +589,15 @@ income = data.fundamentals.statements(
 `monetary_funds`（货币资金），不误称为现金及现金等价物。
 `periods` 与 `report_start/report_end` 互斥；范围模式至少传 `report_start`，`report_end` 默认不设
 上界。`periods` 是每只股票最近 N 个不同的 `period_end`，选完报告期后再返回符合
-`company_type` 的行。`company_type` 使用平台枚举 `industrial/bank/insurance/securities`；`limit`
-仍是合并结果的全局上限。默认排序为：
+`company_type` 的行。`company_type` 使用平台枚举
+`industrial/bank/insurance/securities`。默认排序为：
 
 ```text
 period_end DESC, symbol ASC, company_type ASC
 ```
 
-`order="asc"` 只反转 `period_end`。在 SQL 中必须先过滤可见修订，再选每个业务键的最新版，最后
-应用用户字段过滤和 `limit`。
+`order="asc"` 只反转 `period_end`。在 SQL 中必须先过滤可见修订，再选每个业务键的最新版，
+最后应用用户字段过滤。
 
 ### 财务指标 `fundamentals.indicators()`
 
@@ -613,7 +607,6 @@ indicators = data.fundamentals.indicators(
     periods=8,
     fields=("basic_earnings_per_share", "return_on_equity", "gross_margin"),
     order="desc",
-    limit=100,
 )
 ```
 
@@ -630,7 +623,6 @@ reports = data.fundamentals.disclosures(
     visible_start=datetime(2023, 1, 1, tzinfo=SHANGHAI),
     visible_end=data.as_of,
     order="asc",
-    limit=100,
 )
 ```
 
@@ -652,7 +644,6 @@ dividends = data.corporate_actions.dividends(
     visible_start=datetime(2023, 1, 1, tzinfo=SHANGHAI),
     visible_end=data.as_of,
     order="asc",
-    limit=100,
 )
 ```
 
@@ -672,7 +663,6 @@ imp_ann_date ASC` 排序。预案将来使用独立方法，不能通过参数�
 industry = data.classification.industry(
     symbols=("000001.SZ", "600000.SH"),
     level=1,
-    limit=100,
 )
 ```
 
@@ -691,7 +681,6 @@ sessions = data.calendar.sessions(
     end=date(2024, 5, 1),
     exchange="SSE",
     order="asc",
-    limit=100,
 )
 
 previous = data.calendar.previous_session(exchange="SSE")
@@ -700,7 +689,7 @@ previous = data.calendar.previous_session(exchange="SSE")
 `sessions()` 默认按 `cal_date ASC, exchange ASC` 排序。回测引擎内部还可以使用完整日历计算下一
 session；策略公共接口初始只提供 `cal_date <= as_of` 本地日期的 session，不提供未来日历查询。
 
-## 返回值、排序和截断
+## 返回值、排序和安全上限
 
 有限查询返回统一结果对象，底层数据使用 Arrow，调用方可以显式转换为 pandas：
 
@@ -710,9 +699,9 @@ class QueryResult:
     table: pyarrow.Table
     as_of: datetime
     sources: tuple[str, ...]
-    truncated: bool
 
     def to_pandas(self) -> pandas.DataFrame: ...
+    def iter_batches(self, *, batch_size: int = 65_536) -> Iterator[pyarrow.RecordBatch]: ...
 ```
 
 `DataReader` 在构造 `QueryResult` 前按平台公共 Schema 做严格校验；缺少字段、多出供应商字段、
@@ -735,16 +724,13 @@ class QueryResult:
 排序必须显式写入 SQL，不能依赖 Parquet、Manifest 或 DuckDB 的物理行顺序。`order` 只反转表中
 的主时间键，其余键始终作为稳定升序 tie-breaker；所有可空排序键显式使用 `NULLS LAST`。
 
-`limit` 统一遵循：
+公共查询不提供通用 `limit`，也不返回半张结果。业务范围由 `symbols/start/end/count/periods`
+等参数决定；Reader 构造参数 `max_result_rows` 是内部安全上限，不属于查询业务语义。适配器最多
+下推读取 `max_result_rows + 1` 行，若完整结果超过上限则抛出 `DataResultTooLargeError`，调用方
+必须缩小证券或时间范围。
 
-1. 先应用 `visible_at <= as_of`；
-2. 再选择当时可见的最新版本；
-3. 再执行安全的业务参数过滤和字段投影；
-4. 再按接口规定的稳定键排序；
-5. 最后返回前 `limit` 行；存在更多结果时设置 `truncated=True`。
-
-`limit=None` 表示不做逻辑截断，不允许内部静默使用默认 limit。大结果可以通过
-`iter_batches(batch_size=...)` 分批消费；当前不提供 `offset` 或跨请求分页游标。
+`iter_batches(batch_size=...)` 用于按 Arrow RecordBatch 消费已经通过安全上限检查的结果，不是
+数据库分页，也不会绕过 `max_result_rows`。当前不提供 `offset` 或跨请求分页游标。
 
 ## 回测与实盘接口
 
@@ -816,7 +802,7 @@ fundamentals.statements(kind="cash_flow")
 -> 归一并校验平台公共 Schema
 -> 应用字段投影
 -> 稳定排序
--> limit
+-> 检查内部 max_result_rows 安全上限
 -> QueryResult
 ```
 
@@ -846,9 +832,9 @@ fundamentals.statements(kind="cash_flow")
 - QMT 当前行情只使用当日 tick，分钟 bar 不得以不同聚合口径覆盖快照；
 - 数据源缺少请求能力时明确失败，不返回供应商字段、不生成半成品且不静默换源；
 - 适配器返回缺列、多列或错误类型时在 Reader 边界失败，不能生成 `QueryResult`；
-- 相同参数的结果字段、排序和 `truncated` 完全稳定；
-- `limit` 只在 PIT 过滤、版本选择和排序后执行；
-- `count=N` 对每个 symbol 生效，`limit=N` 对合并结果生效；
+- 相同参数的结果字段和排序完全稳定；
+- 查询超过内部 `max_result_rows` 时明确失败，不静默截断；
+- `count=N` 和 `periods=N` 分别按其接口定义对每个 symbol 生效；
 - 分钟线在结束前不可见，当日日线最终字段在 16:05 前不可见；
 - 看见开盘价后的订单不能成交在同一个开盘事件；
 - D 日停牌证券在 D 日不能成交，状态缺失不自动变成 `False`；

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+from collections.abc import Callable
 from datetime import date, datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -14,12 +15,20 @@ from data import (
     DataCapabilityNotSupportedError,
     DataCatalog,
     DataReader,
+    DataResultTooLargeError,
     DataSourceNotConfiguredError,
     DataSourceUnavailableError,
     DataView,
     SourceConfig,
 )
 from data.adapters import QmtAdapter, TushareAdapter
+from data.reader import (
+    CalendarReader,
+    ClassificationReader,
+    CorporateActionsReader,
+    FundamentalsReader,
+    MarketReader,
+)
 from models import CAPABILITY_SCHEMAS, CASH_FLOW_STATEMENT_SCHEMA
 from qmt_protocol import BarQuote, HistoryBar, SequencedQuote, TickQuote
 from qmt_receiver import QmtDataStore
@@ -80,7 +89,43 @@ def test_adapters_expose_explicit_capability_parameters() -> None:
     )
 
 
-def test_daily_bars_obey_pit_projection_and_limit(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "query",
+    (
+        MarketReader.bars,
+        MarketReader.current,
+        MarketReader.status,
+        MarketReader.daily_metrics,
+        MarketReader.moneyflow,
+        FundamentalsReader.statements,
+        FundamentalsReader.indicators,
+        FundamentalsReader.disclosures,
+        CorporateActionsReader.dividends,
+        CorporateActionsReader.adjustment_factors,
+        ClassificationReader.industry,
+        CalendarReader.sessions,
+    ),
+)
+def test_public_queries_do_not_expose_generic_limit(query: Callable[..., object]) -> None:
+    assert "limit" not in inspect.signature(query).parameters
+
+
+@pytest.mark.parametrize("max_result_rows", (0, -1, True, 1.5))
+def test_reader_rejects_invalid_internal_result_limit(
+    tmp_path: Path, max_result_rows: object
+) -> None:
+    with (
+        DataCatalog(tushare_root=tmp_path / "tushare", qmt_root=tmp_path / "qmt") as catalog,
+        pytest.raises(ValueError, match="max_result_rows"),
+    ):
+        DataReader(
+            catalog,
+            sources=SourceConfig(routes={}),
+            max_result_rows=max_result_rows,  # type: ignore[arg-type]
+        )
+
+
+def test_daily_bars_obey_pit_projection_and_support_arrow_batches(tmp_path: Path) -> None:
     tushare_root = tmp_path / "tushare"
     with TushareDataStore(tushare_root) as store:
         store.write(
@@ -121,7 +166,6 @@ def test_daily_bars_obey_pit_projection_and_limit(tmp_path: Path) -> None:
             count=2,
             fields=("close", "volume", "amount"),
             order="desc",
-            limit=1,
         )
 
     assert [row["close"] for row in before.table.to_pylist()] == [11.0]
@@ -134,7 +178,8 @@ def test_daily_bars_obey_pit_projection_and_limit(tmp_path: Path) -> None:
         "amount",
     ]
     assert after.table.to_pylist()[0]["close"] == 12.0
-    assert after.truncated is True
+    assert [batch.num_rows for batch in after.iter_batches(batch_size=1)] == [1, 1]
+    assert not hasattr(after, "truncated")
     assert before.table.to_pylist()[0]["volume"] == 10_000.0
     assert before.table.to_pylist()[0]["amount"] == 200_000.0
 
@@ -229,7 +274,9 @@ def test_previous_session_returns_latest_open_day(tmp_path: Path) -> None:
     assert previous == date(2024, 1, 9)
 
 
-def test_market_status_pushes_projection_and_limit(tmp_path: Path) -> None:
+def test_market_status_projects_all_rows_and_enforces_internal_result_limit(
+    tmp_path: Path,
+) -> None:
     tushare_root = tmp_path / "tushare"
     with TushareDataStore(tushare_root) as store:
         store.write(
@@ -255,22 +302,28 @@ def test_market_status_pushes_projection_and_limit(tmp_path: Path) -> None:
         )
 
     with DataCatalog(tushare_root=tushare_root, qmt_root=tmp_path / "qmt") as catalog:
+        config = SourceConfig(routes={"market.price_limits": "tushare"})
         result = (
-            DataReader(
-                catalog,
-                sources=SourceConfig(routes={"market.price_limits": "tushare"}),
-            )
+            DataReader(catalog, sources=config)
             .at(_as_of(2, 10))
             .market.status(
                 symbols=ALL_SYMBOLS,
                 fields=("up_limit",),
-                limit=1,
             )
         )
+        guarded = DataReader(catalog, sources=config, max_result_rows=2)
+        with pytest.raises(DataResultTooLargeError, match="超过内部上限 2 行"):
+            guarded.at(_as_of(2, 10)).market.status(
+                symbols=ALL_SYMBOLS,
+                fields=("up_limit",),
+            )
 
     assert result.table.schema.names == ["symbol", "up_limit"]
-    assert result.table.to_pylist() == [{"symbol": "000001.SZ", "up_limit": 11.0}]
-    assert result.truncated is True
+    assert result.table.to_pylist() == [
+        {"symbol": "000001.SZ", "up_limit": 11.0},
+        {"symbol": "000002.SZ", "up_limit": 12.0},
+        {"symbol": "000003.SZ", "up_limit": 13.0},
+    ]
 
 
 def test_intraday_suspension_becomes_false_after_interval_and_rejects_bad_timing(

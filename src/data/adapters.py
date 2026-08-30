@@ -387,8 +387,6 @@ class TushareAdapter:
                 LIMIT $fetch_limit
             """
         else:
-            if symbols is not None:
-                fetch_limit = None
             params = _query_parameters(
                 as_of=as_of,
                 as_of_date=as_of.date(),
@@ -846,8 +844,6 @@ class TushareAdapter:
         if company_type is not None:
             source_company_type = _PLATFORM_TO_TUSHARE_COMPANY_TYPE[company_type]
         direction = _sql_direction(order, default="desc")
-        if periods is not None and symbols is not None:
-            fetch_limit = None
         params = _query_parameters(
             as_of=as_of,
             symbols=symbols,
@@ -930,8 +926,6 @@ class TushareAdapter:
             expressions,
         )
         direction = _sql_direction(order, default="desc")
-        if periods is not None and symbols is not None:
-            fetch_limit = None
         params = _query_parameters(
             as_of=as_of,
             symbols=symbols,
@@ -1356,8 +1350,6 @@ class QmtAdapter:
                 LIMIT $fetch_limit
             """
         else:
-            if symbols is not None:
-                fetch_limit = None
             params = _query_parameters(
                 as_of=as_of,
                 as_of_date=as_of.date(),
@@ -1417,8 +1409,6 @@ class QmtAdapter:
         end_expr = f"{start_expr} + INTERVAL '{minutes} minutes'"
         qmt_adjustment = "none"
         direction = _sql_direction(order, default="asc")
-        if count is not None and symbols is not None:
-            fetch_limit = None
         as_of_us = _epoch_us(as_of)
         assert as_of_us is not None
         params = _query_parameters(

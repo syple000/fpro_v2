@@ -17,5 +17,9 @@ class DataSourceUnavailableError(DataReaderError):
     """已发布的数据当前不可访问。"""
 
 
+class DataResultTooLargeError(DataReaderError):
+    """查询结果超过 Reader 的内部安全上限。"""
+
+
 class DataAdapterError(DataReaderError):
     """来源适配器违反了平台字段或类型契约。"""

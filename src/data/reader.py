@@ -17,6 +17,7 @@ from data.config import SourceConfig
 from data.errors import (
     DataAdapterError,
     DataCapabilityNotSupportedError,
+    DataResultTooLargeError,
     DataSourceNotConfiguredError,
     DataSourceUnavailableError,
 )
@@ -61,10 +62,14 @@ class DataReader:
         catalog: DataCatalog,
         *,
         sources: SourceConfig,
-        max_limit: int = 1_000_000,
+        max_result_rows: int = 1_000_000,
     ) -> None:
-        if isinstance(max_limit, bool) or not isinstance(max_limit, int) or max_limit < 1:
-            raise ValueError("max_limit 必须是正整数")
+        if (
+            isinstance(max_result_rows, bool)
+            or not isinstance(max_result_rows, int)
+            or max_result_rows < 1
+        ):
+            raise ValueError("max_result_rows 必须是正整数")
         adapters: dict[str, Adapter] = {
             "tushare": TushareAdapter(catalog),
             "qmt": QmtAdapter(catalog),
@@ -79,7 +84,7 @@ class DataReader:
 
         self._sources = sources
         self._adapters = adapters
-        self._max_limit = max_limit
+        self._max_result_rows = max_result_rows
 
     def at(self, as_of: datetime) -> DataView:
         """创建绑定带时区具体时间的数据视图。"""
@@ -87,7 +92,7 @@ class DataReader:
             as_of=_aware_datetime(as_of, "as_of"),
             adapters=self._adapters,
             source_config=self._sources,
-            max_limit=self._max_limit,
+            max_result_rows=self._max_result_rows,
         )
 
 
@@ -103,7 +108,7 @@ class DataView:
         "calendar",
         "_adapters",
         "_source_config",
-        "_max_limit",
+        "_max_result_rows",
     )
 
     def __init__(
@@ -112,12 +117,12 @@ class DataView:
         as_of: datetime,
         adapters: Mapping[str, Adapter],
         source_config: SourceConfig,
-        max_limit: int,
+        max_result_rows: int,
     ) -> None:
         self._as_of = as_of
         self._adapters = adapters
         self._source_config = source_config
-        self._max_limit = max_limit
+        self._max_result_rows = max_result_rows
         self.market = MarketReader(self)
         self.fundamentals = FundamentalsReader(self)
         self.corporate_actions = CorporateActionsReader(self)
@@ -164,7 +169,6 @@ class DataView:
         identity: tuple[str, ...],
         fields: Sequence[str] | None,
         sort: tuple[tuple[str, SortDirection], ...],
-        limit: int | None,
         sources: Sequence[str],
         presorted: bool = True,
     ) -> QueryResult:
@@ -183,14 +187,15 @@ class DataView:
                 null_placement="at_end",
             )
             projected = projected.take(indices)
-        truncated = limit is not None and projected.num_rows > limit
-        if limit is not None:
-            projected = projected.slice(0, limit)
+        if projected.num_rows > self._max_result_rows:
+            raise DataResultTooLargeError(
+                f"查询结果超过内部上限 {self._max_result_rows} 行；"
+                "请缩小 symbols、时间范围、count 或 periods"
+            )
         return QueryResult(
             table=projected,
             as_of=self.as_of,
             sources=tuple(dict.fromkeys(sources)),
-            truncated=truncated,
         )
 
 
@@ -211,15 +216,13 @@ class MarketReader:
         fields: Sequence[str] | None = None,
         adjustment: Literal["none", "forward"] = "none",
         order: Literal["asc", "desc"] = "asc",
-        limit: int | None = None,
     ) -> QueryResult:
         if frequency not in SUPPORTED_FREQUENCIES:
             raise ValueError(f"不支持的 frequency: {frequency!r}")
         if adjustment not in {"none", "forward"}:
             raise ValueError("adjustment 只允许 'none' 或 'forward'")
         order = _order(order)
-        limit = _limit(limit, self._data._max_limit)
-        normalized_symbols = _symbols(symbols, limit)
+        normalized_symbols = _symbols(symbols)
         if count is not None:
             count = _positive_int(count, "count")
             if start is not None or end is not None:
@@ -237,7 +240,7 @@ class MarketReader:
         route = "market.daily_bars" if frequency == "1d" else "market.intraday_bars"
         identity = ("symbol", "interval_start", "interval_end")
         selected, columns = _projection(route, identity, fields)
-        fetch_limit = limit + 1 if limit is not None else None
+        fetch_limit = self._data._max_result_rows + 1
         if frequency == "1d":
             table, source = self._data._read(
                 route,
@@ -282,7 +285,6 @@ class MarketReader:
             identity=identity,
             fields=selected,
             sort=sort,
-            limit=limit,
             sources=(source,),
         )
 
@@ -291,10 +293,8 @@ class MarketReader:
         *,
         symbols: Symbols,
         fields: Sequence[str] | None = None,
-        limit: int | None = None,
     ) -> QueryResult:
-        limit = _limit(limit, self._data._max_limit)
-        normalized_symbols = _symbols(symbols, limit)
+        normalized_symbols = _symbols(symbols)
         identity = ("symbol",)
         selected, columns = _projection("market.realtime_quotes", identity, fields)
         table, source = self._data._read(
@@ -302,7 +302,7 @@ class MarketReader:
             query=lambda adapter: adapter.current(
                 as_of=self._data.as_of,
                 symbols=normalized_symbols,
-                fetch_limit=limit + 1 if limit is not None else None,
+                fetch_limit=self._data._max_result_rows + 1,
                 columns=columns,
             ),
             columns=columns,
@@ -312,7 +312,6 @@ class MarketReader:
             identity=identity,
             fields=selected,
             sort=(("symbol", "ascending"),),
-            limit=limit,
             sources=(source,),
         )
 
@@ -321,13 +320,11 @@ class MarketReader:
         *,
         symbols: Symbols,
         fields: Sequence[str] | None = None,
-        limit: int | None = None,
     ) -> QueryResult:
         allowed = ("suspended", "up_limit", "down_limit", "st_type")
         selected = list(allowed) if fields is None else list(fields)
         _fields(selected, allowed, ("symbol",))
-        limit = _limit(limit, self._data._max_limit)
-        normalized_symbols = _symbols(symbols, limit)
+        normalized_symbols = _symbols(symbols)
         routes: list[tuple[str, tuple[str, ...]]] = []
         if "suspended" in selected:
             routes.append(("market.suspensions", ("suspended",)))
@@ -342,7 +339,7 @@ class MarketReader:
             rows = {symbol: {"symbol": symbol} for symbol in normalized_symbols}
         sources: list[str] = []
         for route, route_fields in routes:
-            fetch_limit = limit + 1 if limit is not None else None
+            fetch_limit = self._data._max_result_rows + 1
             columns = ("symbol", *route_fields)
             if route == "market.suspensions":
                 part, source = self._data._read(
@@ -405,7 +402,6 @@ class MarketReader:
             identity=("symbol",),
             fields=selected,
             sort=(("symbol", "ascending"),),
-            limit=limit,
             sources=sources,
             presorted=False,
         )
@@ -418,7 +414,6 @@ class MarketReader:
         end: date | None = None,
         fields: Sequence[str] | None = None,
         order: Literal["asc", "desc"] = "asc",
-        limit: int | None = None,
     ) -> QueryResult:
         return self._dated_table(
             route="market.daily_metrics",
@@ -427,7 +422,6 @@ class MarketReader:
             end=end,
             fields=fields,
             order=order,
-            limit=limit,
         )
 
     def moneyflow(
@@ -438,7 +432,6 @@ class MarketReader:
         end: date | None = None,
         fields: Sequence[str] | None = None,
         order: Literal["asc", "desc"] = "asc",
-        limit: int | None = None,
     ) -> QueryResult:
         return self._dated_table(
             route="market.moneyflow",
@@ -447,7 +440,6 @@ class MarketReader:
             end=end,
             fields=fields,
             order=order,
-            limit=limit,
         )
 
     def _dated_table(
@@ -459,7 +451,6 @@ class MarketReader:
         end: date | None,
         fields: Sequence[str] | None,
         order: str,
-        limit: int | None,
     ) -> QueryResult:
         start = _plain_date(start, "start")
         end = (
@@ -469,11 +460,10 @@ class MarketReader:
         )
         _range(start, end, "start", "end")
         order = _order(order)
-        limit = _limit(limit, self._data._max_limit)
-        normalized_symbols = _symbols(symbols, limit)
+        normalized_symbols = _symbols(symbols)
         identity = ("symbol", "trade_date")
         selected, columns = _projection(route, identity, fields)
-        fetch_limit = limit + 1 if limit is not None else None
+        fetch_limit = self._data._max_result_rows + 1
         if route == "market.daily_metrics":
             table, source = self._data._read(
                 route,
@@ -510,7 +500,6 @@ class MarketReader:
                 ("trade_date", "ascending" if order == "asc" else "descending"),
                 ("symbol", "ascending"),
             ),
-            limit=limit,
             sources=(source,),
         )
 
@@ -543,7 +532,6 @@ class FundamentalsReader:
         company_type: CompanyType | None = None,
         fields: Sequence[str] | None = None,
         order: Literal["asc", "desc"] = "desc",
-        limit: int | None = None,
     ) -> QueryResult:
         try:
             route = self._STATEMENTS[kind]
@@ -551,8 +539,7 @@ class FundamentalsReader:
             raise ValueError(f"不支持的财报 kind: {kind!r}") from None
         report_start, report_end, periods = _report_range(report_start, report_end, periods)
         order = _order(order)
-        limit = _limit(limit, self._data._max_limit)
-        normalized_symbols = _symbols(symbols, limit)
+        normalized_symbols = _symbols(symbols)
         identity = (
             "symbol",
             "period_end",
@@ -563,7 +550,7 @@ class FundamentalsReader:
         )
         selected, columns = _projection(route, identity, fields)
         normalized_company_type = _company_type(company_type)
-        fetch_limit = limit + 1 if limit is not None else None
+        fetch_limit = self._data._max_result_rows + 1
         if kind == "income":
             table, source = self._data._read(
                 route,
@@ -621,7 +608,6 @@ class FundamentalsReader:
                 ("symbol", "ascending"),
                 ("company_type", "ascending"),
             ),
-            limit=limit,
             sources=(source,),
         )
 
@@ -634,12 +620,10 @@ class FundamentalsReader:
         periods: int | None = None,
         fields: Sequence[str] | None = None,
         order: Literal["asc", "desc"] = "desc",
-        limit: int | None = None,
     ) -> QueryResult:
         report_start, report_end, periods = _report_range(report_start, report_end, periods)
         order = _order(order)
-        limit = _limit(limit, self._data._max_limit)
-        normalized_symbols = _symbols(symbols, limit)
+        normalized_symbols = _symbols(symbols)
         identity = ("symbol", "period_end", "visible_at", "announcement_date")
         selected, columns = _projection("fundamentals.indicators", identity, fields)
         table, source = self._data._read(
@@ -651,7 +635,7 @@ class FundamentalsReader:
                 report_end=report_end,
                 periods=periods,
                 order=order,
-                fetch_limit=limit + 1 if limit is not None else None,
+                fetch_limit=self._data._max_result_rows + 1,
                 columns=columns,
             ),
             columns=columns,
@@ -664,7 +648,6 @@ class FundamentalsReader:
                 ("period_end", "ascending" if order == "asc" else "descending"),
                 ("symbol", "ascending"),
             ),
-            limit=limit,
             sources=(source,),
         )
 
@@ -677,7 +660,6 @@ class FundamentalsReader:
         visible_end: datetime | None = None,
         fields: Sequence[str] | None = None,
         order: Literal["asc", "desc"] = "asc",
-        limit: int | None = None,
     ) -> QueryResult:
         try:
             route = self._DISCLOSURES[kind]
@@ -685,11 +667,10 @@ class FundamentalsReader:
             raise ValueError(f"不支持的披露 kind: {kind!r}") from None
         start, end = _visible_range(visible_start, visible_end, self._data.as_of)
         order = _order(order)
-        limit = _limit(limit, self._data._max_limit)
-        normalized_symbols = _symbols(symbols, limit)
+        normalized_symbols = _symbols(symbols)
         identity = ("symbol", "visible_at", "period_end", "announcement_date")
         selected, columns = _projection(route, identity, fields)
-        fetch_limit = limit + 1 if limit is not None else None
+        fetch_limit = self._data._max_result_rows + 1
         if kind == "forecast":
             table, source = self._data._read(
                 route,
@@ -743,7 +724,6 @@ class FundamentalsReader:
                 ("period_end", "ascending"),
                 ("announcement_date", "ascending"),
             ),
-            limit=limit,
             sources=(source,),
         )
 
@@ -762,12 +742,10 @@ class CorporateActionsReader:
         visible_end: datetime | None = None,
         fields: Sequence[str] | None = None,
         order: Literal["asc", "desc"] = "asc",
-        limit: int | None = None,
     ) -> QueryResult:
         start, end = _visible_range(visible_start, visible_end, self._data.as_of)
         order = _order(order)
-        limit = _limit(limit, self._data._max_limit)
-        normalized_symbols = _symbols(symbols, limit)
+        normalized_symbols = _symbols(symbols)
         identity = (
             "symbol",
             "visible_at",
@@ -786,7 +764,7 @@ class CorporateActionsReader:
                 visible_start=start,
                 visible_end=end,
                 order=order,
-                fetch_limit=limit + 1 if limit is not None else None,
+                fetch_limit=self._data._max_result_rows + 1,
                 columns=columns,
             ),
             columns=columns,
@@ -805,7 +783,6 @@ class CorporateActionsReader:
                 ("div_proc", "ascending"),
                 ("implementation_ann_date", "ascending"),
             ),
-            limit=limit,
             sources=(source,),
         )
 
@@ -816,7 +793,6 @@ class CorporateActionsReader:
         start: date | None = None,
         end: date | None = None,
         order: Literal["asc", "desc"] = "asc",
-        limit: int | None = None,
     ) -> QueryResult:
         if start is not None:
             start = _plain_date(start, "start")
@@ -825,8 +801,7 @@ class CorporateActionsReader:
         if start is not None and end is not None:
             _range(start, end, "start", "end")
         order = _order(order)
-        limit = _limit(limit, self._data._max_limit)
-        normalized_symbols = _symbols(symbols, limit)
+        normalized_symbols = _symbols(symbols)
         table, source = self._data._read(
             "corporate_actions.adjustment_factors",
             query=lambda adapter: _tushare(adapter).adjustment_factors(
@@ -835,7 +810,7 @@ class CorporateActionsReader:
                 start=start,
                 end=end,
                 order=order,
-                fetch_limit=limit + 1 if limit is not None else None,
+                fetch_limit=self._data._max_result_rows + 1,
             ),
         )
         return self._data._result(
@@ -846,7 +821,6 @@ class CorporateActionsReader:
                 ("trade_date", "ascending" if order == "asc" else "descending"),
                 ("symbol", "ascending"),
             ),
-            limit=limit,
             sources=(source,),
         )
 
@@ -862,19 +836,17 @@ class ClassificationReader:
         *,
         symbols: Symbols,
         level: Literal[1, 2, 3] = 1,
-        limit: int | None = None,
     ) -> QueryResult:
         if isinstance(level, bool) or level not in {1, 2, 3}:
             raise ValueError("level 只允许 1、2、3")
-        limit = _limit(limit, self._data._max_limit)
-        normalized_symbols = _symbols(symbols, limit)
+        normalized_symbols = _symbols(symbols)
         table, source = self._data._read(
             "classification.industry",
             query=lambda adapter: _tushare(adapter).industry(
                 as_of=self._data.as_of,
                 symbols=normalized_symbols,
                 level=level,
-                fetch_limit=limit + 1 if limit is not None else None,
+                fetch_limit=self._data._max_result_rows + 1,
             ),
         )
         return self._data._result(
@@ -882,7 +854,6 @@ class ClassificationReader:
             identity=("symbol",),
             fields=("level", "industry_code", "industry_name"),
             sort=(("symbol", "ascending"),),
-            limit=limit,
             sources=(source,),
         )
 
@@ -901,7 +872,6 @@ class CalendarReader:
         exchange: str | None = None,
         fields: Sequence[str] | None = None,
         order: Literal["asc", "desc"] = "asc",
-        limit: int | None = None,
     ) -> QueryResult:
         start = _plain_date(start, "start")
         end = (
@@ -911,7 +881,6 @@ class CalendarReader:
         )
         _range(start, end, "start", "end")
         order = _order(order)
-        limit = _limit(limit, self._data._max_limit)
         identity = ("cal_date", "exchange")
         selected, columns = _projection("calendar.sessions", identity, fields)
         table, source = self._data._read(
@@ -922,7 +891,7 @@ class CalendarReader:
                 end=end,
                 exchange=_optional_code(exchange, "exchange"),
                 order=order,
-                fetch_limit=limit + 1 if limit is not None else None,
+                fetch_limit=self._data._max_result_rows + 1,
                 columns=columns,
             ),
             columns=columns,
@@ -935,7 +904,6 @@ class CalendarReader:
                 ("cal_date", "ascending" if order == "asc" else "descending"),
                 ("exchange", "ascending"),
             ),
-            limit=limit,
             sources=(source,),
         )
 
@@ -1006,10 +974,8 @@ def _projection(
     return selected, (*identity, *selected)
 
 
-def _symbols(symbols: Symbols, limit: int | None) -> tuple[str, ...] | None:
+def _symbols(symbols: Symbols) -> tuple[str, ...] | None:
     if symbols is ALL_SYMBOLS:
-        if limit is None:
-            raise ValueError("ALL_SYMBOLS 必须同时提供 limit")
         return None
     if isinstance(symbols, (str, bytes)) or not isinstance(symbols, Sequence):
         raise TypeError("symbols 必须是证券代码序列或 ALL_SYMBOLS")
@@ -1019,15 +985,6 @@ def _symbols(symbols: Symbols, limit: int | None) -> tuple[str, ...] | None:
     if len(values) != len(set(values)):
         raise ValueError("symbols 不能包含重复证券代码")
     return values
-
-
-def _limit(value: int | None, maximum: int) -> int | None:
-    if value is None:
-        return None
-    value = _positive_int(value, "limit")
-    if value > maximum:
-        raise ValueError(f"limit 不能超过 {maximum}")
-    return value
 
 
 def _positive_int(value: object, name: str) -> int:

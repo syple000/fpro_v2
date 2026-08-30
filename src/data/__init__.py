@@ -6,6 +6,7 @@ from data.errors import (
     DataAdapterError,
     DataCapabilityNotSupportedError,
     DataReaderError,
+    DataResultTooLargeError,
     DataSourceNotConfiguredError,
     DataSourceUnavailableError,
 )
@@ -20,6 +21,7 @@ __all__ = [
     "DataCatalog",
     "DataReader",
     "DataReaderError",
+    "DataResultTooLargeError",
     "DataSourceNotConfiguredError",
     "DataSourceUnavailableError",
     "DataView",

@@ -17,7 +17,7 @@ def run(
     qmt_dir: Path,
     as_of: datetime,
     symbol: str,
-    limit: int,
+    periods: int,
 ) -> tuple[QueryResult, QueryResult]:
     """通过公共 Reader 查询指定股票的现金流和当前行情。"""
     sources = SourceConfig(
@@ -32,14 +32,12 @@ def run(
         cashflow = data.fundamentals.statements(
             kind="cash_flow",
             symbols=(symbol,),
-            periods=limit,
+            periods=periods,
             fields=("free_cash_flow",),
-            limit=limit,
         )
         current = data.market.current(
             symbols=(symbol,),
             fields=("last",),
-            limit=limit,
         )
     return cashflow, current
 
@@ -56,17 +54,17 @@ def main() -> None:
         help="带时区的 PIT 时间，例如 2024-04-30T16:05:00+08:00",
     )
     parser.add_argument("--symbol", default="000001.SZ")
-    parser.add_argument("--limit", type=int, default=10)
+    parser.add_argument("--periods", type=int, default=10)
     arguments = parser.parse_args()
-    if arguments.limit < 1:
-        parser.error("--limit 必须大于等于 1")
+    if arguments.periods < 1:
+        parser.error("--periods 必须大于等于 1")
 
     cashflow, current = run(
         arguments.tushare_dir,
         arguments.qmt_dir,
         arguments.as_of,
         arguments.symbol,
-        arguments.limit,
+        arguments.periods,
     )
     print("Cashflow:")
     print(cashflow.to_pandas().to_string(index=False))

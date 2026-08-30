@@ -207,7 +207,6 @@ class QueryResult:
     table: pa.Table
     as_of: datetime
     sources: tuple[str, ...]
-    truncated: bool
 
     def to_pandas(self) -> pd.DataFrame:
         """显式转换为 pandas DataFrame。"""
