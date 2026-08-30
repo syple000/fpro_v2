@@ -11,6 +11,7 @@ import pytest
 
 from data import (
     ALL_SYMBOLS,
+    DataAdapter,
     DataCapability,
     DataCapabilityNotSupportedError,
     DataCatalog,
@@ -23,13 +24,14 @@ from data import (
 )
 from data.adapters import QmtAdapter, TushareAdapter
 from data.reader import (
+    _CAPABILITY_METHODS,
     CalendarReader,
     ClassificationReader,
     CorporateActionsReader,
     FundamentalsReader,
     MarketReader,
 )
-from models import CAPABILITY_SCHEMAS, CASH_FLOW_STATEMENT_SCHEMA
+from models import CAPABILITY_SCHEMAS, CASH_FLOW_STATEMENT_SCHEMA, DAILY_METRICS_SCHEMA
 from qmt_protocol import BarQuote, HistoryBar, SequencedQuote, TickQuote
 from qmt_receiver import QmtDataStore
 from tushare_data import TABLE_SCHEMAS, TushareDataStore
@@ -49,8 +51,35 @@ def _us(value: datetime) -> int:
     return int(value.timestamp() * 1_000_000)
 
 
+class _CustomDailyMetricsAdapter:
+    capabilities = frozenset({DataCapability.DAILY_METRICS})
+
+    def daily_metrics(
+        self,
+        *,
+        as_of: datetime,
+        symbols: tuple[str, ...] | None,
+        start: date,
+        end: date,
+        order: str,
+        fetch_limit: int | None,
+        columns: tuple[str, ...] | None = None,
+    ) -> pa.Table:
+        del as_of, symbols, start, end, order, fetch_limit
+        table = pa.Table.from_pylist(
+            [{"symbol": "000001.SZ", "trade_date": date(2024, 1, 2), "close": 10.0}],
+            schema=DAILY_METRICS_SCHEMA,
+        )
+        return table if columns is None else table.select(columns)
+
+
+class _IncompleteDailyMetricsAdapter:
+    capabilities = frozenset({DataCapability.DAILY_METRICS})
+
+
 def test_every_capability_has_a_platform_schema() -> None:
     assert set(CAPABILITY_SCHEMAS) == set(DataCapability)
+    assert set(_CAPABILITY_METHODS) == set(DataCapability)
     assert all(isinstance(schema, pa.Schema) for schema in CAPABILITY_SCHEMAS.values())
 
 
@@ -122,6 +151,39 @@ def test_reader_rejects_invalid_internal_result_limit(
             catalog,
             sources=SourceConfig(routes={}),
             max_result_rows=max_result_rows,  # type: ignore[arg-type]
+        )
+
+
+def test_reader_routes_injected_adapter_by_declared_capability(tmp_path: Path) -> None:
+    custom: DataAdapter = _CustomDailyMetricsAdapter()
+    with DataCatalog(tushare_root=tmp_path / "tushare", qmt_root=tmp_path / "qmt") as catalog:
+        reader = DataReader(
+            catalog,
+            sources=SourceConfig(routes={"market.daily_metrics": "custom"}),
+            adapters={"custom": custom},
+        )
+        result = reader.at(_as_of(2, 18)).market.daily_metrics(
+            symbols=("000001.SZ",),
+            start=date(2024, 1, 1),
+            fields=("close",),
+        )
+
+    assert result.sources == ("custom",)
+    assert result.table.to_pylist() == [
+        {"symbol": "000001.SZ", "trade_date": date(2024, 1, 2), "close": 10.0}
+    ]
+
+
+def test_reader_rejects_declared_capability_without_required_method(tmp_path: Path) -> None:
+    incomplete: DataAdapter = _IncompleteDailyMetricsAdapter()
+    with (
+        DataCatalog(tushare_root=tmp_path / "tushare", qmt_root=tmp_path / "qmt") as catalog,
+        pytest.raises(DataCapabilityNotSupportedError, match="缺少适配器方法.*daily_metrics"),
+    ):
+        DataReader(
+            catalog,
+            sources=SourceConfig(routes={"market.daily_metrics": "custom"}),
+            adapters={"custom": incomplete},
         )
 
 
@@ -274,7 +336,7 @@ def test_previous_session_returns_latest_open_day(tmp_path: Path) -> None:
     assert previous == date(2024, 1, 9)
 
 
-def test_market_status_projects_all_rows_and_enforces_internal_result_limit(
+def test_market_status_requires_explicit_symbols_and_enforces_internal_result_limit(
     tmp_path: Path,
 ) -> None:
     tushare_root = tmp_path / "tushare"
@@ -307,14 +369,19 @@ def test_market_status_projects_all_rows_and_enforces_internal_result_limit(
             DataReader(catalog, sources=config)
             .at(_as_of(2, 10))
             .market.status(
-                symbols=ALL_SYMBOLS,
+                symbols=("000001.SZ", "000002.SZ", "000003.SZ"),
                 fields=("up_limit",),
             )
         )
+        with pytest.raises(ValueError, match="暂不支持 ALL_SYMBOLS"):
+            DataReader(catalog, sources=config).at(_as_of(2, 10)).market.status(
+                symbols=ALL_SYMBOLS,
+                fields=("up_limit",),
+            )
         guarded = DataReader(catalog, sources=config, max_result_rows=2)
         with pytest.raises(DataResultTooLargeError, match="超过内部上限 2 行"):
             guarded.at(_as_of(2, 10)).market.status(
-                symbols=ALL_SYMBOLS,
+                symbols=("000001.SZ", "000002.SZ", "000003.SZ"),
                 fields=("up_limit",),
             )
 

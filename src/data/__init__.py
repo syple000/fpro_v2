@@ -10,12 +10,14 @@ from data.errors import (
     DataSourceNotConfiguredError,
     DataSourceUnavailableError,
 )
+from data.protocols import DataAdapter
 from data.reader import ALL_SYMBOLS, DataReader, DataView
 from models import DataCapability, QueryResult
 
 __all__ = [
     "ALL_SYMBOLS",
     "DataAdapterError",
+    "DataAdapter",
     "DataCapability",
     "DataCapabilityNotSupportedError",
     "DataCatalog",

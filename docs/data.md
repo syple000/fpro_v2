@@ -232,7 +232,7 @@ alpha 数据逐日解锁。策略只读取当前和历史 session；若要精确
   把 `history_bars`、`current_snapshot` 和基本面读取分开。
 
 本项目采用相同思路：公开接口按业务拆分，`DataReader` 出口统一为平台数据模型，底层由 PIT
-规则和 Tushare/QMT 内置适配器完成读取。
+规则和按 capability 注册的来源适配器完成读取。
 
 ```text
 策略 / 研究 / 回测 / 实盘
@@ -242,7 +242,8 @@ DataReader.at(as_of) -> DataView -> 平台统一 Schema
 PIT 规则 + SourceConfig 路由
           |
           ├── TushareAdapter
-          └── QmtAdapter
+          ├── QmtAdapter
+          └── injected DataAdapter
 ```
 
 不公开 `query("tushare_table", ...)` 形式的万能策略接口。策略不需要知道源表名、可见日期列、
@@ -277,15 +278,16 @@ Reader 在统一入口根据 `CAPABILITY_SCHEMAS` 校验字段名称、顺序、
 公共字段。新增供应商专属字段必须先提升为平台业务字段并更新 Schema 版本，不能只对某一个
 数据源开放。
 
-同一个公共请求在 Tushare/QMT 间切换后，返回的字段集合、类型、单位、排序和业务含义必须保持
+同一个公共请求在不同适配器间切换后，返回的字段集合、类型、单位、排序和业务含义必须保持
 不变；允许
 变化的只有来源本身提供的数值。`QueryResult.sources` 只用于平台审计和排障，不能改变公共表
 结构，也不能成为策略分支条件。
 
-### 内置数据源适配器
+### 数据源适配器
 
-当前只有 `TushareAdapter` 和 `QmtAdapter`。两者以固定 `source_id` 注册，并声明能够实现的逻辑
-能力，例如不复权日线、前复权日线、分钟线、实时行情或财务报表。适配器负责：
+内置来源是 `TushareAdapter` 和 `QmtAdapter`，也可以在创建 Reader 时通过
+`adapters={"source_id": adapter}` 注册额外来源。适配器遵守公开的 `DataAdapter` 最小协议，声明
+能够实现的逻辑能力，例如不复权日线、前复权日线、分钟线、实时行情或财务报表。适配器负责：
 
 - 将原生表、文件或实时消息转换为平台内部标准记录；
 - 提供该来源的 `visible_at` 规则；
@@ -294,7 +296,23 @@ Reader 在统一入口根据 `CAPABILITY_SCHEMAS` 校验字段名称、顺序、
 
 适配器直接返回符合平台 Schema 的 `pyarrow.Table`，最终 `QueryResult` 由 `DataReader` 构造。
 返回表包含该能力 Schema 规定的 PIT 字段和版本键；Reader 会严格校验字段、类型、顺序与
-可空性。等确实需要第三个数据源时，再从两个现有实现中提取公共扩展接口。
+可空性。Reader 不再按 `TushareAdapter/QmtAdapter` 具体类型分派，而是在构造时检查每条已配置
+路由声明的 capability 和对应显式方法。主要方法约定为：
+
+| capability | 适配器方法 |
+| --- | --- |
+| `market.daily_bars/intraday_bars/realtime_quotes` | `daily_bars()` / `intraday_bars()` / `current()` |
+| `market.daily_metrics/moneyflow` | `daily_metrics()` / `moneyflow()` |
+| `market.suspensions/price_limits/st_status` | `suspensions()` / `price_limits()` / `st_status()` |
+| 三张财务报表 | `statements(kind=...)` |
+| `fundamentals.indicators` | `financial_indicators()` |
+| 预告、快报和审计 | `disclosures(kind=...)` |
+| 分红、复权因子、行业 | `dividends()` / `adjustment_factors()` / `industry()` |
+| 交易日历 | `sessions()` 和 `previous_session()` |
+
+来源声明 capability 却缺少对应方法时，Reader 在构造阶段抛出
+`DataCapabilityNotSupportedError`，不会等到查询后才以属性错误失败。内置 `source_id` 不能被额外
+适配器覆盖，避免配置意外替换生产来源。
 
 ### 按逻辑数据集配置来源
 
@@ -365,6 +383,7 @@ with DataCatalog(
     reader = DataReader(
         catalog,
         max_result_rows=1_000_000,
+        # 可选：adapters={"vendor": VendorAdapter(catalog)},
         sources=SourceConfig(
             routes={
                 "market.daily_bars": "qmt",
@@ -419,7 +438,8 @@ Reader 提供不复权历史行情和当日 tick；Tushare 适配器在内部使
 所有复数查询都使用仅限关键字参数，并共享以下约束：
 
 - `symbols` 必须显式传入；空序列返回空结果，不解释为全市场；
-- 全市场必须显式传 `ALL_SYMBOLS`；结果仍受 Reader 内部安全上限保护；
+- 支持全市场的接口必须显式传 `ALL_SYMBOLS`；结果仍受 Reader 内部安全上限保护；
+- `market.status()` 在没有 PIT 股票池前不支持 `ALL_SYMBOLS`，必须显式传入证券列表；
 - 重复或格式错误的证券代码直接报错；
 - `fields=None` 表示该接口的全部公共字段；非空时只接受登记字段，不接受表达式或 SQL；
 - 业务时间的 `start/end` 和报告范围均为左闭右开 `[start, end)`；
@@ -519,6 +539,8 @@ status = data.market.status(
 
 每个 symbol 最多一行，固定按 `symbol ASC` 排序。Reader 内部组合三张 Tushare 表；缺少其中一张
 表的行保持对应状态未知，不能把缺失解释为 `False` 或普通股票。
+停牌和 ST 等状态表是稀疏表，不能用它们推导全市场股票集合。因此当前 `status()` 明确拒绝
+`ALL_SYMBOLS`；调用方应传入其 PIT 股票池，未来增加历史 `universe(as_of)` 后再由平台执行左连接。
 
 ### 日终指标和资金流
 
@@ -764,7 +786,7 @@ Reader 不把不同查询强行压进统一的 `AdapterRequest` 或无类型的 
 
 ```text
 market.bars(frequency="1d")
--> TushareAdapter.daily_bars(
+-> selected_adapter.daily_bars(
        as_of=...,
        symbols=...,
        start=...,
@@ -775,7 +797,8 @@ market.bars(frequency="1d")
    )
 
 fundamentals.statements(kind="cash_flow")
--> TushareAdapter.cash_flow_statements(
+-> selected_adapter.statements(
+       kind="cash_flow",
        as_of=...,
        symbols=...,
        report_start=...,
@@ -786,7 +809,7 @@ fundamentals.statements(kind="cash_flow")
    )
 ```
 
-不同能力只声明自己真正需要的参数。例如 Tushare 日线没有 `frequency` 参数，
+不同能力只声明自己真正需要的参数。例如日线适配器没有 `frequency` 参数，
 `previous_session()` 也不会通过 `sessions(open_only=True)` 复用入口。统一保留在有实际价值的
 边界：Adapter 返回 Arrow 表，Reader 按逻辑数据集校验平台 Schema 并包装为 `QueryResult`。
 
@@ -795,7 +818,7 @@ fundamentals.statements(kind="cash_flow")
 ```text
 根据请求解析主逻辑数据集
 -> 从 SourceConfig 解析主 source_id
--> 调用对应的 TushareAdapter 或 QmtAdapter
+-> 校验 capability 并调用对应来源的显式适配器方法
 -> 适配器按 symbols/业务范围读取候选数据
 -> 过滤 visible_at <= as_of
 -> 在业务键内选择最新可见版本
@@ -825,7 +848,7 @@ fundamentals.statements(kind="cash_flow")
 此外至少验证：
 
 - 同一个时间视图的所有公共方法使用同一个 `as_of`；
-- 每个逻辑数据集都能独立绑定当前支持的 Tushare 或 QMT，组合查询只读取本次需要的路由；
+- 每个逻辑数据集都能独立绑定内置或注入的适配器，组合查询只读取本次需要的路由；
 - 路由未配置、能力不支持、来源不可用和合法空结果分别产生约定的不同结果；
 - 同一公共请求切换 Tushare/QMT 后，结果 Schema、类型、单位和排序完全一致；
 - Tushare 前复权只使用 `as_of` 时可见的因子，QMT 在缺少因子可见性元数据时明确拒绝前复权；

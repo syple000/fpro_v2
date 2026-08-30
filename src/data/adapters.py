@@ -730,6 +730,41 @@ class TushareAdapter:
         """
         return _fetch(self._connection, query, params, ST_STATUS_SCHEMA, columns)
 
+    def statements(
+        self,
+        *,
+        kind: Literal["income", "balance_sheet", "cash_flow"],
+        as_of: datetime,
+        symbols: tuple[str, ...] | None,
+        report_start: date | None,
+        report_end: date | None,
+        company_type: str | None,
+        periods: int | None,
+        order: Literal["asc", "desc"],
+        fetch_limit: int | None,
+        columns: tuple[str, ...] | None = None,
+    ) -> pa.Table:
+        """按平台报表种类分派到 Tushare 的对应原始表。"""
+        if kind == "income":
+            method = self.income_statements
+        elif kind == "balance_sheet":
+            method = self.balance_sheets
+        elif kind == "cash_flow":
+            method = self.cash_flow_statements
+        else:
+            raise DataCapabilityNotSupportedError(f"Tushare 不支持财报种类 {kind!r}")
+        return method(
+            as_of=as_of,
+            symbols=symbols,
+            report_start=report_start,
+            report_end=report_end,
+            company_type=company_type,
+            periods=periods,
+            order=order,
+            fetch_limit=fetch_limit,
+            columns=columns,
+        )
+
     def income_statements(
         self,
         *,
@@ -972,6 +1007,37 @@ class TushareAdapter:
             params,
             FINANCIAL_INDICATOR_SCHEMA,
             columns,
+        )
+
+    def disclosures(
+        self,
+        *,
+        kind: Literal["forecast", "express", "audit"],
+        as_of: datetime,
+        symbols: tuple[str, ...] | None,
+        visible_start: datetime | None,
+        visible_end: datetime,
+        order: Literal["asc", "desc"],
+        fetch_limit: int | None,
+        columns: tuple[str, ...] | None = None,
+    ) -> pa.Table:
+        """按平台披露种类分派到 Tushare 的对应原始表。"""
+        if kind == "forecast":
+            method = self.forecasts
+        elif kind == "express":
+            method = self.express_reports
+        elif kind == "audit":
+            method = self.audit_reports
+        else:
+            raise DataCapabilityNotSupportedError(f"Tushare 不支持披露种类 {kind!r}")
+        return method(
+            as_of=as_of,
+            symbols=symbols,
+            visible_start=visible_start,
+            visible_end=visible_end,
+            order=order,
+            fetch_limit=fetch_limit,
+            columns=columns,
         )
 
     def forecasts(
