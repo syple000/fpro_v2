@@ -839,6 +839,29 @@ fundamentals.statements(kind="cash_flow")
 `catalog.connection` 或数据源客户端。运行期间需要加载新 Manifest 时由外围流程显式调用
 `catalog.refresh()`。
 
+## 全接口冒烟测试
+
+`data-test` 会以一个 symbol 调用 Reader 的全部公共查询方法。`bars()` 使用 Tushare 日线，
+`current()` 使用 QMT 实时事件（QMT 无数据时落空 CSV）；`statements()` 和 `disclosures()` 会覆盖
+所有 kind，其他方法各调用一次。每个查询结果写成独立 CSV，上一交易日也单独落盘，并生成记录
+参数、字段、来源和行数的 `manifest.json`。Tushare 当前没有分钟线能力，因此不额外调用同一个
+`bars()` 的分钟周期分支：
+
+```bash
+uv run data-test \
+  --tushare-dir data/tushare \
+  --qmt-dir data/qmt \
+  --output-dir data/test/data_reader \
+  --symbol 000001.SZ \
+  --periods 10 \
+  --lookback-days 365 \
+  --exchange SSE
+```
+
+`--as-of` 默认为当前上海时间；需要复现历史结果时应显式传入带时区时间。默认输出目录是
+`data/test/data_reader`，重复运行会覆盖同名测试结果文件。单个查询失败不会阻止后续方法继续
+执行；失败项写入 manifest 的 `errors`，删除对应的旧 CSV，并使命令最终返回非零状态。
+
 ## 验收条件
 
 最重要的性质是：
