@@ -4,10 +4,12 @@
 `qmt_receiver.sync_all(..., force=True)` 强制下载并落地样本股票，然后完成三类比较：
 
 - QMT 不复权日线与 Tushare `daily`；
-- QMT 等比前复权（`front_ratio`）日线与
-  `daily × adj_factor / 区间末最新 adj_factor`；
 - QMT 财务表与 Tushare `income`、`balancesheet`、`cashflow`、`fina_indicator` 的同义字段；
 - QMT 除权事件与 Tushare 已实施分红的税前现金分红、送股和转增比例。
+
+若目录中另外存在旧的 QMT `front_ratio` 分区，复核器仍可把它与
+`daily × adj_factor / 区间末最新 adj_factor` 比较；该结果只用于供应商口径复核，不代表数据
+满足 Reader 的严格 PIT 前复权语义。
 
 QMT 与 Tushare 的股票日线成交量都以手为单位；QMT 用整数手、Tushare 可保留不足一手的
 小数，因此允许半手取整误差。QMT 成交额按元转换为 Tushare 的千元。前复权价格允许半分

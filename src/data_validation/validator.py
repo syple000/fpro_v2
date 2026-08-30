@@ -301,6 +301,7 @@ def compare_daily(
 
     tushare = {(row["ts_code"], row["trade_date"]): row for row in tushare_rows}
     qmt = {(row["code"], row["trade_date"], row["adjustment"]): row for row in qmt_rows}
+    has_front_ratio = any(adjustment == "front_ratio" for _, _, adjustment in qmt)
     factors = {(row["ts_code"], row["trade_date"]): row["adj_factor"] for row in factor_rows}
     latest_factors: dict[str, tuple[date, float]] = {}
     for row in factor_rows:
@@ -342,23 +343,24 @@ def compare_daily(
                 _scaled(none_row["amount"], 1_000),
             )
 
-        factor = factors.get(key)
-        latest = latest_factors.get(key[0])
-        if ts_row is None or front_row is None or factor is None or latest is None:
-            differences.append(_missing("daily_front", key, ts_row, front_row))
-            continue
-        for field in ("open", "high", "low", "close"):
-            expected = _scaled_product(ts_row[field], factor, latest[1])
-            compared += _compare(
-                differences,
-                "daily_front",
-                key,
-                field,
-                expected,
-                front_row[field],
-                rtol=1e-5,
-                atol=0.005001,
-            )
+        if has_front_ratio:
+            factor = factors.get(key)
+            latest = latest_factors.get(key[0])
+            if ts_row is None or front_row is None or factor is None or latest is None:
+                differences.append(_missing("daily_front", key, ts_row, front_row))
+                continue
+            for field in ("open", "high", "low", "close"):
+                expected = _scaled_product(ts_row[field], factor, latest[1])
+                compared += _compare(
+                    differences,
+                    "daily_front",
+                    key,
+                    field,
+                    expected,
+                    front_row[field],
+                    rtol=1e-5,
+                    atol=0.005001,
+                )
     return CheckResult("daily", compared, tuple(differences))
 
 

@@ -39,6 +39,8 @@ from models import (
 )
 
 _TZ = "Asia/Shanghai"
+_CALENDAR_COVERAGE_ERROR = "__FPRO_CALENDAR_COVERAGE_ERROR__"
+_SUSPENSION_TIMING_ERROR = "__FPRO_SUSPENSION_TIMING_ERROR__"
 _FORWARD_BAR_SCHEMA = pa.schema(
     [*BAR_SCHEMA, pa.field("__invalid_factor", pa.bool_(), nullable=False)]
 )
@@ -132,7 +134,7 @@ _BALANCE_SHEET_SOURCE_FIELDS = {
     "special_reserve": "special_rese",
     "retained_earnings": "undistr_porfit",
     "treasury_stock": "treasury_share",
-    "cash_and_cash_equivalents": "money_cap",
+    "monetary_funds": "money_cap",
     "trading_financial_assets": "trad_asset",
     "derivative_financial_assets": "deriv_assets",
     "notes_receivable": "notes_receiv",
@@ -623,48 +625,56 @@ class TushareAdapter:
             fetch_limit=fetch_limit,
         )
         query = f"""
-            WITH suspensions AS (
-                SELECT *,
-                       timezone(
-                           '{_TZ}',
-                           CAST(trade_date AS DATE) + CAST(try_strptime(
-                               regexp_extract(
-                                   suspend_timing,
-                                   '([0-2][0-9]:[0-5][0-9])',
-                                   1
-                               ),
-                               '%H:%M'
-                           ) AS TIME)
-                       ) AS interval_start,
-                       timezone(
-                           '{_TZ}',
-                           CAST(trade_date AS DATE) + CAST(try_strptime(
-                               regexp_extract(
-                                   suspend_timing,
-                                   '[0-2][0-9]:[0-5][0-9][^0-2]*([0-2][0-9]:[0-5][0-9])',
-                                   1
-                               ),
-                               '%H:%M'
-                           ) AS TIME)
-                       ) AS interval_end
+            WITH source AS MATERIALIZED (
+                SELECT *
                 FROM tushare.suspend_d
+                WHERE trade_date = $trade_date
+                  AND ($symbols IS NULL OR ts_code IN (SELECT unnest($symbols)))
+            ), suspensions AS (
+                SELECT *,
+                       CASE WHEN suspend_timing IS NOT NULL THEN coalesce(
+                           timezone(
+                               '{_TZ}',
+                               CAST(trade_date AS DATE) + CAST(try_strptime(
+                                   regexp_extract(
+                                       suspend_timing,
+                                       '([0-2][0-9]:[0-5][0-9])',
+                                       1
+                                   ),
+                                   '%H:%M'
+                               ) AS TIME)
+                           ),
+                           CAST(error('{_SUSPENSION_TIMING_ERROR}') AS TIMESTAMPTZ)
+                       ) END AS interval_start,
+                       CASE WHEN suspend_timing IS NOT NULL THEN coalesce(
+                           timezone(
+                               '{_TZ}',
+                               CAST(trade_date AS DATE) + CAST(try_strptime(
+                                   regexp_extract(
+                                       suspend_timing,
+                                       '[0-2][0-9]:[0-5][0-9][^0-2]*([0-2][0-9]:[0-5][0-9])',
+                                       1
+                                   ),
+                                   '%H:%M'
+                               ) AS TIME)
+                           ),
+                           CAST(error('{_SUSPENSION_TIMING_ERROR}') AS TIMESTAMPTZ)
+                       ) END AS interval_end
+                FROM source
             )
             SELECT ts_code AS symbol,
                    CASE
-                       WHEN suspend_type = 'S'
-                            AND (suspend_timing IS NULL OR interval_end > $as_of)
-                           THEN TRUE
-                       WHEN suspend_type = 'R' THEN FALSE
+                       WHEN suspend_type = 'S' AND suspend_timing IS NULL THEN TRUE
+                       WHEN suspend_type = 'S' AND interval_end > $as_of THEN TRUE
+                       WHEN suspend_type IN ('S', 'R') THEN FALSE
                    END AS suspended
             FROM suspensions
-            WHERE trade_date = $trade_date
-              AND (
+            WHERE (
                   (suspend_timing IS NULL AND {_day_time("trade_date", "09:25")} <= $as_of)
                   OR (suspend_timing IS NOT NULL AND interval_start <= $as_of)
               )
-              AND ($symbols IS NULL OR ts_code IN (SELECT unnest($symbols)))
             QUALIFY row_number() OVER (
-                PARTITION BY ts_code ORDER BY suspend_timing DESC NULLS LAST, suspend_type
+                PARTITION BY ts_code ORDER BY interval_start DESC NULLS LAST, suspend_type
             ) = 1
             ORDER BY symbol
             LIMIT $fetch_limit
@@ -854,7 +864,7 @@ class TushareAdapter:
                 FROM tushare.{table}
                 WHERE end_date IS NOT NULL
                   AND f_ann_date IS NOT NULL
-                  AND report_type = '1'
+                  AND report_type IN ('1', '4')
                   AND ($symbols IS NULL OR ts_code IN (SELECT unnest($symbols)))
                   AND ($start IS NULL OR end_date >= $start)
                   AND ($end IS NULL OR end_date < $end)
@@ -866,8 +876,15 @@ class TushareAdapter:
                     PARTITION BY ts_code, end_date, comp_type
                     ORDER BY f_ann_date DESC NULLS LAST,
                              ann_date DESC NULLS LAST,
+                             CASE report_type WHEN '4' THEN 1 ELSE 2 END,
                              try_cast(update_flag AS INTEGER) DESC NULLS LAST
                 ) = 1
+            ), ranked AS (
+                SELECT *,
+                       dense_rank() OVER (
+                           PARTITION BY ts_code ORDER BY end_date DESC
+                       ) AS period_rank
+                FROM latest
             )
             SELECT ts_code AS symbol,
                    end_date AS period_end,
@@ -881,11 +898,9 @@ class TushareAdapter:
                        WHEN '4' THEN 'securities'
                    END AS company_type,
                    {select_fields}
-            FROM latest
-            WHERE $company_type IS NULL OR comp_type = $company_type
-            QUALIFY $periods IS NULL OR dense_rank() OVER (
-                PARTITION BY ts_code ORDER BY end_date DESC
-            ) <= $periods
+            FROM ranked
+            WHERE ($periods IS NULL OR period_rank <= $periods)
+              AND ($company_type IS NULL OR comp_type = $company_type)
             ORDER BY period_end {direction}, symbol, company_type
             LIMIT $fetch_limit
         """
@@ -1304,12 +1319,14 @@ class QmtAdapter:
         fetch_limit: int | None,
         columns: tuple[str, ...] | None = None,
     ) -> pa.Table:
-        qmt_adjustments = ("none",) if adjustment == "none" else ("front_ratio", "front")
+        if adjustment == "forward":
+            raise DataCapabilityNotSupportedError(
+                "QMT 历史复权行情缺少 PIT 因子可见性，暂不支持 adjustment='forward'"
+            )
         direction = _sql_direction(order, default="asc")
         if count is None:
             assert start is not None
             params = _query_parameters(
-                adjustments=qmt_adjustments,
                 as_of=as_of,
                 as_of_date=as_of.date(),
                 symbols=symbols,
@@ -1320,31 +1337,19 @@ class QmtAdapter:
                 fetch_limit=fetch_limit,
             )
             query = f"""
-                WITH source_bars AS (
-                    SELECT *
-                    FROM qmt.daily
-                    WHERE adjustment IN (SELECT unnest($adjustments))
-                      AND trade_date <= $as_of_date
-                      AND trade_date >= $start_date
-                      AND trade_date <= $end_date
-                      AND ($symbols IS NULL OR code IN (SELECT unnest($symbols)))
-                    QUALIFY row_number() OVER (
-                        PARTITION BY code, trade_date
-                        ORDER BY CASE adjustment
-                            WHEN 'front_ratio' THEN 1
-                            WHEN 'front' THEN 2
-                            ELSE 3
-                        END
-                    ) = 1
-                )
                 SELECT code AS symbol,
                        {_day_time("trade_date", "09:30")} AS interval_start,
                        {_day_time("trade_date", "15:00")} AS interval_end,
                        open, high, low, close, preClose AS pre_close,
                        {_qmt_share_volume("volume")} AS volume,
                        amount
-                FROM source_bars
-                WHERE {_day_time("trade_date", "16:05")} <= $as_of
+                FROM qmt.daily
+                WHERE adjustment = 'none'
+                  AND trade_date <= $as_of_date
+                  AND trade_date >= $start_date
+                  AND trade_date <= $end_date
+                  AND ($symbols IS NULL OR code IN (SELECT unnest($symbols)))
+                  AND {_day_time("trade_date", "16:05")} <= $as_of
                   AND {_day_time("trade_date", "09:30")} >= $start
                   AND {_day_time("trade_date", "09:30")} < $end
                 ORDER BY interval_end {direction}, symbol, interval_start {direction}
@@ -1354,7 +1359,6 @@ class QmtAdapter:
             if symbols is not None:
                 fetch_limit = None
             params = _query_parameters(
-                adjustments=qmt_adjustments,
                 as_of=as_of,
                 as_of_date=as_of.date(),
                 symbols=symbols,
@@ -1362,29 +1366,17 @@ class QmtAdapter:
                 fetch_limit=fetch_limit,
             )
             query = f"""
-                WITH source_bars AS (
-                    SELECT *
-                    FROM qmt.daily
-                    WHERE adjustment IN (SELECT unnest($adjustments))
-                      AND trade_date <= $as_of_date
-                      AND ($symbols IS NULL OR code IN (SELECT unnest($symbols)))
-                    QUALIFY row_number() OVER (
-                        PARTITION BY code, trade_date
-                        ORDER BY CASE adjustment
-                            WHEN 'front_ratio' THEN 1
-                            WHEN 'front' THEN 2
-                            ELSE 3
-                        END
-                    ) = 1
-                )
                 SELECT code AS symbol,
                        {_day_time("trade_date", "09:30")} AS interval_start,
                        {_day_time("trade_date", "15:00")} AS interval_end,
                        open, high, low, close, preClose AS pre_close,
                        {_qmt_share_volume("volume")} AS volume,
                        amount
-                FROM source_bars
-                WHERE {_day_time("trade_date", "16:05")} <= $as_of
+                FROM qmt.daily
+                WHERE adjustment = 'none'
+                  AND trade_date <= $as_of_date
+                  AND ($symbols IS NULL OR code IN (SELECT unnest($symbols)))
+                  AND {_day_time("trade_date", "16:05")} <= $as_of
                 QUALIFY row_number() OVER (
                     PARTITION BY code ORDER BY trade_date DESC
                 ) <= $count
@@ -1416,10 +1408,14 @@ class QmtAdapter:
         }.get(frequency)
         if period is None:
             raise DataCapabilityNotSupportedError(f"QMT 不支持分钟周期 {frequency!r}")
+        if adjustment == "forward":
+            raise DataCapabilityNotSupportedError(
+                "QMT 历史复权行情缺少 PIT 因子可见性，暂不支持 adjustment='forward'"
+            )
         qmt_period, minutes = period
         start_expr = _epoch_time("event_time")
         end_expr = f"{start_expr} + INTERVAL '{minutes} minutes'"
-        qmt_adjustment = "none" if adjustment == "none" else "front_ratio"
+        qmt_adjustment = "none"
         direction = _sql_direction(order, default="asc")
         if count is not None and symbols is not None:
             fetch_limit = None
@@ -1428,7 +1424,6 @@ class QmtAdapter:
         params = _query_parameters(
             period=qmt_period,
             adjustment=qmt_adjustment,
-            include_live=qmt_adjustment == "none",
             as_of=as_of,
             as_of_date=as_of.date(),
             as_of_us=as_of_us,
@@ -1473,8 +1468,7 @@ class QmtAdapter:
                        received_at,
                        seq
                 FROM qmt.bars
-                WHERE $include_live
-                  AND period = $period
+                WHERE period = $period
                   AND trading_date <= $as_of_date
                   AND ($symbols IS NULL OR code IN (SELECT unnest($symbols)))
                   AND ($start_date IS NULL OR trading_date >= $start_date)
@@ -1535,49 +1529,23 @@ class QmtAdapter:
             fetch_limit=fetch_limit,
         )
         query = f"""
-            WITH candidates AS (
-                SELECT code AS symbol,
-                       event_time,
-                       received_at,
-                       seq,
-                       quote.open AS open,
-                       quote.high AS high,
-                       quote.low AS low,
-                       quote.lastPrice AS last,
-                       quote.lastClose AS pre_close,
-                       {_qmt_share_volume("quote.volume", "quote.pvolume")} AS volume,
-                       quote.amount AS amount
-                FROM qmt.ticks
-                WHERE trading_date <= $as_of_date
-                  AND received_at <= $as_of_us
-                  AND ($symbols IS NULL OR code IN (SELECT unnest($symbols)))
-
-                UNION ALL
-
-                SELECT code AS symbol,
-                       event_time,
-                       received_at,
-                       seq,
-                       quote.open AS open,
-                       quote.high AS high,
-                       quote.low AS low,
-                       quote.close AS last,
-                       quote.preClose AS pre_close,
-                       {_qmt_share_volume("quote.volume")} AS volume,
-                       quote.amount AS amount
-                FROM qmt.bars
-                WHERE trading_date <= $as_of_date
-                  AND received_at <= $as_of_us
-                  AND ($symbols IS NULL OR code IN (SELECT unnest($symbols)))
-            )
-            SELECT symbol,
+            SELECT code AS symbol,
                    {_epoch_time("event_time")} AS event_time,
-                   open, high, low, last, pre_close, volume, amount
-            FROM candidates
+                   quote.open AS open,
+                   quote.high AS high,
+                   quote.low AS low,
+                   quote.lastPrice AS last,
+                   quote.lastClose AS pre_close,
+                   {_qmt_share_volume("quote.volume", "quote.pvolume")} AS volume,
+                   quote.amount AS amount
+            FROM qmt.ticks
+            WHERE trading_date = $as_of_date
+              AND received_at <= $as_of_us
+              AND ($symbols IS NULL OR code IN (SELECT unnest($symbols)))
             QUALIFY row_number() OVER (
-                PARTITION BY symbol ORDER BY received_at DESC, seq DESC
+                PARTITION BY code ORDER BY received_at DESC, seq DESC
             ) = 1
-            ORDER BY symbol
+            ORDER BY code
             LIMIT $fetch_limit
         """
         return _fetch(self._connection, query, params, CURRENT_SCHEMA, columns)
@@ -1603,6 +1571,11 @@ def _fetch(
     try:
         table = connection.execute(query, params).to_arrow_table()
     except duckdb.Error as exc:
+        message = str(exc)
+        if _CALENDAR_COVERAGE_ERROR in message:
+            raise DataSourceUnavailableError("交易日历未覆盖计算可见时间所需的下一交易日") from exc
+        if _SUSPENSION_TIMING_ERROR in message:
+            raise DataSourceUnavailableError("Tushare 停牌时段格式无效") from exc
         raise DataSourceUnavailableError("读取已发布数据失败") from exc
     return _coerce_schema(table, output_schema) if output_schema is not None else table
 
@@ -1664,11 +1637,10 @@ def _epoch_time(column: str) -> str:
 
 
 def _next_session_time(column: str) -> str:
-    # 已发布日历优先；空日历时只退化为工作日，便于读取尚未同步日历的轻量数据集。
-    fallback = f"{column} + CASE dayofweek({column}) WHEN 5 THEN 3 WHEN 6 THEN 2 ELSE 1 END"
     next_date = (
         "coalesce((SELECT min(cal_date) FROM data_internal.trade_cal "
-        f"WHERE is_open = 1 AND cal_date > {column}), {fallback})"
+        f"WHERE is_open = 1 AND cal_date > {column}), "
+        f"CAST(error('{_CALENDAR_COVERAGE_ERROR}') AS DATE))"
     )
     return f"timezone('{_TZ}', CAST({next_date} AS DATE) + TIME '09:25')"
 

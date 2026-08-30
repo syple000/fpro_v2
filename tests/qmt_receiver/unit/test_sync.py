@@ -147,15 +147,15 @@ def test_sync_all_downloads_and_writes_all_sources(tmp_path: Path) -> None:
             "SELECT code, ex_date, interest, stockBonus, stockGift, dr FROM qmt.dividend_factors"
         ).fetchone()
 
-    assert result.daily_rows == 2
-    assert result.intraday_rows == 2
+    assert result.daily_rows == 1
+    assert result.intraday_rows == 1
     assert result.financial_rows == 1
     assert result.dividend_factor_rows == 1
     assert client.history_modes == ["incremental", "incremental"]
     assert client.history_periods == ["1d", "1m"]
-    assert client.adjustments == ["none", "front_ratio", "none", "front_ratio"]
-    assert daily == [("front_ratio", 8.0), ("none", 10.0)]
-    assert intraday == [("1m", "front_ratio", 8.0), ("1m", "none", 10.0)]
+    assert client.adjustments == ["none", "none"]
+    assert daily == [("none", 10.0)]
+    assert intraday == [("1m", "none", 10.0)]
     assert financial is not None
     assert dividend is not None
     assert financial[:2] == ("000001.SZ", "Balance")
@@ -183,7 +183,7 @@ def test_sync_all_force_uses_full_history_download(tmp_path: Path) -> None:
     assert client.history_periods == ["1d", "1m"]
 
 
-def test_sync_intraday_downloads_native_front_ratio(tmp_path: Path) -> None:
+def test_sync_intraday_persists_only_raw_bars(tmp_path: Path) -> None:
     client = FakeSyncClient()
     qmt_root = tmp_path / "qmt"
     with QmtDataStore(qmt_root) as store:
@@ -201,8 +201,8 @@ def test_sync_intraday_downloads_native_front_ratio(tmp_path: Path) -> None:
             "SELECT period, adjustment, close FROM qmt.intraday ORDER BY adjustment"
         ).fetchall()
 
-    assert rows == 2
+    assert rows == 1
     assert client.history_modes == ["incremental"]
     assert client.history_periods == ["1m"]
-    assert client.adjustments == ["none", "front_ratio"]
-    assert bars == [("1m", "front_ratio", 8.0), ("1m", "none", 10.0)]
+    assert client.adjustments == ["none"]
+    assert bars == [("1m", "none", 10.0)]

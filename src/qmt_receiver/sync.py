@@ -94,7 +94,7 @@ def sync_daily(
     *,
     force: bool = False,
 ) -> int:
-    """同步等比前复权和不复权日线；force 时覆盖下载已有历史。"""
+    """同步不复权日线；force 时覆盖下载已有历史。"""
     client.download_history(
         stocks,
         period="1d",
@@ -102,19 +102,16 @@ def sync_daily(
         end_time=end_time,
         mode="full" if force else "incremental",
     )
-    rows = 0
-    for adjustment in ("none", "front_ratio"):
-        response = client.query_history(
-            stocks,
-            fields=DAILY_FIELDS,
-            period="1d",
-            start_time=start_time,
-            end_time=end_time,
-            dividend_type=adjustment,
-            fill_data=False,
-        )
-        rows += store.write_daily(response.data, adjustment)
-    return rows
+    response = client.query_history(
+        stocks,
+        fields=DAILY_FIELDS,
+        period="1d",
+        start_time=start_time,
+        end_time=end_time,
+        dividend_type="none",
+        fill_data=False,
+    )
+    return store.write_daily(response.data, "none")
 
 
 def sync_intraday(
@@ -127,7 +124,7 @@ def sync_intraday(
     period: XtDataPeriod,
     force: bool = False,
 ) -> int:
-    """同步 QMT 原生不复权和等比前复权历史分钟线。"""
+    """同步 QMT 原生不复权历史分钟线。"""
     if period not in _INTRADAY_PERIODS:
         raise ValueError(f"分钟线不支持周期 {period!r}")
     client.download_history(
@@ -137,19 +134,16 @@ def sync_intraday(
         end_time=end_time,
         mode="full" if force else "incremental",
     )
-    rows = 0
-    for adjustment in ("none", "front_ratio"):
-        response = client.query_history(
-            stocks,
-            fields=DAILY_FIELDS,
-            period=period,
-            start_time=start_time,
-            end_time=end_time,
-            dividend_type=adjustment,
-            fill_data=False,
-        )
-        rows += store.write_intraday(response.data, period, adjustment)
-    return rows
+    response = client.query_history(
+        stocks,
+        fields=DAILY_FIELDS,
+        period=period,
+        start_time=start_time,
+        end_time=end_time,
+        dividend_type="none",
+        fill_data=False,
+    )
+    return store.write_intraday(response.data, period, "none")
 
 
 def sync_financial(

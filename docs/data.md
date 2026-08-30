@@ -64,6 +64,8 @@ DAILY_BASIC_READY 17:05
 各自在适配器中实现明确的可见时间规则。
 
 `next_session(D)` 表示严格晚于 D 的第一个交易日。周五公告的数据通常从下周一 09:25 可见。
+该计算必须命中已发布交易日历；空日历或日历覆盖止于 D 时不回退为“下一个工作日”，而是抛出
+`DataSourceUnavailableError`，避免把节假日误当成交易日。
 
 ## 内置数据源的可见约束
 
@@ -113,7 +115,8 @@ D 表示记录的 `trade_date`、公告日期或生效日期。可见日期为�
 ### 停牌、涨跌停和缺失行情
 
 停牌不是下一交易日才知道：D 日全日停牌在 D 日盘前可见，撮合器在 D 日禁止成交。日内停牌
-只有到停牌开始后才对策略可见。
+只有到停牌开始后才对策略可见；已知停牌区间结束后返回 `False`。非空但无法解析的停牌时段是
+源数据错误，不能静默返回未知状态。
 
 策略读取当前状态，而不是整张原始停牌表：
 
@@ -137,8 +140,11 @@ Tushare 财务数据大多只有公告日期，没有精确发布时间。因此
 
 ```text
 先过滤 visible_at <= as_of
-适配器在 Tushare 原始表中筛选合并口径，再按 ts_code、end_date、comp_type 选择最新版本
+适配器在 Tushare 原始表中保留普通合并报表（report_type=1）和调整后合并报表（report_type=4）
+排除调整前历史版本（report_type=5），再按 ts_code、end_date、comp_type 选择最新版本
 ```
+
+相同公告日期下优先调整后合并报表。
 
 不能先选择今天看到的最终版本，再向过去过滤。需要统一计算口径的重要财务因子从 PIT 三张
 报表计算；需要 Tushare 指标口径时直接使用 `fina_indicator`。
@@ -160,9 +166,11 @@ adjusted_price(t) = raw_price(t) * factor(t) / anchor_factor(as_of)
 日线、当日因子和锚点因子在同一条 DuckDB 查询中完成关联，不生成中间 Arrow 表；任何行情缺少
 当日因子、锚点因子或锚点为零时，整次查询明确失败。
 
-QMT 适配器直接选择同步时由 QMT 返回的 `front_ratio` 日线或分钟线，不自行重复计算。为兼容
-已有 QMT 日线数据，日线也识别旧的 `front` 标记；两者同时存在时明确优先
-`front_ratio`，不会返回重复交易日。分钟存储只接受 `front_ratio`。
+QMT 原生 `front/front_ratio` 的价格锚点取决于查询区间，但当前历史表没有记录锚点、因子版本或
+因子的历史可见时间，因此不能满足上述 PIT 语义。QMT 同步只新增 `adjustment="none"` 的原始
+行情；已有 `front/front_ratio` 分区可保留用于离线复核，但 Reader 不读取它们，QMT 路由收到
+`adjustment="forward"` 时明确抛出 `DataCapabilityNotSupportedError`。只有在存储补齐原始价格、
+因子、因子生效日和可见时间后，才能重新启用 QMT 前复权。
 Reader 只把 `adjustment` 语义传给当前行情适配器，不读取因子、不拼接数据源，也不要求配置
 `corporate_actions.adjustment_factors` 路由。
 适配器必须把结果归一到平台 bar Schema：只调整 OHLC 和前收盘价，
@@ -176,7 +184,8 @@ Reader 只把 `adjustment` 语义传给当前行情适配器，不读取因子�
 
 交易日历用于驱动回测 session、处理节假日并计算 `next_session`，属于引擎配置，不作为普通
 alpha 数据逐日解锁。策略只读取当前和历史 session；若要精确还原临时休市变更，需要另存
-日历公告时间和版本。
+日历公告时间和版本。凡是查询需要计算 `next_session`，日历必须至少覆盖到相关日期之后的第一
+个开市日；覆盖不足属于来源不可用，不使用工作日近似。
 
 ## 已发布数据使用前提
 
@@ -235,7 +244,7 @@ PIT 规则 + SourceConfig 路由
 
 `DataReader` 是数据抽象的唯一出口。源数据在进入 Reader 结果前必须转换为平台定义的公共
 Schema；供应商原生结构不能穿透这个边界。例如 Tushare 的 `ts_code`、QMT 的 `code`、
-`front_ratio` 标记和嵌套 `quote` 都由适配器消化，策略只看到平台的
+复权标记和嵌套 `quote` 都由适配器边界处理，策略只看到平台的
 `symbol/interval_start/interval_end/open/high/low/close/volume/amount` 等字段。
 
 平台模型统一规定：
@@ -314,15 +323,15 @@ Reader 创建时校验所有已配置的 `source_id` 是否注册并支持对应
 - 请求依赖的路由未配置：抛出 `DataSourceNotConfiguredError`；
 - 路由已配置，但适配器不支持请求能力且平台也无法用已配置依赖完成派生：抛出
   `DataCapabilityNotSupportedError`；
-- 已发布数据的存储当前不可访问：抛出
+- 已发布数据的存储当前不可访问，或计算可见时间所需的交易日历覆盖不足：抛出
   `DataSourceUnavailableError`；
 - 已发布数据正常可读，只是指定证券或时间范围内没有记录：返回符合平台 Schema 的空
   `QueryResult`。
 
 数据源在 Reader 创建时绑定，策略不能逐次选源。一个公共请求依赖多个逻辑数据集时，Reader
 只解析本次确实需要的路由：例如 `market.status(fields=("suspended",))` 只要求
-`market.suspensions`。`market.bars()` 无论是否复权都只解析对应的日线或分钟线路由；
-Tushare 的 `daily + adj_factor` 和 QMT 的原生 `front_ratio` 都是适配器内部实现细节。
+`market.suspensions`。`market.bars()` 无论是否复权都只解析对应的日线或分钟线路由；Tushare
+的 `daily + adj_factor` 是当前严格 PIT 前复权实现，QMT 对该选项明确报告能力不支持。
 多路由组合结果的 `QueryResult.sources` 记录本次实际使用的全部 `source_id`，但公共表 Schema
 不随来源数量变化。
 
@@ -375,10 +384,10 @@ with DataCatalog(
 | 公共接口 | 内置实现 |
 | --- | --- |
 | `market.bars(frequency="1d", adjustment="none")` | Tushare `daily`；或 QMT `daily(adjustment="none")` |
-| `market.bars(frequency="1d", adjustment="forward")` | Tushare `daily + adj_factor` 现场计算；或使用 QMT `daily(adjustment="front_ratio")`，兼容旧 `front` 数据 |
+| `market.bars(frequency="1d", adjustment="forward")` | Tushare `daily + adj_factor` 现场计算；QMT 当前明确不支持 |
 | `market.bars()` 不复权分钟周期 | QMT 同步的 `intraday(adjustment="none")` 与已经实时接收的原始 `bars`；`tushare_data` 尚无分钟表 |
-| `market.bars()` 前复权分钟周期 | 直接使用 QMT 同步的 `intraday(adjustment="front_ratio")` |
-| `market.current()` | QMT tick/bar；无实时源时仅提供 Tushare 日线的开盘事件 |
+| `market.bars()` 前复权分钟周期 | 当前没有满足严格 PIT 语义的内置实现 |
+| `market.current()` | QMT 当日 tick；无实时源时仅提供 Tushare 日线的开盘事件 |
 | `market.daily_metrics()` | `tushare.daily_basic` |
 | `market.moneyflow()` | `tushare.moneyflow` |
 | `market.status()` | `tushare.suspend_d`、`stk_limit`、`stock_st` |
@@ -390,9 +399,9 @@ with DataCatalog(
 | `calendar.*` | `tushare.trade_cal` |
 
 `qmt.financial` 和 `qmt.dividend_factors` 当前用于交叉验证，不作为第一版策略公共接口的数据源；
-它们以后可以在完成平台 Schema 映射和可见性规则登记后成为对应能力的实现。QMT `front_ratio`
-已经是 `adjustment="forward"` 的有效实现：QMT 适配器直接读取并归一化日线或分钟线；Tushare
-适配器则在内部使用 `daily + adj_factor` 计算。两种实现对 Reader 暴露完全相同的 bar 能力。
+它们以后可以在完成平台 Schema 映射和可见性规则登记后成为对应能力的实现。QMT 目前只向
+Reader 提供不复权历史行情和当日 tick；Tushare 适配器在内部使用 `daily + adj_factor` 实现
+严格 PIT 前复权。
 
 ### 公共参数
 
@@ -489,8 +498,9 @@ current = data.market.current(
 )
 ```
 
-每个 symbol 最多返回一行，固定按 `symbol ASC` 排序。没有实时源时不伪造盘中 `last`；
-Tushare 最终日线只能按前文规则提供已经发生的开盘事件。
+每个 symbol 最多返回一行，固定按 `symbol ASC` 排序。没有实时源时不伪造盘中 `last`；QMT
+只从 `as_of` 当日的 tick 中选择最新接收事件，不用分钟 bar 覆盖 tick，也不跨交易日返回上一
+交易日快照。Tushare 最终日线只能按前文规则提供已经发生的开盘事件。
 
 ### 市场状态 `market.status()`
 
@@ -572,7 +582,9 @@ income = data.fundamentals.statements(
 )
 ```
 
-平台只公开合并口径报表，Tushare 的 `report_type/end_type` 等源编码不进入公共 Schema。
+平台只公开合并口径报表，读取普通合并和后续调整后合并版本；Tushare 的
+`report_type/end_type` 等源编码不进入公共 Schema。资产负债表中的 `money_cap` 映射为
+`monetary_funds`（货币资金），不误称为现金及现金等价物。
 `periods` 与 `report_start/report_end` 互斥；范围模式至少传 `report_start`，`report_end` 默认不设
 上界。`periods` 是每只股票最近 N 个不同的 `period_end`，选完报告期后再返回符合
 `company_type` 的行。`company_type` 使用平台枚举 `industrial/bank/insurance/securities`；`limit`
@@ -822,8 +834,8 @@ fundamentals.statements(kind="cash_flow")
 - 每个逻辑数据集都能独立绑定当前支持的 Tushare 或 QMT，组合查询只读取本次需要的路由；
 - 路由未配置、能力不支持、来源不可用和合法空结果分别产生约定的不同结果；
 - 同一公共请求切换 Tushare/QMT 后，结果 Schema、类型、单位和排序完全一致；
-- 回测用 Tushare 计算前复权、实盘用 QMT `front_ratio` 时，策略调用和平台 bar 结构完全一致；
-- QMT 分钟线直接选择原生 `front_ratio`，成交量和成交额保持平台规定的实际成交口径；
+- Tushare 前复权只使用 `as_of` 时可见的因子，QMT 在缺少因子可见性元数据时明确拒绝前复权；
+- QMT 当前行情只使用当日 tick，分钟 bar 不得以不同聚合口径覆盖快照；
 - 数据源缺少请求能力时明确失败，不返回供应商字段、不生成半成品且不静默换源；
 - 适配器返回缺列、多列或错误类型时在 Reader 边界失败，不能生成 `QueryResult`；
 - 相同参数的结果字段、排序和 `truncated` 完全稳定；

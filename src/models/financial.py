@@ -94,7 +94,7 @@ BALANCE_SHEET_SCHEMA = pa.schema(
             "special_reserve",
             "retained_earnings",
             "treasury_stock",
-            "cash_and_cash_equivalents",
+            "monetary_funds",
             "trading_financial_assets",
             "derivative_financial_assets",
             "notes_receivable",

@@ -181,6 +181,52 @@ def test_sampled_qmt_data_matches_tushare(tmp_path: Path) -> None:
     assert dividend_result.compared == 4
 
 
+def test_daily_comparison_accepts_raw_only_qmt_sync(tmp_path: Path) -> None:
+    tushare_root = tmp_path / "tushare"
+    qmt_root = tmp_path / "qmt"
+    day = date(2024, 1, 2)
+    with TushareDataStore(tushare_root) as store:
+        store.write(
+            "daily",
+            _table(
+                "daily",
+                {
+                    "ts_code": "000001.SZ",
+                    "trade_date": day,
+                    "open": 10.0,
+                    "high": 11.0,
+                    "low": 9.0,
+                    "close": 10.5,
+                    "vol": 10.0,
+                    "amount": 100.0,
+                },
+            ),
+        )
+    with QmtDataStore(qmt_root) as store:
+        store.write_daily(
+            {
+                "000001.SZ": [
+                    HistoryBar(
+                        index=20240102,
+                        open=10.0,
+                        high=11.0,
+                        low=9.0,
+                        close=10.5,
+                        volume=10,
+                        amount=100_000.0,
+                    )
+                ]
+            },
+            "none",
+        )
+
+    with DataCatalog(tushare_root=tushare_root, qmt_root=qmt_root) as catalog:
+        result = compare_daily(catalog.connection, ["000001.SZ"], day, day)
+
+    assert result.passed
+    assert result.compared == 6
+
+
 def test_financial_comparison_normalises_vendor_aliases_and_precision(tmp_path: Path) -> None:
     tushare_root = tmp_path / "tushare"
     qmt_root = tmp_path / "qmt"
