@@ -10,6 +10,7 @@ from data_validation import (
     compare_daily,
     compare_dividends,
     compare_financial,
+    compare_qmt_front_ratio,
     sample_stocks,
 )
 from qmt_protocol import (
@@ -225,6 +226,51 @@ def test_daily_comparison_accepts_raw_only_qmt_sync(tmp_path: Path) -> None:
 
     assert result.passed
     assert result.compared == 6
+
+
+def test_qmt_front_ratio_is_reproduced_from_raw_and_event_dr(tmp_path: Path) -> None:
+    qmt_root = tmp_path / "qmt"
+    day = date(2024, 1, 2)
+    raw = HistoryBar(
+        index=20240102,
+        open=10.0,
+        high=12.0,
+        low=9.0,
+        close=11.0,
+        preClose=9.5,
+        volume=100,
+        amount=1_000.0,
+    )
+    with QmtDataStore(qmt_root) as store:
+        store.write_daily({"000001.SZ": [raw]}, "none")
+
+    native = HistoryBar(
+        index=20240102,
+        open=5.0,
+        high=6.0,
+        low=4.5,
+        close=5.5,
+        preClose=4.75,
+        volume=100,
+        amount=1_000.0,
+    )
+    factor = DividendFactor(
+        date="20240103",
+        time=1_704_211_200_000.0,
+        dr=2.0,
+    )
+    with DataCatalog(tushare_root=tmp_path / "tushare", qmt_root=qmt_root) as catalog:
+        result = compare_qmt_front_ratio(
+            catalog.connection,
+            ["000001.SZ"],
+            day,
+            day,
+            {"000001.SZ": [native]},
+            {"000001.SZ": [factor]},
+        )
+
+    assert result.passed
+    assert result.compared == 7
 
 
 def test_financial_comparison_normalises_vendor_aliases_and_precision(tmp_path: Path) -> None:

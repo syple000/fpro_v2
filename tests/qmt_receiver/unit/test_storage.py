@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import pyarrow as pa
@@ -369,3 +369,46 @@ def test_bar_deduplication_keeps_different_periods(tmp_path: Path) -> None:
     table = _read_only_table(tmp_path / "bars")
     assert table.num_rows == 2
     assert set(table.column("period").to_pylist()) == {"1m", "5m"}
+
+
+def test_sync_meta_merges_ranges_per_stock_and_period(tmp_path: Path) -> None:
+    with QmtDataStore(tmp_path) as store:
+        store.mark_sync_completed("daily", "000001.SZ", date(2024, 1, 2), date(2024, 1, 3))
+        store.mark_sync_completed("daily", "000001.SZ", date(2024, 1, 4), date(2024, 1, 5))
+        store.mark_sync_completed("daily", "600000.SH", date(2024, 1, 3), date(2024, 1, 4))
+        store.mark_sync_completed(
+            "intraday",
+            "000001.SZ",
+            date(2024, 1, 2),
+            date(2024, 1, 5),
+            period="1m",
+        )
+
+        assert store.sync_completed_ranges("daily", "000001.SZ") == [
+            (date(2024, 1, 2), date(2024, 1, 5))
+        ]
+        assert store.sync_completed_ranges("daily", "600000.SH") == [
+            (date(2024, 1, 3), date(2024, 1, 4))
+        ]
+        assert store.sync_completed_ranges("intraday", "000001.SZ", period="1m") == [
+            (date(2024, 1, 2), date(2024, 1, 5))
+        ]
+        assert store.sync_completed_ranges("intraday", "000001.SZ", period="5m") == []
+
+    document = json.loads((tmp_path / "_meta" / "sync" / "daily.json").read_text(encoding="utf-8"))
+    assert document["version"] == 1
+    assert document["dataset"] == "daily"
+    assert document["completed_ranges"] == [
+        {
+            "code": "000001.SZ",
+            "period": None,
+            "start_date": "2024-01-02",
+            "end_date": "2024-01-05",
+        },
+        {
+            "code": "600000.SH",
+            "period": None,
+            "start_date": "2024-01-03",
+            "end_date": "2024-01-04",
+        },
+    ]

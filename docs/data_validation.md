@@ -1,20 +1,21 @@
 # Tushare/QMT 数据复核
 
 `data_validation` 从 Tushare 日线股票池中做可重复随机抽样，直接调用
-`qmt_receiver.sync_all(..., force=True)` 强制下载并落地样本股票，然后完成三类比较：
+`qmt_receiver.sync_all(..., force=True)` 强制下载并落地样本股票，然后完成四类比较：
 
 - QMT 不复权日线与 Tushare `daily`；
+- 本次实拉的 QMT 原生 `front_ratio` 与“QMT 不复权日线 ÷ 后续事件 `dr` 连乘”；
 - QMT 财务表与 Tushare `income`、`balancesheet`、`cashflow`、`fina_indicator` 的同义字段；
 - QMT 除权事件与 Tushare 已实施分红的税前现金分红、送股和转增比例。
 
-若目录中另外存在旧的 QMT `front_ratio` 分区，复核器仍可把它与
-`daily × adj_factor / 区间末最新 adj_factor` 比较；该结果只用于供应商口径复核，不代表数据
-满足 Reader 的严格 PIT 前复权语义。
+原生 `front_ratio` 只保存在本次校验响应中，不写入生产 Parquet。复核会另外拉取样本股票的
+完整 QMT 除权事件序列：对每根 K 线，将其 OHLC 和前收盘价除以所有 `ex_date` 晚于 K 线日期的
+`dr` 连乘，再与原生值比较；成交量和成交额必须原样相等。生产 Reader 则把因子锚定在查询
+`as_of`，并要求 meta 中的因子同步区间完整覆盖 K 线到锚点。
 
-TODO：QMT 动态前复权实现后，复核命令应显式拉取一份仅用于校验的原生 `front_ratio` 快照，
-固定股票范围、起止日期和锚点，比较平台根据 QMT 不复权日线及 QMT 除权因子计算出的 OHLC、
-前收盘价和行覆盖情况；同时验证成交量、成交额没有被复权。校验快照不得注册为 Reader 的生产
-行情来源。
+2026-08-30 的实机验证覆盖 21 只股票、4,839 根日线，其中 2,140 根跨越至少一次除权事件；
+五个价格字段的最大绝对误差为 `7.11e-15`，4,839 根 K 线的成交量和成交额全部保持一致。分钟线
+使用相同的日期边界和计算公式；同步数据中不保存原生复权分钟线。
 
 QMT 与 Tushare 的股票日线成交量都以手为单位；QMT 用整数手、Tushare 可保留不足一手的
 小数，因此允许半手取整误差。QMT 成交额按元转换为 Tushare 的千元。前复权价格允许半分

@@ -166,18 +166,19 @@ adjusted_price(t) = raw_price(t) * factor(t) / anchor_factor(as_of)
 日线、当日因子和锚点因子在同一条 DuckDB 查询中完成关联，不生成中间 Arrow 表；任何行情缺少
 当日因子、锚点因子或锚点为零时，整次查询明确失败。
 
-QMT 原生 `front/front_ratio` 的价格锚点取决于查询区间，但当前历史表没有记录锚点、因子版本或
-因子的历史可见时间，因此不能满足上述 PIT 语义。QMT 同步只新增 `adjustment="none"` 的原始
-行情；已有 `front/front_ratio` 分区可保留用于离线复核，但 Reader 不读取它们，QMT 路由收到
-`adjustment="forward"` 时明确抛出 `DataCapabilityNotSupportedError`。只有在存储补齐原始价格、
-因子、因子生效日和可见时间后，才能重新启用 QMT 前复权。
+QMT 适配器同样只读取 `adjustment="none"` 的生产行情，但使用 QMT 除权事件中的 `dr` 动态计算：
 
-> TODO：补充 QMT 前复权能力。生产数据继续只落地 `adjustment="none"` 的日线，并保存带版本和
-> 可见时间的 QMT 除权因子；由 Adapter 按统一公式从不复权价格现场计算前复权价格，通过
-> `market.bars(adjustment="forward")` 透出。同步或数据复核流程另行拉取同一股票、区间和锚点的
-> QMT 原生 `front_ratio`，逐项校验计算结果的 OHLC 与前收盘价；成交量和成交额只校验保持实际
-> 成交口径。原生 `front_ratio` 仅作为校验基准，不与生产日线增量拼接，也不替代因子版本的 PIT
-> 约束。
+```text
+adjusted_price(t) = raw_price(t) / product(dr(e), t < ex_date(e) <= anchor(as_of))
+```
+
+`dr` 是单次事件的价格除数，不是 Tushare 那种逐日累计因子。事件在除权日 09:25 生效，因此
+除权日当天的 K 线不应用当天 `dr`，此前 K 线除以后续已生效事件的连乘。同步 meta 按证券记录
+`dividend_factors` 完成区间；任何返回 K 线到 `as_of` 锚点之间没有被一个完整因子区间覆盖时，
+整次前复权查询明确失败。旧的原生 `front/front_ratio` 分区只作复核，Reader 不读取。
+
+同一公式用于 QMT 日线和下载/实时分钟线。实机抽样已逐项比较未复权行情现场计算值与 QMT 原生
+`front_ratio`：OHLC 和前收盘价达到浮点精度一致，成交量和成交额完全不变。
 
 Reader 只把 `adjustment` 语义传给当前行情适配器，不读取因子、不拼接数据源，也不要求配置
 `corporate_actions.adjustment_factors` 路由。
@@ -359,7 +360,7 @@ Reader 创建时校验所有已配置的 `source_id` 是否注册并支持对应
 数据源在 Reader 创建时绑定，策略不能逐次选源。一个公共请求依赖多个逻辑数据集时，Reader
 只解析本次确实需要的路由：例如 `market.status(fields=("suspended",))` 只要求
 `market.suspensions`。`market.bars()` 无论是否复权都只解析对应的日线或分钟线路由；Tushare
-的 `daily + adj_factor` 是当前严格 PIT 前复权实现，QMT 对该选项明确报告能力不支持。
+的 `daily + adj_factor` 和 QMT 的 `none + dividend_factors.dr` 都在各自适配器内部完成前复权。
 多路由组合结果的 `QueryResult.sources` 记录本次实际使用的全部 `source_id`，但公共表 Schema
 不随来源数量变化。
 
@@ -414,9 +415,9 @@ with DataCatalog(
 | 公共接口 | 内置实现 |
 | --- | --- |
 | `market.bars(frequency="1d", adjustment="none")` | Tushare `daily`；或 QMT `daily(adjustment="none")` |
-| `market.bars(frequency="1d", adjustment="forward")` | Tushare `daily + adj_factor` 现场计算；QMT 当前明确不支持 |
+| `market.bars(frequency="1d", adjustment="forward")` | Tushare `daily + adj_factor`；或 QMT `daily(none) + dividend_factors.dr` 现场计算 |
 | `market.bars()` 不复权分钟周期 | QMT 同步的 `intraday(adjustment="none")` 与已经实时接收的原始 `bars`；`tushare_data` 尚无分钟表 |
-| `market.bars()` 前复权分钟周期 | 当前没有满足严格 PIT 语义的内置实现 |
+| `market.bars()` 前复权分钟周期 | QMT 未复权分钟线与 `dividend_factors.dr` 现场计算 |
 | `market.current()` | QMT 当日 tick；无实时源时仅提供 Tushare 日线的开盘事件 |
 | `market.daily_metrics()` | `tushare.daily_basic` |
 | `market.moneyflow()` | `tushare.moneyflow` |
@@ -428,10 +429,9 @@ with DataCatalog(
 | `classification.industry()` | `tushare.sw_industry` |
 | `calendar.*` | `tushare.trade_cal` |
 
-`qmt.financial` 和 `qmt.dividend_factors` 当前用于交叉验证，不作为第一版策略公共接口的数据源；
-它们以后可以在完成平台 Schema 映射和可见性规则登记后成为对应能力的实现。QMT 目前只向
-Reader 提供不复权历史行情和当日 tick；Tushare 适配器在内部使用 `daily + adj_factor` 实现
-严格 PIT 前复权。
+`qmt.financial` 当前只用于交叉验证，不作为第一版策略公共接口的数据源。QMT
+`dividend_factors` 不直接暴露为 `corporate_actions.adjustment_factors()`，而是 QMT 行情适配器
+实现日线和分钟线前复权的内部依赖；该依赖不需要单独配置路由。
 
 ### 公共参数
 
@@ -874,7 +874,7 @@ uv run data-test \
 - 每个逻辑数据集都能独立绑定内置或注入的适配器，组合查询只读取本次需要的路由；
 - 路由未配置、能力不支持、来源不可用和合法空结果分别产生约定的不同结果；
 - 同一公共请求切换 Tushare/QMT 后，结果 Schema、类型、单位和排序完全一致；
-- Tushare 前复权只使用 `as_of` 时可见的因子，QMT 在缺少因子可见性元数据时明确拒绝前复权；
+- Tushare 和 QMT 前复权都只使用 `as_of` 时已经生效的因子；QMT 因子同步区间不完整时明确拒绝；
 - QMT 当前行情只使用当日 tick，分钟 bar 不得以不同聚合口径覆盖快照；
 - 数据源缺少请求能力时明确失败，不返回供应商字段、不生成半成品且不静默换源；
 - 适配器返回缺列、多列或错误类型时在 Reader 边界失败，不能生成 `QueryResult`；

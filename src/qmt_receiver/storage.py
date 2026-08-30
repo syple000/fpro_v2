@@ -4,16 +4,25 @@ from __future__ import annotations
 
 import json
 import math
+import os
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
+from threading import RLock
 from typing import Any
+from uuid import uuid4
 from zoneinfo import ZoneInfo
 
 import pyarrow as pa
 
 import qmt_receiver.schemas as schemas
-from fpro_common import datetime_to_utc_us, normalise_unix_timestamp_us, utc_us_to_datetime
+from fpro_common import (
+    datetime_to_utc_us,
+    normalise_unix_timestamp_us,
+    utc_now_us,
+    utc_us_to_datetime,
+)
 from parquet_store import ParquetStore, TableConfig
 from qmt_protocol import (
     BarQuote,
@@ -29,6 +38,20 @@ from qmt_protocol import (
 )
 
 _QMT_TIMEZONE = ZoneInfo("Asia/Shanghai")
+_SYNC_META_DATASETS = frozenset(
+    {schemas.DAILY_TABLE, schemas.INTRADAY_TABLE, schemas.DIVIDEND_FACTOR_TABLE}
+)
+
+
+@dataclass(frozen=True, slots=True)
+class QmtSyncRange:
+    """一只证券的一类 QMT 数据已完整同步的日期闭区间。"""
+
+    dataset: str
+    code: str
+    period: str | None
+    start_date: date
+    end_date: date
 
 
 class QmtDataStore:
@@ -36,7 +59,10 @@ class QmtDataStore:
 
     def __init__(self, root: str | Path, timezone: str = "Asia/Shanghai") -> None:
         self._timezone = ZoneInfo(timezone)
-        self._store = ParquetStore(root)
+        root_path = Path(root).expanduser().resolve()
+        self._store = ParquetStore(root_path)
+        self._sync_meta_dir = root_path / "_meta" / "sync"
+        self._sync_meta_lock = RLock()
         for table_name, schema in schemas.TABLE_SCHEMAS.items():
             self._store.register(
                 TableConfig(
@@ -45,11 +71,80 @@ class QmtDataStore:
                     partition_by=schemas.TABLE_PARTITION_BY[table_name],
                     sort_by=schemas.TABLE_SORT_BY[table_name],
                     primary_key=schemas.TABLE_PRIMARY_KEY[table_name],
-                    deduplicate_prefer_by=(
-                        schemas.TABLE_DEDUPLICATE_PREFER_BY[table_name] or None
-                    ),
+                    deduplicate_prefer_by=(schemas.TABLE_DEDUPLICATE_PREFER_BY[table_name] or None),
                 )
             )
+
+    def sync_completed_ranges(
+        self,
+        dataset: str,
+        code: str,
+        *,
+        period: str | None = None,
+    ) -> list[tuple[date, date]]:
+        """读取指定数据和证券已完整同步的日期闭区间。"""
+        _validate_sync_key(dataset, code, period)
+        with self._sync_meta_lock:
+            ranges = load_sync_ranges(self._sync_meta_dir, dataset=dataset)
+        return [
+            (item.start_date, item.end_date)
+            for item in ranges
+            if item.code == code and item.period == period
+        ]
+
+    def mark_sync_completed(
+        self,
+        dataset: str,
+        code: str,
+        start_date: date,
+        end_date: date,
+        *,
+        period: str | None = None,
+    ) -> None:
+        """在数据成功落盘后原子提交一个完成区间。"""
+        _validate_sync_key(dataset, code, period)
+        if start_date > end_date:
+            raise ValueError("QMT 同步完成区间起止颠倒")
+        with self._sync_meta_lock:
+            current = load_sync_ranges(self._sync_meta_dir, dataset=dataset)
+            grouped: dict[tuple[str, str | None], list[tuple[date, date]]] = {}
+            for item in current:
+                grouped.setdefault((item.code, item.period), []).append(
+                    (item.start_date, item.end_date)
+                )
+            grouped.setdefault((code, period), []).append((start_date, end_date))
+
+            completed_ranges = []
+            for (item_code, item_period), values in sorted(
+                grouped.items(), key=lambda item: (item[0][0], item[0][1] or "")
+            ):
+                completed_ranges.extend(
+                    {
+                        "code": item_code,
+                        "period": item_period,
+                        "start_date": range_start.isoformat(),
+                        "end_date": range_end.isoformat(),
+                    }
+                    for range_start, range_end in _merge_date_ranges(values)
+                )
+            document = {
+                "version": 1,
+                "dataset": dataset,
+                "updated_at": utc_now_us(),
+                "completed_ranges": completed_ranges,
+            }
+            self._sync_meta_dir.mkdir(parents=True, exist_ok=True)
+            path = self._sync_meta_dir / f"{dataset}.json"
+            temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
+            try:
+                with temporary.open("x", encoding="utf-8") as file:
+                    json.dump(document, file, ensure_ascii=False, indent=2, sort_keys=True)
+                    file.write("\n")
+                    file.flush()
+                    os.fsync(file.fileno())
+                os.replace(temporary, path)
+            finally:
+                temporary.unlink(missing_ok=True)
 
     def append_quotes(self, records: Sequence[SequencedQuote]) -> list[QuoteEvent]:
         """追加实时行情，不立即 flush 或整理。"""
@@ -363,3 +458,93 @@ def _json(value: object) -> str:
         separators=(",", ":"),
         sort_keys=True,
     )
+
+
+def load_sync_ranges(
+    meta_dir: str | Path,
+    *,
+    dataset: str | None = None,
+) -> list[QmtSyncRange]:
+    """读取 QMT 同步元数据；供存储层和 DataCatalog 共用。"""
+    root = Path(meta_dir)
+    paths = [root / f"{dataset}.json"] if dataset is not None else sorted(root.glob("*.json"))
+    result: list[QmtSyncRange] = []
+    for path in paths:
+        if not path.exists():
+            continue
+        try:
+            document: object = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError(f"无法读取 QMT 同步元数据: {path}") from exc
+        if not isinstance(document, dict):
+            raise ValueError(f"QMT 同步元数据格式错误: {path}")
+        document_dataset = document.get("dataset")
+        if (
+            document.get("version") != 1
+            or not isinstance(document_dataset, str)
+            or document_dataset not in _SYNC_META_DATASETS
+            or path.stem != document_dataset
+        ):
+            raise ValueError(f"QMT 同步元数据版本或数据表不匹配: {path}")
+        raw_ranges = document.get("completed_ranges")
+        if not isinstance(raw_ranges, list):
+            raise ValueError(f"QMT 同步元数据缺少 completed_ranges: {path}")
+        for raw_range in raw_ranges:
+            if not isinstance(raw_range, dict):
+                raise ValueError(f"QMT 同步完成区间格式错误: {path}")
+            code = raw_range.get("code")
+            period = raw_range.get("period")
+            raw_start = raw_range.get("start_date")
+            raw_end = raw_range.get("end_date")
+            if (
+                not isinstance(code, str)
+                or (period is not None and not isinstance(period, str))
+                or not isinstance(raw_start, str)
+                or not isinstance(raw_end, str)
+            ):
+                raise ValueError(f"QMT 同步完成区间字段错误: {path}")
+            _validate_sync_key(document_dataset, code, period)
+            try:
+                start_date = date.fromisoformat(raw_start)
+                end_date = date.fromisoformat(raw_end)
+            except ValueError as exc:
+                raise ValueError(f"QMT 同步完成区间日期无效: {path}") from exc
+            if start_date > end_date:
+                raise ValueError(f"QMT 同步完成区间起止颠倒: {path}")
+            result.append(QmtSyncRange(document_dataset, code, period, start_date, end_date))
+
+    grouped: dict[tuple[str, str, str | None], list[tuple[date, date]]] = {}
+    for item in result:
+        grouped.setdefault((item.dataset, item.code, item.period), []).append(
+            (item.start_date, item.end_date)
+        )
+    return [
+        QmtSyncRange(item_dataset, code, period, start_date, end_date)
+        for (item_dataset, code, period), values in sorted(
+            grouped.items(), key=lambda item: (item[0][0], item[0][1], item[0][2] or "")
+        )
+        for start_date, end_date in _merge_date_ranges(values)
+    ]
+
+
+def _validate_sync_key(dataset: str, code: str, period: str | None) -> None:
+    if dataset not in _SYNC_META_DATASETS:
+        raise ValueError(f"不支持记录同步区间的数据表: {dataset!r}")
+    if not code or code != code.strip().upper():
+        raise ValueError(f"QMT 同步证券代码必须是规范大写形式: {code!r}")
+    if dataset == schemas.INTRADAY_TABLE:
+        if period not in {"1m", "5m", "15m", "30m", "1h"}:
+            raise ValueError(f"QMT 分钟线同步周期无效: {period!r}")
+    elif period is not None:
+        raise ValueError(f"{dataset} 同步元数据不接受 period")
+
+
+def _merge_date_ranges(ranges: Sequence[tuple[date, date]]) -> list[tuple[date, date]]:
+    merged: list[tuple[date, date]] = []
+    for start_date, end_date in sorted(ranges):
+        if not merged or start_date.toordinal() > merged[-1][1].toordinal() + 1:
+            merged.append((start_date, end_date))
+            continue
+        previous_start, previous_end = merged[-1]
+        merged[-1] = (previous_start, max(previous_end, end_date))
+    return merged

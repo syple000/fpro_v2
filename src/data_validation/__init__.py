@@ -7,6 +7,7 @@ from data_validation.validator import (
     compare_daily,
     compare_dividends,
     compare_financial,
+    compare_qmt_front_ratio,
     sample_stocks,
     validate_sample,
 )
@@ -18,6 +19,7 @@ __all__ = [
     "compare_daily",
     "compare_dividends",
     "compare_financial",
+    "compare_qmt_front_ratio",
     "sample_stocks",
     "validate_sample",
 ]

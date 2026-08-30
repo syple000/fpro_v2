@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Literal
 from zoneinfo import ZoneInfo
 
@@ -1379,10 +1379,6 @@ class QmtAdapter:
         fetch_limit: int | None,
         columns: tuple[str, ...] | None = None,
     ) -> pa.Table:
-        if adjustment == "forward":
-            raise DataCapabilityNotSupportedError(
-                "QMT 历史复权行情缺少 PIT 因子可见性，暂不支持 adjustment='forward'"
-            )
         direction = _sql_direction(order, default="asc")
         if count is None:
             assert start is not None
@@ -1441,7 +1437,15 @@ class QmtAdapter:
                 ORDER BY interval_end {direction}, symbol, interval_start {direction}
                 LIMIT $fetch_limit
             """
-        return _fetch(self._connection, query, params, BAR_SCHEMA, columns)
+        if adjustment == "none":
+            return _fetch(self._connection, query, params, BAR_SCHEMA, columns)
+        return self._forward_bars(
+            raw_bars_sql=query,
+            params=params,
+            as_of=as_of,
+            direction=direction,
+            columns=columns,
+        )
 
     def intraday_bars(
         self,
@@ -1466,10 +1470,6 @@ class QmtAdapter:
         }.get(frequency)
         if period is None:
             raise DataCapabilityNotSupportedError(f"QMT 不支持分钟周期 {frequency!r}")
-        if adjustment == "forward":
-            raise DataCapabilityNotSupportedError(
-                "QMT 历史复权行情缺少 PIT 因子可见性，暂不支持 adjustment='forward'"
-            )
         qmt_period, minutes = period
         start_expr = _epoch_time("event_time")
         end_expr = f"{start_expr} + INTERVAL '{minutes} minutes'"
@@ -1566,7 +1566,76 @@ class QmtAdapter:
             ORDER BY interval_end {direction}, symbol, interval_start {direction}
             LIMIT $fetch_limit
         """
-        return _fetch(self._connection, query, params, BAR_SCHEMA, columns)
+        if adjustment == "none":
+            return _fetch(self._connection, query, params, BAR_SCHEMA, columns)
+        return self._forward_bars(
+            raw_bars_sql=query,
+            params=params,
+            as_of=as_of,
+            direction=direction,
+            columns=columns,
+        )
+
+    def _forward_bars(
+        self,
+        *,
+        raw_bars_sql: str,
+        params: Mapping[str, object],
+        as_of: datetime,
+        direction: str,
+        columns: tuple[str, ...] | None,
+    ) -> pa.Table:
+        factor_end_date = as_of.date()
+        if (as_of.hour, as_of.minute) < (9, 25):
+            factor_end_date -= timedelta(days=1)
+        query_params = {**params, "factor_end_date": factor_end_date}
+        bar_date = f"CAST(timezone('{_TZ}', b.interval_start) AS DATE)"
+        query = f"""
+            WITH raw_bars AS MATERIALIZED (
+                {raw_bars_sql}
+            )
+            SELECT b.symbol,
+                   b.interval_start,
+                   b.interval_end,
+                   b.open / coalesce(NULLIF(f.divisor, 0), 1) AS open,
+                   b.high / coalesce(NULLIF(f.divisor, 0), 1) AS high,
+                   b.low / coalesce(NULLIF(f.divisor, 0), 1) AS low,
+                   b.close / coalesce(NULLIF(f.divisor, 0), 1) AS close,
+                   b.pre_close / coalesce(NULLIF(f.divisor, 0), 1) AS pre_close,
+                   b.volume,
+                   b.amount,
+                   coalesce(f.invalid_factor, false)
+                   OR (
+                       {bar_date} < $factor_end_date
+                       AND NOT EXISTS (
+                           SELECT 1
+                           FROM data_internal.qmt_sync_ranges r
+                           WHERE r.dataset = 'dividend_factors'
+                             AND r.code = b.symbol
+                             AND r.period IS NULL
+                             AND r.start_date <= {bar_date} + INTERVAL 1 DAY
+                             AND r.end_date >= $factor_end_date
+                       )
+                   ) AS __invalid_factor
+            FROM raw_bars b
+            LEFT JOIN LATERAL (
+                SELECT product(df.dr) AS divisor,
+                       coalesce(bool_or(df.dr IS NULL OR df.dr <= 0), false)
+                           AS invalid_factor
+                FROM qmt.dividend_factors df
+                WHERE df.code = b.symbol
+                  AND df.ex_date > {bar_date}
+                  AND df.ex_date <= $factor_end_date
+                  AND {_day_time("df.ex_date", "09:25")} <= $as_of
+            ) f ON true
+            ORDER BY b.interval_end {direction},
+                     b.symbol,
+                     b.interval_start {direction}
+        """
+        adjusted = _fetch(self._connection, query, query_params, _FORWARD_BAR_SCHEMA)
+        if pc.any(adjusted.column("__invalid_factor")).as_py():
+            raise DataCapabilityNotSupportedError("QMT 复权因子同步区间不完整或包含无效 dr")
+        return _project_table(adjusted.select(BAR_SCHEMA.names), columns)
 
     def current(
         self,

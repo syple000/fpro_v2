@@ -10,7 +10,18 @@ import duckdb
 import pyarrow as pa
 
 from qmt_receiver.schemas import TABLE_SCHEMAS as QMT_TABLE_SCHEMAS
+from qmt_receiver.storage import load_sync_ranges
 from tushare_data.schemas import TABLE_SCHEMAS
+
+_QMT_SYNC_RANGE_SCHEMA = pa.schema(
+    [
+        pa.field("dataset", pa.string(), nullable=False),
+        pa.field("code", pa.string(), nullable=False),
+        pa.field("period", pa.string()),
+        pa.field("start_date", pa.date32(), nullable=False),
+        pa.field("end_date", pa.date32(), nullable=False),
+    ]
+)
 
 
 class DataCatalog:
@@ -48,6 +59,7 @@ class DataCatalog:
                     schema=schema,
                 )
         _refresh_reference_tables(self._connection)
+        _refresh_qmt_sync_ranges(self._connection, self._sources["qmt"][0])
 
     def close(self) -> None:
         """关闭 DuckDB 连接。"""
@@ -134,6 +146,30 @@ def _refresh_reference_tables(connection: duckdb.DuckDBPyConnection) -> None:
     )
     connection.execute(
         "CREATE OR REPLACE TABLE data_internal.sw_industry AS SELECT * FROM tushare.sw_industry"
+    )
+
+
+def _refresh_qmt_sync_ranges(
+    connection: duckdb.DuckDBPyConnection,
+    qmt_root: Path,
+) -> None:
+    """把 QMT 小型同步区间元数据物化，供复权覆盖检查使用。"""
+    rows = [
+        {
+            "dataset": item.dataset,
+            "code": item.code,
+            "period": item.period,
+            "start_date": item.start_date,
+            "end_date": item.end_date,
+        }
+        for item in load_sync_ranges(qmt_root / "_meta" / "sync")
+    ]
+    connection.register(
+        "__qmt_sync_ranges",
+        pa.Table.from_pylist(rows, schema=_QMT_SYNC_RANGE_SCHEMA),
+    )
+    connection.execute(
+        "CREATE OR REPLACE TABLE data_internal.qmt_sync_ranges AS SELECT * FROM __qmt_sync_ranges"
     )
 
 

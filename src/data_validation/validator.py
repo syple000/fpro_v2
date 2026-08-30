@@ -5,15 +5,16 @@ from __future__ import annotations
 import json
 import math
 import random
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
 import duckdb
 
 from data import DataCatalog
+from qmt_protocol import DividendFactor, HistoryBar, HistoryQuote
 from qmt_receiver import QmtAgentClient, QmtDataStore
 from qmt_receiver.sync import SyncResult, sync_all
 
@@ -222,7 +223,7 @@ def validate_sample(
     sample_size: int = 20,
     seed: int = 0,
 ) -> ValidationReport:
-    """从 Tushare 日线随机抽股票，拉取 QMT 数据并完成三类比较。"""
+    """从 Tushare 日线随机抽股票，拉取 QMT 数据并完成四类比较。"""
     with DataCatalog(tushare_root=tushare_root, qmt_root=qmt_root) as catalog:
         stocks = sample_stocks(
             catalog.connection,
@@ -241,10 +242,27 @@ def validate_sample(
             end_date.strftime("%Y%m%d"),
             force=True,
         )
+    native_front = client.query_history(
+        stocks,
+        period="1d",
+        start_time=start_date.strftime("%Y%m%d"),
+        end_time=end_date.strftime("%Y%m%d"),
+        dividend_type="front_ratio",
+        fill_data=False,
+    ).data
+    all_factors = client.query_dividend_factors(stocks).data
 
     with DataCatalog(tushare_root=tushare_root, qmt_root=qmt_root) as catalog:
         checks = (
             compare_daily(catalog.connection, stocks, start_date, end_date),
+            compare_qmt_front_ratio(
+                catalog.connection,
+                stocks,
+                start_date,
+                end_date,
+                native_front,
+                all_factors,
+            ),
             compare_financial(catalog.connection, stocks, start_date, end_date),
             compare_dividends(catalog.connection, stocks, start_date, end_date),
         )
@@ -362,6 +380,90 @@ def compare_daily(
                     atol=0.005001,
                 )
     return CheckResult("daily", compared, tuple(differences))
+
+
+def compare_qmt_front_ratio(
+    connection: duckdb.DuckDBPyConnection,
+    stocks: list[str],
+    start_date: date,
+    end_date: date,
+    native_front: Mapping[str, Sequence[HistoryQuote]],
+    factors: Mapping[str, Sequence[DividendFactor]],
+) -> CheckResult:
+    """用 QMT 未复权行情和事件 dr 复现本次实拉的原生 front_ratio。"""
+    raw_rows = _fetch(
+        connection,
+        "SELECT code, trade_date, open, high, low, close, preClose, volume, amount "
+        f"FROM qmt.daily WHERE {_stock_filter('code', stocks)} "
+        "AND adjustment = 'none' AND trade_date BETWEEN ? AND ?",
+        [*stocks, start_date, end_date],
+    )
+    native = {
+        (code, _history_date(record.index)): record
+        for code, records in native_front.items()
+        for record in records
+        if isinstance(record, HistoryBar)
+    }
+    event_factors = {
+        code: tuple((_factor_date(item), item.dr) for item in records)
+        for code, records in factors.items()
+    }
+    differences: list[Difference] = []
+    compared = 0
+    for raw in raw_rows:
+        key = (raw["code"], raw["trade_date"])
+        front = native.get(key)
+        if front is None:
+            differences.append(_missing("qmt_front_ratio", key, raw, None))
+            continue
+        divisor = 1.0
+        invalid_factor = False
+        for ex_date, factor in event_factors.get(key[0], ()):
+            if ex_date <= key[1]:
+                continue
+            if factor is None or factor <= 0:
+                invalid_factor = True
+                break
+            divisor *= factor
+        if invalid_factor:
+            differences.append(
+                Difference(
+                    "qmt_front_ratio",
+                    key[0],
+                    key[1].isoformat(),
+                    "dr",
+                    "positive",
+                    "invalid",
+                )
+            )
+            continue
+        for field, native_field in (
+            ("open", "open"),
+            ("high", "high"),
+            ("low", "low"),
+            ("close", "close"),
+            ("preClose", "preClose"),
+        ):
+            compared += _compare(
+                differences,
+                "qmt_front_ratio",
+                key,
+                field,
+                _divided(raw[field], divisor),
+                getattr(front, native_field),
+                rtol=1e-12,
+                atol=1e-12,
+            )
+        for field in ("volume", "amount"):
+            compared += _compare(
+                differences,
+                "qmt_front_ratio",
+                key,
+                field,
+                raw[field],
+                getattr(front, field),
+            )
+    return CheckResult("qmt_front_ratio", compared, tuple(differences))
 
 
 def compare_financial(
@@ -588,6 +690,27 @@ def _missing(
 
 def _scaled(value: object, divisor: float) -> float | None:
     return float(value) / divisor if isinstance(value, (int, float)) else None
+
+
+def _divided(value: object, divisor: float) -> float | None:
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return None
+    return float(value) / divisor
+
+
+def _history_date(index: int) -> date:
+    try:
+        return date.fromisoformat(f"{str(index)[:4]}-{str(index)[4:6]}-{str(index)[6:8]}")
+    except ValueError as exc:
+        raise ValueError(f"QMT 日线包含无效 index: {index!r}") from exc
+
+
+def _factor_date(factor: DividendFactor) -> date:
+    text = factor.date.strip().replace("-", "")
+    try:
+        return datetime.strptime(text[:8], "%Y%m%d").date()
+    except ValueError as exc:
+        raise ValueError(f"QMT 除权因子包含无效 date: {factor.date!r}") from exc
 
 
 def _scaled_product(value: object, factor: object, latest: object) -> float | None:

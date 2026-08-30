@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from datetime import date
 from pathlib import Path
 
 from data import DataCatalog
@@ -20,7 +21,7 @@ from qmt_protocol import (
     HistoryQueryResponse,
     XtDataPeriod,
 )
-from qmt_receiver import QmtDataStore, sync_all, sync_intraday
+from qmt_receiver import QmtDataStore, sync_all, sync_daily, sync_intraday
 
 
 class FakeSyncClient:
@@ -206,3 +207,35 @@ def test_sync_intraday_persists_only_raw_bars(tmp_path: Path) -> None:
     assert client.history_periods == ["1m"]
     assert client.adjustments == ["none"]
     assert bars == [("1m", "none", 10.0)]
+
+
+def test_sync_daily_skips_completed_ranges_and_force_refetches(tmp_path: Path) -> None:
+    client = FakeSyncClient()
+    with QmtDataStore(tmp_path / "qmt") as store:
+        first = sync_daily(
+            client,
+            store,
+            ["000001.SZ"],
+            "20240101",
+            "20240131",
+        )
+        skipped = sync_daily(
+            client,
+            store,
+            ["000001.SZ"],
+            "20240101",
+            "20240131",
+        )
+        forced = sync_daily(
+            client,
+            store,
+            ["000001.SZ"],
+            "20240101",
+            "20240131",
+            force=True,
+        )
+        completed = store.sync_completed_ranges("daily", "000001.SZ")
+
+    assert (first, skipped, forced) == (1, 0, 1)
+    assert client.history_modes == ["incremental", "full"]
+    assert completed == [(date(2024, 1, 1), date(2024, 1, 31))]

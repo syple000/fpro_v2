@@ -76,13 +76,19 @@ agent 保留 XtData 原始 `quote.time`。receiver 落盘时才生成业务字�
 - `sync_dividend_factors()`：同步具体 `DividendFactor` 记录。
 - `sync_all()`：依次同步日线、1 分钟线、财务和除权因子，并接受关键字参数 `force=False`。
 
-同步流程不再新增 `front/front_ratio` 行情。QMT 原生前复权缺少锚点及因子历史可见时间，不能
-直接作为严格 PIT 的 Reader 输出；旧分区仍可由存储层读取以便离线复核。
+生产同步只落地 `adjustment="none"` 行情，不再新增 `front/front_ratio`。Reader 使用未复权价格
+和 `dividend_factors.dr` 现场计算前复权；旧的原生复权分区只供离线复核，不参与生产读取。
 
-TODO：在保持生产同步只落地不复权行情的前提下，为除权因子增加快照版本、采集时间、有效日期
-和完整覆盖范围；随后由数据适配器使用不复权日线和因子计算 `front_ratio` 并开放统一前复权
-接口。数据复核任务应单独拉取 QMT 原生 `front_ratio`，使用相同区间和锚点与平台计算结果比较，
-但不得把这份校验数据混入生产历史行情。
+QMT 的 `dr` 是单次除权事件的价格除数。以 `as_of` 为锚点，K 线日期为 `t` 时：
+
+```text
+front_ratio_price(t) = raw_price(t) / product(dr(e), t < ex_date(e) <= as_of)
+```
+
+只换算 OHLC 和前收盘价，成交量、成交额保持实际成交口径。除权日当天不应用当天 `dr`；因子从
+除权日 09:25 起可见。2026-08-30 对实机 qmt-agent 拉取的 21 只股票、4,839 根日线复核中，
+2,140 根发生了换算，五个价格字段最大绝对误差为 `7.11e-15`，全部成交量和成交额与原生
+`front_ratio` 一致。
 
 ```python
 from qmt_receiver import QmtAgentClient, QmtDataStore, sync_all
@@ -101,10 +107,13 @@ with (
     )
 ```
 
-QMT 历史行情默认以 `incremental` 模式补齐本地缓存；`force=True` 改用 `full`，即使区间已经
-下载过也再次下载。财务下载和除权因子查询没有增量/完整模式，本来就会在每次同步时请求，
-所以 `force` 不改变这两类调用。`sync_all()` 默认包含 1 分钟线；其他分钟周期仍按实际需要调用
-`sync_intraday()`。命令行 `qmt-receiver-test sync` 同样支持 `--force`。
+QMT 日线、分钟线和除权因子的完成区间记录在 `<root>/_meta/sync/*.json`，键由数据集、证券代码
+以及分钟周期组成。一次查询和落盘全部成功后才原子提交区间；重叠或相邻区间自动合并，重复同步
+默认只补缺口。日线和分钟线缺口使用 XtData `incremental` 下载；`force=True` 忽略 meta，行情
+改用 `full` 下载，除权因子也重新查询。财务数据仍按每次请求刷新，不使用这组区间 checkpoint。
+
+`sync_all()` 默认包含 1 分钟线；其他分钟周期按实际需要调用 `sync_intraday()`。同步 checkpoint
+使用 `YYYYMMDD` 日级闭区间。命令行 `qmt-receiver-test sync` 同样支持 `--force`。
 
 历史、财务和除权返回在进入 receiver 时已经是具体行结构。存储层只做物理表映射，不再解析通用 DataFrame 或任意 JSON 单元。
 

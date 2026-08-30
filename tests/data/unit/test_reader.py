@@ -32,7 +32,7 @@ from data.reader import (
     MarketReader,
 )
 from models import CAPABILITY_SCHEMAS, CASH_FLOW_STATEMENT_SCHEMA, DAILY_METRICS_SCHEMA
-from qmt_protocol import BarQuote, HistoryBar, SequencedQuote, TickQuote
+from qmt_protocol import BarQuote, DividendFactor, HistoryBar, SequencedQuote, TickQuote
 from qmt_receiver import QmtDataStore
 from tushare_data import TABLE_SCHEMAS, TushareDataStore
 
@@ -756,7 +756,7 @@ def test_tushare_forward_adjustment_rejects_missing_factor_after_projection(
             )
 
 
-def test_qmt_adapter_rejects_front_ratio_intraday_bars_without_pit_metadata(
+def test_qmt_adapter_calculates_forward_intraday_from_raw_bars_and_dr(
     tmp_path: Path,
 ) -> None:
     qmt_root = tmp_path / "qmt"
@@ -783,18 +783,29 @@ def test_qmt_adapter_rejects_front_ratio_intraday_bars_without_pit_metadata(
     with QmtDataStore(qmt_root) as store:
         store.write_intraday({"000001.SZ": [raw]}, "1m", "none")
         store.write_intraday({"000001.SZ": [adjusted]}, "1m", "front_ratio")
+        store.write_dividend_factors(
+            {
+                "000001.SZ": [
+                    DividendFactor(
+                        date="20240103",
+                        time=1_704_211_200_000.0,
+                        dr=2.0,
+                    )
+                ]
+            }
+        )
+        store.mark_sync_completed(
+            "dividend_factors",
+            "000001.SZ",
+            date(2024, 1, 2),
+            date(2024, 1, 4),
+        )
 
     config = SourceConfig(routes={"market.intraday_bars": "qmt"})
-    with (
-        DataCatalog(tushare_root=tmp_path / "tushare", qmt_root=qmt_root) as catalog,
-        pytest.raises(
-            DataCapabilityNotSupportedError,
-            match="缺少 PIT 因子可见性",
-        ),
-    ):
-        (
+    with DataCatalog(tushare_root=tmp_path / "tushare", qmt_root=qmt_root) as catalog:
+        result = (
             DataReader(catalog, sources=config)
-            .at(_as_of(3, 10))
+            .at(_as_of(4, 10))
             .market.bars(
                 symbols=("000001.SZ",),
                 frequency="1m",
@@ -804,8 +815,21 @@ def test_qmt_adapter_rejects_front_ratio_intraday_bars_without_pit_metadata(
             )
         )
 
+    assert result.table.to_pylist()[0] == {
+        "symbol": "000001.SZ",
+        "interval_start": _as_of(2, 9, 30),
+        "interval_end": _as_of(2, 9, 31),
+        "open": 5.0,
+        "high": 6.0,
+        "low": 4.5,
+        "close": 5.5,
+        "pre_close": 4.75,
+        "volume": 10_000.0,
+        "amount": 1_000.0,
+    }
 
-def test_qmt_daily_forward_rejects_legacy_pre_adjusted_partitions(
+
+def test_qmt_daily_forward_uses_raw_and_factors_not_legacy_adjusted_partitions(
     tmp_path: Path,
 ) -> None:
     qmt_root = tmp_path / "qmt"
@@ -827,15 +851,26 @@ def test_qmt_daily_forward_rejects_legacy_pre_adjusted_partitions(
             {"000001.SZ": [HistoryBar(index=20240103, close=7.0)]},
             "front_ratio",
         )
+        store.write_dividend_factors(
+            {
+                "000001.SZ": [
+                    DividendFactor(
+                        date="20240103",
+                        time=1_704_211_200_000.0,
+                        dr=2.0,
+                    )
+                ]
+            }
+        )
+        store.mark_sync_completed(
+            "dividend_factors",
+            "000001.SZ",
+            date(2024, 1, 2),
+            date(2024, 1, 3),
+        )
 
-    with (
-        DataCatalog(tushare_root=tmp_path / "tushare", qmt_root=qmt_root) as catalog,
-        pytest.raises(
-            DataCapabilityNotSupportedError,
-            match="缺少 PIT 因子可见性",
-        ),
-    ):
-        (
+    with DataCatalog(tushare_root=tmp_path / "tushare", qmt_root=qmt_root) as catalog:
+        result = (
             DataReader(
                 catalog,
                 sources=SourceConfig(routes={"market.daily_bars": "qmt"}),
@@ -847,6 +882,45 @@ def test_qmt_daily_forward_rejects_legacy_pre_adjusted_partitions(
                 count=2,
                 adjustment="forward",
                 fields=("close",),
+            )
+        )
+
+    assert result.table.to_pylist() == [
+        {
+            "symbol": "000001.SZ",
+            "interval_start": _as_of(2, 9, 30),
+            "interval_end": _as_of(2, 15),
+            "close": 5.0,
+        }
+    ]
+
+
+def test_qmt_forward_rejects_incomplete_factor_sync_range(tmp_path: Path) -> None:
+    qmt_root = tmp_path / "qmt"
+    with QmtDataStore(qmt_root) as store:
+        store.write_daily(
+            {"000001.SZ": [HistoryBar(index=20240102, close=10.0)]},
+            "none",
+        )
+
+    with (
+        DataCatalog(tushare_root=tmp_path / "tushare", qmt_root=qmt_root) as catalog,
+        pytest.raises(
+            DataCapabilityNotSupportedError,
+            match="复权因子同步区间不完整",
+        ),
+    ):
+        (
+            DataReader(
+                catalog,
+                sources=SourceConfig(routes={"market.daily_bars": "qmt"}),
+            )
+            .at(_as_of(3, 17))
+            .market.bars(
+                symbols=("000001.SZ",),
+                frequency="1d",
+                count=1,
+                adjustment="forward",
             )
         )
 
