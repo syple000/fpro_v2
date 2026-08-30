@@ -48,3 +48,34 @@ def test_refresh_reloads_exact_manifest_file_set(tmp_path: Path) -> None:
         count = catalog.connection.execute("SELECT count(*) FROM tushare.daily").fetchone()
 
     assert count == (2,)
+
+
+def test_refresh_rebuilds_reference_table_cache(tmp_path: Path) -> None:
+    tushare_root = tmp_path / "tushare"
+    with TushareDataStore(tushare_root) as store:
+        store.write(
+            "trade_cal",
+            _table(
+                "trade_cal",
+                {"exchange": "SSE", "cal_date": date(2024, 1, 2), "is_open": 1},
+            ),
+        )
+
+    with DataCatalog(tushare_root=tushare_root, qmt_root=tmp_path / "qmt") as catalog:
+        assert catalog.connection.execute(
+            "SELECT count(*) FROM data_internal.trade_cal"
+        ).fetchone() == (1,)
+        with TushareDataStore(tushare_root) as store:
+            store.write(
+                "trade_cal",
+                _table(
+                    "trade_cal",
+                    {"exchange": "SSE", "cal_date": date(2024, 1, 3), "is_open": 1},
+                ),
+            )
+        catalog.refresh()
+        count = catalog.connection.execute(
+            "SELECT count(*) FROM data_internal.trade_cal"
+        ).fetchone()
+
+    assert count == (2,)

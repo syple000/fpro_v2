@@ -354,11 +354,15 @@ class TushareAdapter:
     ) -> pa.Table:
         direction = _sql_direction(order, default="asc")
         if count is None:
+            assert start is not None
             params = _query_parameters(
                 as_of=as_of,
+                as_of_date=as_of.date(),
                 symbols=symbols,
                 start=start,
                 end=end,
+                start_date=_local_date(start),
+                end_date=_local_date(end),
                 fetch_limit=fetch_limit,
             )
             query = f"""
@@ -370,6 +374,9 @@ class TushareAdapter:
                        CAST(amount * 1000.0 AS DOUBLE) AS amount
                 FROM tushare.daily
                 WHERE trade_date IS NOT NULL
+                  AND trade_date <= $as_of_date
+                  AND trade_date >= $start_date
+                  AND trade_date <= $end_date
                   AND {_day_time("trade_date", "16:05")} <= $as_of
                   AND ($symbols IS NULL OR ts_code IN (SELECT unnest($symbols)))
                   AND {_day_time("trade_date", "09:30")} >= $start
@@ -382,6 +389,7 @@ class TushareAdapter:
                 fetch_limit = None
             params = _query_parameters(
                 as_of=as_of,
+                as_of_date=as_of.date(),
                 symbols=symbols,
                 count=count,
                 fetch_limit=fetch_limit,
@@ -395,6 +403,7 @@ class TushareAdapter:
                        CAST(amount * 1000.0 AS DOUBLE) AS amount
                 FROM tushare.daily
                 WHERE trade_date IS NOT NULL
+                  AND trade_date <= $as_of_date
                   AND {_day_time("trade_date", "16:05")} <= $as_of
                   AND ($symbols IS NULL OR ts_code IN (SELECT unnest($symbols)))
                 QUALIFY row_number() OVER (
@@ -422,23 +431,25 @@ class TushareAdapter:
         columns: tuple[str, ...] | None,
     ) -> pa.Table:
         query = f"""
-            WITH raw_bars AS (
+            WITH raw_bars AS MATERIALIZED (
                 {raw_bars_sql}
+            ), raw_symbols AS (
+                SELECT DISTINCT symbol
+                FROM raw_bars
             ), visible_factors AS (
-                SELECT ts_code AS symbol,
-                       trade_date,
-                       adj_factor AS factor
-                FROM tushare.adj_factor
-                WHERE trade_date IS NOT NULL
-                  AND {_day_time("trade_date", "09:25")} <= $as_of
-                  AND ($symbols IS NULL OR ts_code IN (SELECT unnest($symbols)))
+                SELECT f.ts_code AS symbol,
+                       f.trade_date,
+                       f.adj_factor AS factor
+                FROM tushare.adj_factor f
+                SEMI JOIN raw_symbols s ON s.symbol = f.ts_code
+                WHERE f.trade_date IS NOT NULL
+                  AND f.trade_date <= $as_of_date
+                  AND {_day_time("f.trade_date", "09:25")} <= $as_of
             ), anchors AS (
                 SELECT symbol,
-                       factor AS anchor
+                       arg_max(factor, trade_date) AS anchor
                 FROM visible_factors
-                QUALIFY row_number() OVER (
-                    PARTITION BY symbol ORDER BY trade_date DESC
-                ) = 1
+                GROUP BY symbol
             )
             SELECT b.symbol,
                    b.interval_start,
@@ -837,19 +848,20 @@ class TushareAdapter:
             fetch_limit=fetch_limit,
         )
         query = f"""
-            WITH visible AS (
-                SELECT *
+            WITH visible AS MATERIALIZED (
+                SELECT *,
+                       {_next_session_time("f_ann_date")} AS visible_at
                 FROM tushare.{table}
                 WHERE end_date IS NOT NULL
                   AND f_ann_date IS NOT NULL
                   AND report_type = '1'
-                  AND {_next_session_time("f_ann_date")} <= $as_of
                   AND ($symbols IS NULL OR ts_code IN (SELECT unnest($symbols)))
                   AND ($start IS NULL OR end_date >= $start)
                   AND ($end IS NULL OR end_date < $end)
             ), latest AS (
                 SELECT *
                 FROM visible
+                WHERE visible_at <= $as_of
                 QUALIFY row_number() OVER (
                     PARTITION BY ts_code, end_date, comp_type
                     ORDER BY f_ann_date DESC NULLS LAST,
@@ -859,7 +871,7 @@ class TushareAdapter:
             )
             SELECT ts_code AS symbol,
                    end_date AS period_end,
-                   {_next_session_time("f_ann_date")} AS visible_at,
+                   visible_at,
                    ann_date AS announcement_date,
                    f_ann_date AS actual_announcement_date,
                    CASE comp_type
@@ -914,15 +926,19 @@ class TushareAdapter:
             fetch_limit=fetch_limit,
         )
         query = f"""
-            WITH latest AS (
-                SELECT *
+            WITH visible AS MATERIALIZED (
+                SELECT *,
+                       {_next_session_time("ann_date")} AS visible_at
                 FROM tushare.fina_indicator
                 WHERE end_date IS NOT NULL
                   AND ann_date IS NOT NULL
-                  AND {_next_session_time("ann_date")} <= $as_of
                   AND ($symbols IS NULL OR ts_code IN (SELECT unnest($symbols)))
                   AND ($start IS NULL OR end_date >= $start)
                   AND ($end IS NULL OR end_date < $end)
+            ), latest AS (
+                SELECT *
+                FROM visible
+                WHERE visible_at <= $as_of
                 QUALIFY row_number() OVER (
                     PARTITION BY ts_code, end_date
                     ORDER BY ann_date DESC NULLS LAST,
@@ -931,7 +947,7 @@ class TushareAdapter:
             )
             SELECT ts_code AS symbol,
                    end_date AS period_end,
-                   {_next_session_time("ann_date")} AS visible_at,
+                   visible_at,
                    ann_date AS announcement_date,
                    {select_fields}
             FROM latest
@@ -1065,7 +1081,7 @@ class TushareAdapter:
         fetch_limit: int | None,
         columns: tuple[str, ...] | None,
     ) -> pa.Table:
-        visible = _next_session_time("ann_date")
+        visible_at = _next_session_time("ann_date")
         update_order = (
             ", try_cast(update_flag AS INTEGER) DESC NULLS LAST" if has_update_flag else ""
         )
@@ -1079,16 +1095,21 @@ class TushareAdapter:
             fetch_limit=fetch_limit,
         )
         query = f"""
-            SELECT ts_code AS symbol, {visible} AS visible_at,
+            WITH visible AS MATERIALIZED (
+                SELECT *,
+                       {visible_at} AS visible_at
+                FROM tushare.{table}
+                WHERE end_date IS NOT NULL
+                  AND ann_date IS NOT NULL
+                  AND ($symbols IS NULL OR ts_code IN (SELECT unnest($symbols)))
+            )
+            SELECT ts_code AS symbol, visible_at,
                    end_date AS period_end, ann_date AS announcement_date,
                    {select_fields}
-            FROM tushare.{table}
-            WHERE end_date IS NOT NULL
-              AND ann_date IS NOT NULL
-              AND {visible} <= $as_of
-              AND ($symbols IS NULL OR ts_code IN (SELECT unnest($symbols)))
-              AND ($start IS NULL OR {visible} >= $start)
-              AND {visible} <= $end
+            FROM visible
+            WHERE visible_at <= $as_of
+              AND ($start IS NULL OR visible_at >= $start)
+              AND visible_at <= $end
             QUALIFY row_number() OVER (
                 PARTITION BY ts_code, end_date
                 ORDER BY ann_date DESC NULLS LAST {update_order}
@@ -1109,7 +1130,7 @@ class TushareAdapter:
         fetch_limit: int | None,
         columns: tuple[str, ...] | None = None,
     ) -> pa.Table:
-        visible = _next_session_time("imp_ann_date")
+        visible_at = _next_session_time("imp_ann_date")
         direction = _sql_direction(order, default="asc")
         params = _query_parameters(
             as_of=as_of,
@@ -1119,18 +1140,23 @@ class TushareAdapter:
             fetch_limit=fetch_limit,
         )
         query = f"""
-            SELECT ts_code AS symbol, {visible} AS visible_at, end_date, ann_date, div_proc,
+            WITH visible AS MATERIALIZED (
+                SELECT *,
+                       {visible_at} AS visible_at
+                FROM tushare.dividend
+                WHERE imp_ann_date IS NOT NULL
+                  AND ($symbols IS NULL OR ts_code IN (SELECT unnest($symbols)))
+            )
+            SELECT ts_code AS symbol, visible_at, end_date, ann_date, div_proc,
                    stk_div AS stock_dividend, stk_bo_rate AS stock_bonus_rate,
                    stk_co_rate AS stock_conversion_rate, cash_div AS cash_dividend,
                    cash_div_tax AS cash_dividend_before_tax, record_date, ex_date, pay_date,
                    div_listdate AS listing_date, imp_ann_date AS implementation_ann_date,
                    base_date, base_share * 10000.0 AS base_share
-            FROM tushare.dividend
-            WHERE imp_ann_date IS NOT NULL
-              AND {visible} <= $as_of
-              AND ($symbols IS NULL OR ts_code IN (SELECT unnest($symbols)))
-              AND ($start IS NULL OR {visible} >= $start)
-              AND {visible} <= $end
+            FROM visible
+            WHERE visible_at <= $as_of
+              AND ($start IS NULL OR visible_at >= $start)
+              AND visible_at <= $end
             ORDER BY visible_at {direction}, symbol, ex_date, end_date, ann_date,
                      div_proc, implementation_ann_date
             LIMIT $fetch_limit
@@ -1187,7 +1213,7 @@ class TushareAdapter:
         query = f"""
             SELECT ts_code AS symbol, CAST({level} AS TINYINT) AS level,
                    l{level}_code AS industry_code, l{level}_name AS industry_name
-            FROM tushare.sw_industry
+            FROM data_internal.sw_industry
             WHERE {_day_time("in_date", "09:25")} <= $as_of
               AND (out_date IS NULL OR out_date > $as_of_date)
               AND ($symbols IS NULL OR ts_code IN (SELECT unnest($symbols)))
@@ -1223,7 +1249,7 @@ class TushareAdapter:
                    exchange,
                    CAST(is_open AS BOOLEAN) AS is_open,
                    pretrade_date AS previous_session
-            FROM tushare.trade_cal
+            FROM data_internal.trade_cal
             WHERE cal_date <= $as_of_date
               AND cal_date >= $start
               AND cal_date < $end
@@ -1242,7 +1268,7 @@ class TushareAdapter:
         query = """
             SELECT cal_date,
                    exchange
-            FROM tushare.trade_cal
+            FROM data_internal.trade_cal
             WHERE cal_date < $end
               AND CAST(is_open AS BOOLEAN)
               AND exchange = $exchange
@@ -1281,12 +1307,16 @@ class QmtAdapter:
         qmt_adjustments = ("none",) if adjustment == "none" else ("front_ratio", "front")
         direction = _sql_direction(order, default="asc")
         if count is None:
+            assert start is not None
             params = _query_parameters(
                 adjustments=qmt_adjustments,
                 as_of=as_of,
+                as_of_date=as_of.date(),
                 symbols=symbols,
                 start=start,
                 end=end,
+                start_date=_local_date(start),
+                end_date=_local_date(end),
                 fetch_limit=fetch_limit,
             )
             query = f"""
@@ -1294,6 +1324,10 @@ class QmtAdapter:
                     SELECT *
                     FROM qmt.daily
                     WHERE adjustment IN (SELECT unnest($adjustments))
+                      AND trade_date <= $as_of_date
+                      AND trade_date >= $start_date
+                      AND trade_date <= $end_date
+                      AND ($symbols IS NULL OR code IN (SELECT unnest($symbols)))
                     QUALIFY row_number() OVER (
                         PARTITION BY code, trade_date
                         ORDER BY CASE adjustment
@@ -1311,7 +1345,6 @@ class QmtAdapter:
                        amount
                 FROM source_bars
                 WHERE {_day_time("trade_date", "16:05")} <= $as_of
-                  AND ($symbols IS NULL OR code IN (SELECT unnest($symbols)))
                   AND {_day_time("trade_date", "09:30")} >= $start
                   AND {_day_time("trade_date", "09:30")} < $end
                 ORDER BY interval_end {direction}, symbol, interval_start {direction}
@@ -1323,6 +1356,7 @@ class QmtAdapter:
             params = _query_parameters(
                 adjustments=qmt_adjustments,
                 as_of=as_of,
+                as_of_date=as_of.date(),
                 symbols=symbols,
                 count=count,
                 fetch_limit=fetch_limit,
@@ -1332,6 +1366,8 @@ class QmtAdapter:
                     SELECT *
                     FROM qmt.daily
                     WHERE adjustment IN (SELECT unnest($adjustments))
+                      AND trade_date <= $as_of_date
+                      AND ($symbols IS NULL OR code IN (SELECT unnest($symbols)))
                     QUALIFY row_number() OVER (
                         PARTITION BY code, trade_date
                         ORDER BY CASE adjustment
@@ -1349,7 +1385,6 @@ class QmtAdapter:
                        amount
                 FROM source_bars
                 WHERE {_day_time("trade_date", "16:05")} <= $as_of
-                  AND ($symbols IS NULL OR code IN (SELECT unnest($symbols)))
                 QUALIFY row_number() OVER (
                     PARTITION BY code ORDER BY trade_date DESC
                 ) <= $count
@@ -1395,6 +1430,7 @@ class QmtAdapter:
             adjustment=qmt_adjustment,
             include_live=qmt_adjustment == "none",
             as_of=as_of,
+            as_of_date=as_of.date(),
             as_of_us=as_of_us,
             latest_start_us=as_of_us - minutes * 60 * 1_000_000,
             symbols=symbols,
@@ -1402,6 +1438,8 @@ class QmtAdapter:
             end=end,
             start_us=_epoch_us(start),
             end_us=_epoch_us(end),
+            start_date=_local_date(start) if start is not None else None,
+            end_date=_local_date(end),
             count=count,
             fetch_limit=fetch_limit,
         )
@@ -1417,6 +1455,10 @@ class QmtAdapter:
                 FROM qmt.intraday
                 WHERE period = $period
                   AND adjustment = $adjustment
+                  AND trading_date <= $as_of_date
+                  AND ($symbols IS NULL OR code IN (SELECT unnest($symbols)))
+                  AND ($start_date IS NULL OR trading_date >= $start_date)
+                  AND trading_date <= $end_date
                   AND event_time <= $latest_start_us
                   AND ($start_us IS NULL OR event_time >= $start_us)
                   AND ($end_us IS NULL OR event_time < $end_us)
@@ -1433,6 +1475,10 @@ class QmtAdapter:
                 FROM qmt.bars
                 WHERE $include_live
                   AND period = $period
+                  AND trading_date <= $as_of_date
+                  AND ($symbols IS NULL OR code IN (SELECT unnest($symbols)))
+                  AND ($start_date IS NULL OR trading_date >= $start_date)
+                  AND trading_date <= $end_date
                   AND event_time IS NOT NULL
                   AND received_at <= $as_of_us
                   AND event_time <= $latest_start_us
@@ -1462,7 +1508,6 @@ class QmtAdapter:
                    open, high, low, close, pre_close, volume, amount
             FROM platform_bars
             WHERE interval_end <= $as_of
-              AND ($symbols IS NULL OR symbol IN (SELECT unnest($symbols)))
               AND ($start IS NULL OR interval_start >= $start)
               AND ($end IS NULL OR interval_start < $end)
             QUALIFY $count IS NULL OR row_number() OVER (
@@ -1484,6 +1529,7 @@ class QmtAdapter:
         as_of_us = _epoch_us(as_of)
         assert as_of_us is not None
         params = _query_parameters(
+            as_of_date=as_of.date(),
             as_of_us=as_of_us,
             symbols=symbols,
             fetch_limit=fetch_limit,
@@ -1502,7 +1548,8 @@ class QmtAdapter:
                        {_qmt_share_volume("quote.volume", "quote.pvolume")} AS volume,
                        quote.amount AS amount
                 FROM qmt.ticks
-                WHERE received_at <= $as_of_us
+                WHERE trading_date <= $as_of_date
+                  AND received_at <= $as_of_us
                   AND ($symbols IS NULL OR code IN (SELECT unnest($symbols)))
 
                 UNION ALL
@@ -1519,7 +1566,8 @@ class QmtAdapter:
                        {_qmt_share_volume("quote.volume")} AS volume,
                        quote.amount AS amount
                 FROM qmt.bars
-                WHERE received_at <= $as_of_us
+                WHERE trading_date <= $as_of_date
+                  AND received_at <= $as_of_us
                   AND ($symbols IS NULL OR code IN (SELECT unnest($symbols)))
             )
             SELECT symbol,
@@ -1619,7 +1667,7 @@ def _next_session_time(column: str) -> str:
     # 已发布日历优先；空日历时只退化为工作日，便于读取尚未同步日历的轻量数据集。
     fallback = f"{column} + CASE dayofweek({column}) WHEN 5 THEN 3 WHEN 6 THEN 2 ELSE 1 END"
     next_date = (
-        "coalesce((SELECT min(cal_date) FROM tushare.trade_cal "
+        "coalesce((SELECT min(cal_date) FROM data_internal.trade_cal "
         f"WHERE is_open = 1 AND cal_date > {column}), {fallback})"
     )
     return f"timezone('{_TZ}', CAST({next_date} AS DATE) + TIME '09:25')"
@@ -1642,6 +1690,12 @@ def _epoch_us(value: object) -> int | None:
     else:
         raise TypeError(f"无法转换为微秒时间戳: {value!r}")
     return int(instant.timestamp() * 1_000_000)
+
+
+def _local_date(value: date | datetime) -> date:
+    if isinstance(value, datetime):
+        return value.astimezone(ZoneInfo(_TZ)).date()
+    return value
 
 
 def _sql_direction(value: object, *, default: str) -> str:

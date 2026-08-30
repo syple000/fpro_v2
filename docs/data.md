@@ -803,7 +803,9 @@ fundamentals.statements(kind="cash_flow")
 身份和业务范围过滤可以安全地下推到版本选择之前；依赖 payload 值的过滤必须在版本选择之后。
 否则最新修订不符合条件时，查询可能错误地重新返回符合条件的旧版本。
 
-`DataCatalog` 负责物理数据和唯一的 DuckDB 连接；内置适配器负责来源接入和标准化；
+`DataCatalog` 负责物理数据和唯一的 DuckDB 连接；为避免每次查询重新打开数千个小文件，
+`trade_cal` 和 `sw_industry` 会在 `refresh()` 时同步物化到私有的 `data_internal` schema，
+原始 `tushare` 视图仍保持不变。内置适配器负责来源接入和标准化；
 `DataReader` 及其领域 Reader 负责来源路由、PIT、版本、平台 Schema 和排序。策略代码不得持有
 `catalog.connection` 或数据源客户端。运行期间需要加载新 Manifest 时由外围流程显式调用
 `catalog.refresh()`。

@@ -166,6 +166,7 @@ class DataView:
         sort: tuple[tuple[str, SortDirection], ...],
         limit: int | None,
         sources: Sequence[str],
+        presorted: bool = True,
     ) -> QueryResult:
         _validate_identity(table, identity)
         payload = [name for name in table.schema.names if name not in identity]
@@ -175,7 +176,7 @@ class DataView:
         if missing_sort:
             # Sort keys are platform identity fields and must never be projected away.
             raise DataAdapterError(f"结果缺少排序字段: {missing_sort}")
-        if projected.num_rows > 1:
+        if not presorted and projected.num_rows > 1:
             indices = pc.sort_indices(
                 projected,
                 sort_keys=list(sort),
@@ -406,6 +407,7 @@ class MarketReader:
             sort=(("symbol", "ascending"),),
             limit=limit,
             sources=sources,
+            presorted=False,
         )
 
     def daily_metrics(
