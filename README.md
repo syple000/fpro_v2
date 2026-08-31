@@ -22,6 +22,7 @@ Parquet 存储的接口和最简示例见 [docs/parquet_store.md](docs/parquet_s
 Tushare 历史数据字段、增量规则和验证方式见 [docs/tushare_data.md](docs/tushare_data.md)。
 统一 PIT Reader 见 [docs/data.md](docs/data.md)。
 跨源随机抽样复核见 [docs/data_validation.md](docs/data_validation.md)。
+回测系统的架构、业务规则、风险点和实施顺序见 [docs/backtest.md](docs/backtest.md)。
 
 ## 时间规范
 
