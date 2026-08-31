@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import Callable
 from datetime import date, timedelta
 from pathlib import Path
@@ -301,9 +302,11 @@ def test_requested_range_is_refetched_and_partitions_are_not_duplicated(
 def test_sync_inc_uses_planned_windows_and_ignores_sync_all_progress(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     current = date(2024, 7, 1)
     calls: dict[str, tuple[date, date]] = {}
+    caplog.set_level(logging.INFO, logger="tushare_data.sync")
 
     def record(dataset: str) -> Callable[..., int]:
         def sync_dataset(
@@ -367,6 +370,9 @@ def test_sync_inc_uses_planned_windows_and_ignores_sync_all_progress(
     assert {call["start_date"] for call in calendar_calls} == {"20240502"}
     assert {call["end_date"] for call in calendar_calls} == {"20250702"}
     assert set(result) == {"trade_cal", *datasets}
+    assert "sync_inc trade_cal 已完成 2024-05-02 至 2025-07-02，写入" in caplog.text
+    assert "sync_inc daily 已完成 2024-06-27 至 2024-07-01，写入 1 行" in caplog.text
+    assert "sync_inc income 已完成 2021-07-01 至 2024-07-01，写入 1 行" in caplog.text
 
     calls.clear()
     ordinary = date(2024, 4, 30)

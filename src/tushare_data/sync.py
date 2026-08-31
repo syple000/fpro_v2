@@ -661,7 +661,16 @@ def sync_inc(
     calendar_start = current - timedelta(days=INC_CALENDAR_PAST_DAYS)
     calendar_end = current + timedelta(days=INC_CALENDAR_FUTURE_DAYS)
 
-    result: dict[str, int] = {"trade_cal": sync_trade_cal(pro, store, calendar_start, calendar_end)}
+    result: dict[str, int] = {
+        "trade_cal": _sync_inc_dataset(
+            pro,
+            store,
+            "trade_cal",
+            sync_trade_cal,
+            calendar_start,
+            calendar_end,
+        )
+    }
     jobs: list[tuple[str, MarketSyncFunction, date, date]] = []
     open_dates = _market_open_dates(store, calendar_start, current)
     if open_dates:
@@ -734,12 +743,39 @@ def sync_inc(
         thread_name_prefix="tushare-dataset",
     ) as executor:
         futures = {
-            dataset: executor.submit(function, pro, store, start_date, end_date)
+            dataset: executor.submit(
+                _sync_inc_dataset,
+                pro,
+                store,
+                dataset,
+                function,
+                start_date,
+                end_date,
+            )
             for dataset, function, start_date, end_date in jobs
         }
         for dataset, future in futures.items():
             result[dataset] = future.result()
     return result
+
+
+def _sync_inc_dataset(
+    pro: TushareProClient,
+    store: TushareDataStore,
+    dataset: str,
+    function: MarketSyncFunction,
+    start_date: date,
+    end_date: date,
+) -> int:
+    written = function(pro, store, start_date, end_date)
+    logger.info(
+        "sync_inc %s 已完成 %s 至 %s，写入 %d 行",
+        dataset,
+        start_date,
+        end_date,
+        written,
+    )
+    return written
 
 
 def _sync_trade_date_dataset(
