@@ -25,6 +25,7 @@ QUERY_NAMES = {
     "corporate_actions.dividends",
     "corporate_actions.adjustment_factors",
     "classification.industry",
+    "reference.stocks",
     "calendar.sessions",
 }
 

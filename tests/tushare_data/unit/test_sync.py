@@ -25,6 +25,7 @@ from tushare_data import (
     sync_fina_audit,
     sync_fina_indicator,
     sync_income,
+    sync_stock_basic,
     sync_suspend_d,
     sync_sw_industry,
 )
@@ -325,6 +326,7 @@ def test_sync_inc_uses_planned_windows_and_ignores_sync_all_progress(
 
     datasets = (
         "daily",
+        "stock_basic",
         "stk_limit",
         "suspend_d",
         "stock_st",
@@ -355,6 +357,7 @@ def test_sync_inc_uses_planned_windows_and_ignores_sync_all_progress(
         result = sync_module.sync_inc(pro, store, current)
 
     assert calls["daily"] == (date(2024, 6, 27), current)
+    assert calls["stock_basic"] == (current, current)
     assert calls["stk_limit"] == calls["suspend_d"] == calls["stock_st"] == calls["daily"]
     assert calls["daily_basic"] == (date(2024, 6, 22), current)
     assert calls["moneyflow"] == calls["adj_factor"] == calls["daily_basic"]
@@ -395,6 +398,7 @@ def test_sync_all_resumes_failed_chunk_and_then_skips_completed_range(
     datasets = (
         "trade_cal",
         "daily",
+        "stock_basic",
         "daily_basic",
         "stk_limit",
         "stock_st",
@@ -898,6 +902,80 @@ def test_sw_industry_full_market_api_is_paginated(tmp_path: Path) -> None:
     ]
 
 
+def test_stock_basic_fetches_listed_delisted_and_paused_stocks(tmp_path: Path) -> None:
+    columns = SOURCE_FIELDS["stock_basic"]
+
+    def stock_row(
+        ts_code: str,
+        list_status: str,
+        list_date: str,
+        delist_date: str | None = None,
+    ) -> dict[str, object]:
+        row = _record("stock_basic", ts_code, list_date)
+        row.update(
+            {
+                "symbol": ts_code.split(".")[0],
+                "name": "测试股票",
+                "market": "主板",
+                "exchange": "SZSE",
+                "curr_type": "CNY",
+                "list_status": list_status,
+                "list_date": list_date,
+                "delist_date": delist_date,
+            }
+        )
+        return row
+
+    def responder(
+        api_name: str,
+        fields: str,
+        arguments: dict[str, object],
+    ) -> pd.DataFrame:
+        if api_name != "stock_basic":
+            return _empty(fields)
+        rows = {
+            "L": [stock_row("000001.SZ", "L", "19910403")],
+            "D": [stock_row("000002.SZ", "D", "19910129", "20240131")],
+            "P": [stock_row("000003.SZ", "P", "19910703")],
+        }[str(arguments["list_status"])]
+        return pd.DataFrame(rows, columns=pd.Index(columns))
+
+    pro, api = _client(responder)
+    with TushareDataStore(tmp_path) as store:
+        assert sync_stock_basic(pro, store, "20170101", "20260822") == 3
+        listed = store.read("stock_basic", date(1991, 4, 3)).to_pylist()
+        delisted = store.read("stock_basic", date(1991, 1, 29)).to_pylist()
+
+    calls = [arguments for name, _, arguments in api.calls if name == "stock_basic"]
+    assert [(call["list_status"], call["offset"]) for call in calls] == [
+        ("L", 0),
+        ("D", 0),
+        ("P", 0),
+    ]
+    assert listed[0]["ts_code"] == "000001.SZ"
+    assert delisted[0]["delist_date"] == date(2024, 1, 31)
+
+
+def test_stock_basic_rejects_record_without_list_date(tmp_path: Path) -> None:
+    def responder(
+        api_name: str,
+        fields: str,
+        arguments: dict[str, object],
+    ) -> pd.DataFrame:
+        if api_name != "stock_basic" or arguments["list_status"] != "L":
+            return _empty(fields)
+        row = _record("stock_basic", "000001.SZ", "20240102")
+        row["list_date"] = None
+        return pd.DataFrame([row], columns=pd.Index(fields.split(",")))
+
+    pro, _ = _client(responder)
+    with (
+        TushareDataStore(tmp_path) as store,
+        pytest.raises(ValueError, match="缺少 list_date"),
+    ):
+        sync_stock_basic(pro, store, "20240101", "20240102")
+
+
 def test_audit_is_the_only_per_stock_fallback_and_uses_full_requested_range(
     tmp_path: Path,
 ) -> None:
@@ -1092,6 +1170,12 @@ def test_every_standard_dataset_keeps_only_source_fields_and_uses_natural_partit
 
 
 def test_schema_contains_current_documented_and_proxy_supported_fields() -> None:
+    assert SOURCE_FIELDS["stock_basic"][-4:] == (
+        "delist_date",
+        "is_hs",
+        "act_name",
+        "act_ent_type",
+    )
     assert SOURCE_FIELDS["daily"][-2:] == ("ah_vol", "ah_amount")
     assert "pre_close" in SOURCE_FIELDS["stk_limit"]
     assert "yoy_sales" in SOURCE_FIELDS["express"]

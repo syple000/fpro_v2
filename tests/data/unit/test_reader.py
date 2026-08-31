@@ -30,6 +30,7 @@ from data.reader import (
     CorporateActionsReader,
     FundamentalsReader,
     MarketReader,
+    ReferenceReader,
 )
 from models import CAPABILITY_SCHEMAS, CASH_FLOW_STATEMENT_SCHEMA, DAILY_METRICS_SCHEMA
 from qmt_protocol import BarQuote, DividendFactor, HistoryBar, SequencedQuote, TickQuote
@@ -132,6 +133,7 @@ def test_adapters_expose_explicit_capability_parameters() -> None:
         CorporateActionsReader.dividends,
         CorporateActionsReader.adjustment_factors,
         ClassificationReader.industry,
+        ReferenceReader.stocks,
         CalendarReader.sessions,
     ),
 )
@@ -1445,6 +1447,80 @@ def test_industry_reader_does_not_expose_future_membership_state(tmp_path: Path)
     assert new.table.to_pylist()[0]["industry_code"] == "850002.SI"
     assert "out_date" not in old.table.schema.names
     assert "is_new" not in old.table.schema.names
+
+
+def test_stock_reference_builds_point_in_time_cny_universe(tmp_path: Path) -> None:
+    tushare_root = tmp_path / "tushare"
+    with TushareDataStore(tushare_root) as store:
+        store.write(
+            "stock_basic",
+            _table(
+                "stock_basic",
+                {
+                    "ts_code": "000001.SZ",
+                    "market": "主板",
+                    "exchange": "SZSE",
+                    "curr_type": "CNY",
+                    "list_status": "L",
+                    "list_date": date(2020, 1, 1),
+                },
+                {
+                    "ts_code": "000002.SZ",
+                    "market": "主板",
+                    "exchange": "SZSE",
+                    "curr_type": "CNY",
+                    "list_status": "D",
+                    "list_date": date(2020, 1, 2),
+                    "delist_date": date(2024, 1, 3),
+                },
+                {
+                    "ts_code": "000003.SZ",
+                    "market": "创业板",
+                    "exchange": "SZSE",
+                    "curr_type": "CNY",
+                    "list_status": "L",
+                    "list_date": date(2024, 1, 3),
+                },
+                {
+                    "ts_code": "900901.SH",
+                    "market": "主板",
+                    "exchange": "SSE",
+                    "curr_type": "USD",
+                    "list_status": "L",
+                    "list_date": date(2020, 1, 1),
+                },
+            ),
+        )
+
+    with DataCatalog(tushare_root=tushare_root, qmt_root=tmp_path / "qmt") as catalog:
+        reader = DataReader(
+            catalog,
+            sources=SourceConfig(routes={"reference.stocks": "tushare"}),
+        )
+        before = reader.at(_as_of(2, 10)).reference.stocks(fields=("listing_date",))
+        listing_morning = reader.at(_as_of(3, 9, 24)).reference.stocks()
+        after = reader.at(_as_of(3, 9, 25)).reference.stocks(market="创业板")
+        all_currencies = reader.at(_as_of(2, 10)).reference.stocks(currency=None)
+
+    assert before.table.to_pylist() == [
+        {"symbol": "000001.SZ", "listing_date": date(2020, 1, 1)},
+        {"symbol": "000002.SZ", "listing_date": date(2020, 1, 2)},
+    ]
+    assert [row["symbol"] for row in listing_morning.table.to_pylist()] == ["000001.SZ"]
+    assert after.table.to_pylist() == [
+        {
+            "symbol": "000003.SZ",
+            "exchange": "SZSE",
+            "market": "创业板",
+            "currency": "CNY",
+            "listing_date": date(2024, 1, 3),
+        }
+    ]
+    assert [row["symbol"] for row in all_currencies.table.to_pylist()] == [
+        "000001.SZ",
+        "000002.SZ",
+        "900901.SH",
+    ]
 
 
 def test_pit_view_time_is_aware_normalized_and_read_only(tmp_path: Path) -> None:

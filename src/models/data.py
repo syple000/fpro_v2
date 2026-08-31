@@ -141,6 +141,16 @@ INDUSTRY_SCHEMA = pa.schema(
     ]
 )
 
+STOCK_SCHEMA = pa.schema(
+    [
+        pa.field("symbol", pa.string(), nullable=False),
+        pa.field("exchange", pa.string()),
+        pa.field("market", pa.string()),
+        pa.field("currency", pa.string()),
+        pa.field("listing_date", pa.date32(), nullable=False),
+    ]
+)
+
 SESSION_SCHEMA = pa.schema(
     [
         pa.field("cal_date", pa.date32(), nullable=False),
@@ -196,6 +206,9 @@ class DataCapability(StrEnum):
 
     # 股票所属的行业分类及层级。
     INDUSTRY = "classification.industry"
+
+    # 证券主数据和指定时点仍处于上市区间内的股票集合。
+    STOCKS = "reference.stocks"
     # 交易日历：是否开市及上一交易日；不是登录会话。
     SESSIONS = "calendar.sessions"
 

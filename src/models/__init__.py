@@ -14,6 +14,7 @@ from models.data import (
     SESSION_SCHEMA,
     ST_STATUS_SCHEMA,
     STATUS_SCHEMA,
+    STOCK_SCHEMA,
     SUSPENSION_SCHEMA,
     DataCapability,
     QueryResult,
@@ -48,6 +49,7 @@ CAPABILITY_SCHEMAS = MappingProxyType(
         DataCapability.DIVIDENDS: DIVIDEND_SCHEMA,
         DataCapability.ADJUSTMENT_FACTORS: ADJUSTMENT_FACTOR_SCHEMA,
         DataCapability.INDUSTRY: INDUSTRY_SCHEMA,
+        DataCapability.STOCKS: STOCK_SCHEMA,
         DataCapability.SESSIONS: SESSION_SCHEMA,
     }
 )
@@ -70,6 +72,7 @@ __all__ = [
     "MONEYFLOW_SCHEMA",
     "PRICE_LIMIT_SCHEMA",
     "SESSION_SCHEMA",
+    "STOCK_SCHEMA",
     "ST_STATUS_SCHEMA",
     "STATUS_SCHEMA",
     "SUSPENSION_SCHEMA",

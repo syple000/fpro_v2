@@ -25,7 +25,7 @@ income = data.fundamentals.statements(
 status = data.market.status(symbols=("000001.SZ",))
 ```
 
-调用方只需要理解 `market/fundamentals/corporate_actions/classification/calendar`，不需要理解
+调用方只需要理解 `market/fundamentals/corporate_actions/classification/reference/calendar`，不需要理解
 数据来自 Tushare 还是 QMT，也不需要理解源表名、版本选择或 SQL。
 
 ## 一条核心规则
@@ -88,6 +88,7 @@ DAILY_BASIC_READY 17:05
 | `fina_indicator` | `next_session(ann_date)` 09:25 | 按 Tushare 已定义的指标口径使用 |
 | 完整 `dividend` 实施记录 | `next_session(imp_ann_date)` 09:25 | 不用预案 `ann_date` 替补 |
 | `sw_industry` 成员 | `in_date` 当日 09:25 | 只返回当前行业，不返回未来退出信息 |
+| `stock_basic` 上市区间 | `list_date` 当日 09:25 | 用 `[list_date, delist_date)` 构造股票池，不返回未来退市日期 |
 | `trade_cal` | 不走普通 PIT 规则 | 作为回测引擎配置 |
 
 D 表示记录的 `trade_date`、公告日期或生效日期。可见日期为空时，该记录不可见，不回退到其他
@@ -215,8 +216,9 @@ alpha 数据逐日解锁。策略只读取当前和历史 session；若要精确
 - 未登记可见性规则的新表，严格 Reader 拒绝读取；
 - 空值或缺失不自动补零、前向填充、换表或切换数据源。
 
-股票池也必须按历史时点构造。不能使用今天仍上市的股票列表回测过去；需要结合历史股票列表、
-上市/退市区间和当日交易状态，避免幸存者偏差。
+股票池也必须按历史时点构造。`reference.stocks()` 根据 `stock_basic` 的上市/退市区间返回当时
+仍在上市区间内的股票；调用方再结合当日停牌和 ST 状态构造策略股票池，避免只使用今天仍上市
+股票产生幸存者偏差。
 
 需要可复现回测时，调用方应在运行期间不调用 `catalog.refresh()`，并自行保留对应的 Manifest
 和 Parquet 文件版本。当前 Reader 不提供物理文件归档或历史版本恢复。
@@ -309,6 +311,7 @@ Reader 在统一入口根据 `CAPABILITY_SCHEMAS` 校验字段名称、顺序、
 | `fundamentals.indicators` | `financial_indicators()` |
 | 预告、快报和审计 | `disclosures(kind=...)` |
 | 分红、复权因子、行业 | `dividends()` / `adjustment_factors()` / `industry()` |
+| 历史股票集合 | `stocks()` |
 | 交易日历 | `sessions()` 和 `previous_session()` |
 
 来源声明 capability 却缺少对应方法时，Reader 在构造阶段抛出
@@ -338,6 +341,7 @@ Reader 在统一入口根据 `CAPABILITY_SCHEMAS` 校验字段名称、顺序、
 | `corporate_actions.dividends` | 分红实施记录 |
 | `corporate_actions.adjustment_factors` | 复权因子 |
 | `classification.industry` | 行业分类和成员 |
+| `reference.stocks` | 指定时点仍在上市区间内的股票主数据 |
 | `calendar.sessions` | 交易日历 |
 
 Reader 创建时校验所有已配置的 `source_id` 是否注册并支持对应基础数据集；每次查询再校验频率、
@@ -427,6 +431,7 @@ with DataCatalog(
 | `fundamentals.disclosures()` | `tushare.forecast`、`express`、`fina_audit` |
 | `corporate_actions.dividends()` | `tushare.dividend` |
 | `classification.industry()` | `tushare.sw_industry` |
+| `reference.stocks()` | `tushare.stock_basic` 的上市/退市区间 |
 | `calendar.*` | `tushare.trade_cal` |
 
 `qmt.financial` 当前只用于交叉验证，不作为第一版策略公共接口的数据源。QMT
@@ -439,7 +444,7 @@ with DataCatalog(
 
 - `symbols` 必须显式传入；空序列返回空结果，不解释为全市场；
 - 支持全市场的接口必须显式传 `ALL_SYMBOLS`；结果仍受 Reader 内部安全上限保护；
-- `market.status()` 在没有 PIT 股票池前不支持 `ALL_SYMBOLS`，必须显式传入证券列表；
+- `market.status()` 不支持 `ALL_SYMBOLS`；需要全市场状态时先通过 `reference.stocks()` 获取 PIT 股票池；
 - 重复或格式错误的证券代码直接报错；
 - `fields=None` 表示该接口的全部公共字段；非空时只接受登记字段，不接受表达式或 SQL；
 - 业务时间的 `start/end` 和报告范围均为左闭右开 `[start, end)`；
@@ -539,8 +544,8 @@ status = data.market.status(
 
 每个 symbol 最多一行，固定按 `symbol ASC` 排序。Reader 内部组合三张 Tushare 表；缺少其中一张
 表的行保持对应状态未知，不能把缺失解释为 `False` 或普通股票。
-停牌和 ST 等状态表是稀疏表，不能用它们推导全市场股票集合。因此当前 `status()` 明确拒绝
-`ALL_SYMBOLS`；调用方应传入其 PIT 股票池，未来增加历史 `universe(as_of)` 后再由平台执行左连接。
+停牌和 ST 等状态表是稀疏表，不能用它们推导全市场股票集合。因此 `status()` 明确拒绝
+`ALL_SYMBOLS`；调用方应先用 `reference.stocks()` 取得 PIT 股票池，再显式传入证券列表。
 
 ### 日终指标和资金流
 
@@ -691,9 +696,22 @@ industry = data.classification.industry(
 每只股票返回 `as_of` 时有效的一个行业，固定按 `symbol ASC` 排序。`level` 只允许 `1/2/3`；
 返回类型不包含未来 `out_date` 和源表状态字段 `is_new`。
 
-成熟量化系统通常还提供历史股票池接口，但当前仓库没有可靠的按日上市/退市股票列表。
-在补充 Tushare 历史股票列表前，不提供会退化为“当前全部股票”的 `universe()`；调用方必须显式
-传入 symbols，避免幸存者偏差。
+## 证券主数据接口 `reference`
+
+```python
+stocks = data.reference.stocks(
+    exchange=None,
+    market=None,
+    currency="CNY",
+    fields=("exchange", "market", "listing_date"),
+)
+```
+
+接口返回 `as_of` 时满足 `list_date <= D < delist_date` 的股票，`delist_date` 为空时没有右边界；
+上市日从 09:25 起进入结果。默认只返回人民币股票，可以用 `exchange/market` 进一步筛选，或传
+`currency=None` 保留其他币种。结果不包含当前 `list_status`、`delist_date`、当前名称或 Tushare
+静态行业字段，避免把当前快照中的未来状态泄露给策略；历史行业应使用
+`classification.industry()`。
 
 ## 日历接口 `calendar`
 
@@ -741,6 +759,7 @@ class QueryResult:
 | `fundamentals.disclosures()` | `visible_at ASC, symbol ASC, period_end ASC, announcement_date ASC` |
 | `corporate_actions.dividends()` | `visible_at ASC, symbol ASC, ex_date ASC, end_date ASC, ann_date ASC, div_proc ASC, imp_ann_date ASC` |
 | `classification.industry()` | `symbol ASC` |
+| `reference.stocks()` | `symbol ASC` |
 | `calendar.sessions()` | `cal_date ASC, exchange ASC` |
 
 排序必须显式写入 SQL，不能依赖 Parquet、Manifest 或 DuckDB 的物理行顺序。`order` 只反转表中
@@ -833,7 +852,7 @@ fundamentals.statements(kind="cash_flow")
 否则最新修订不符合条件时，查询可能错误地重新返回符合条件的旧版本。
 
 `DataCatalog` 负责物理数据和唯一的 DuckDB 连接；为避免每次查询重新打开数千个小文件，
-`trade_cal` 和 `sw_industry` 会在 `refresh()` 时同步物化到私有的 `data_internal` schema，
+`trade_cal`、`sw_industry` 和 `stock_basic` 会在 `refresh()` 时同步物化到私有的 `data_internal` schema，
 原始 `tushare` 视图仍保持不变。内置适配器负责来源接入和标准化；
 `DataReader` 及其领域 Reader 负责来源路由、PIT、版本、平台 Schema 和排序。策略代码不得持有
 `catalog.connection` 或数据源客户端。运行期间需要加载新 Manifest 时由外围流程显式调用

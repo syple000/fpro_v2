@@ -34,6 +34,7 @@ from models import (
     PRICE_LIMIT_SCHEMA,
     SESSION_SCHEMA,
     ST_STATUS_SCHEMA,
+    STOCK_SCHEMA,
     SUSPENSION_SCHEMA,
     DataCapability,
 )
@@ -73,6 +74,7 @@ _TUSHARE_CAPABILITIES = frozenset(
         DataCapability.DIVIDENDS,
         DataCapability.ADJUSTMENT_FACTORS,
         DataCapability.INDUSTRY,
+        DataCapability.STOCKS,
         DataCapability.SESSIONS,
     }
 )
@@ -1299,6 +1301,41 @@ class TushareAdapter:
             LIMIT $fetch_limit
         """
         return _fetch(self._connection, query, params, INDUSTRY_SCHEMA, columns)
+
+    def stocks(
+        self,
+        *,
+        as_of: datetime,
+        exchange: str | None,
+        market: str | None,
+        currency: str | None,
+        fetch_limit: int | None,
+        columns: tuple[str, ...] | None = None,
+    ) -> pa.Table:
+        params = _query_parameters(
+            as_of=as_of,
+            as_of_date=as_of.date(),
+            exchange=exchange,
+            market=market,
+            currency=currency,
+            fetch_limit=fetch_limit,
+        )
+        query = f"""
+            SELECT ts_code AS symbol,
+                   exchange,
+                   market,
+                   curr_type AS currency,
+                   list_date AS listing_date
+            FROM data_internal.stock_basic
+            WHERE {_day_time("list_date", "09:25")} <= $as_of
+              AND (delist_date IS NULL OR $as_of_date < delist_date)
+              AND ($exchange IS NULL OR exchange = $exchange)
+              AND ($market IS NULL OR market = $market)
+              AND ($currency IS NULL OR curr_type = $currency)
+            ORDER BY symbol
+            LIMIT $fetch_limit
+        """
+        return _fetch(self._connection, query, params, STOCK_SCHEMA, columns)
 
     def sessions(
         self,

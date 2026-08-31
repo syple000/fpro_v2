@@ -1,6 +1,6 @@
 # tushare_data
 
-`tushare_data` 通过 quicksync/Tushare 按全市场粒度拉取数据，再写入
+`tushare_data` 通过 quicksync/Tushare 按全市场粒度拉取证券主数据、行情、财务和公司行动，再写入
 `parquet_store`。存储层只保留 Tushare 接口字段；PIT 可见性由独立的
 [`data`](data.md) DuckDB 读取层处理。
 
@@ -19,6 +19,10 @@
 API 游标和存储分区是两个独立概念。同步层不会根据请求区间过滤返回行：
 例如按 `ann_date=2024-04-18` 拉到 `f_ann_date=2025-04-29` 的修订版时，
 该行依然会写入它的 `end_date` 分区。
+
+`stock_basic` 没有历史区间参数。同步层分别获取 `L/D/P`（上市、退市、暂停上市）三类完整
+快照，按稳定的 `list_date` 分区；`G/UN` 尚未上市且通常没有 `list_date`，不进入历史可交易
+股票主表。`sync_all` 对一次缺失区间只请求一轮完整快照，`sync_inc` 每次运行都会刷新。
 
 所有分页请求都按实际返回行数推进 `offset`。`fina_audit` 是唯一个需要先
 拉股票列表再逐股请求的业务：每只股票使用完整待同步日期区间，每完成 30 只
@@ -45,6 +49,7 @@ checkpoint，重跑 `sync_all` 只补未完成区间。
 
 | 业务 | 分区 | 分区内主键 |
 | --- | --- | --- |
+| `stock_basic` | `list_date` | `ts_code` |
 | `daily`、`daily_basic`、`adj_factor`、`stk_limit`、`moneyflow` | `trade_date` | `ts_code` |
 | `suspend_d` | `trade_date` | `ts_code, suspend_type, suspend_timing` |
 | `stock_st` | `trade_date` | `ts_code, type` |
@@ -77,6 +82,12 @@ checkpoint，重跑 `sync_all` 只补未完成区间。
 ```sql
 in_date <= as_of AND (out_date IS NULL OR out_date > as_of)
 ```
+
+## 证券主数据
+
+`stock_basic` 保留 Tushare 当前快照中的代码、交易所、市场、币种、上市状态、上市日和退市日等
+原始字段。统一 Reader 的 `reference.stocks()` 只用 `list_date/delist_date` 构造指定时点的上市
+区间，不把当前 `list_status` 或未来 `delist_date` 暴露给策略；默认只返回人民币股票。
 
 ## 运行
 

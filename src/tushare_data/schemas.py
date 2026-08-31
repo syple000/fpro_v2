@@ -12,6 +12,44 @@ import pyarrow as pa
 
 # PIT 可见性由独立的 DuckDB 读取层根据下列原始日期字段推导；本模块不落盘派生字段。
 
+# 证券主数据。stock_basic 是当前快照；历史可交易区间由 list_date/delist_date 表示。
+STOCK_BASIC_FIELDS = (
+    # TS代码
+    "ts_code",
+    # 股票代码
+    "symbol",
+    # 股票名称
+    "name",
+    # 地域
+    "area",
+    # Tushare 行业
+    "industry",
+    # 股票全称
+    "fullname",
+    # 英文全称
+    "enname",
+    # 拼音缩写
+    "cnspell",
+    # 市场类型（主板/创业板/科创板/CDR/北交所）
+    "market",
+    # 交易所代码
+    "exchange",
+    # 交易货币
+    "curr_type",
+    # 上市状态：L上市、D退市、P暂停上市
+    "list_status",
+    # 上市日期
+    "list_date",
+    # 退市日期
+    "delist_date",
+    # 是否沪深港通标的
+    "is_hs",
+    # 实控人名称
+    "act_name",
+    # 实控人企业性质
+    "act_ent_type",
+)
+
 # PIT 日期：trade_date。
 DAILY_FIELDS = (
     # 股票代码
@@ -1390,6 +1428,8 @@ INDEX_MEMBER_ALL_FIELDS = (
 )
 
 DATE_FIELDS = {
+    "list_date",
+    "delist_date",
     "trade_date",
     "cal_date",
     "pretrade_date",
@@ -1409,6 +1449,18 @@ DATE_FIELDS = {
 
 STRING_FIELDS = {
     "ts_code",
+    "symbol",
+    "area",
+    "industry",
+    "fullname",
+    "enname",
+    "cnspell",
+    "market",
+    "curr_type",
+    "list_status",
+    "is_hs",
+    "act_name",
+    "act_ent_type",
     "report_type",
     "comp_type",
     "end_type",
@@ -1466,6 +1518,7 @@ def _source_schema(fields: tuple[str, ...]) -> pa.Schema:
     return pa.schema(arrow_fields)
 
 
+STOCK_BASIC_SCHEMA = _source_schema(STOCK_BASIC_FIELDS)
 DAILY_SCHEMA = _source_schema(DAILY_FIELDS)
 DAILY_BASIC_SCHEMA = _source_schema(DAILY_BASIC_FIELDS)
 ADJ_FACTOR_SCHEMA = _source_schema(ADJ_FACTOR_FIELDS)
@@ -1499,6 +1552,7 @@ TRADE_CAL_SCHEMA = pa.schema(
 )
 
 TABLE_SCHEMAS = {
+    "stock_basic": STOCK_BASIC_SCHEMA,
     "daily": DAILY_SCHEMA,
     "daily_basic": DAILY_BASIC_SCHEMA,
     "adj_factor": ADJ_FACTOR_SCHEMA,
@@ -1519,6 +1573,7 @@ TABLE_SCHEMAS = {
 }
 
 SOURCE_FIELDS = {
+    "stock_basic": STOCK_BASIC_FIELDS,
     "daily": DAILY_FIELDS,
     "daily_basic": DAILY_BASIC_FIELDS,
     "adj_factor": ADJ_FACTOR_FIELDS,
@@ -1539,6 +1594,7 @@ SOURCE_FIELDS = {
 }
 
 TABLE_PARTITION_BY = {
+    "stock_basic": "list_date",
     "daily": "trade_date",
     "daily_basic": "trade_date",
     "adj_factor": "trade_date",
@@ -1560,6 +1616,7 @@ TABLE_PARTITION_BY = {
 
 # 下列为分区内的“源数据版本键”，分区字段不重复写入。
 TABLE_PRIMARY_KEY = {
+    "stock_basic": ("ts_code",),
     "daily": ("ts_code",),
     "daily_basic": ("ts_code",),
     "adj_factor": ("ts_code",),

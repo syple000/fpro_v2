@@ -32,6 +32,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_API_URL = "http://api.quicksync.cn"
 _REQUEST_TIMEOUT_SECONDS = 120
 MARKET_EXCHANGES = ("SSE", "SZSE", "BSE")
+STOCK_BASIC_LIST_STATUSES = ("L", "D", "P")
 PAGE_SIZE = 5_000
 INDEX_MEMBER_PAGE_SIZE = 2_000
 FINA_AUDIT_STOCK_BATCH_SIZE = 30
@@ -124,6 +125,37 @@ def sync_daily(
             trade_date=day, fields=fields, limit=limit, offset=offset
         ),
     )
+
+
+def sync_stock_basic(
+    pro: TushareProClient,
+    store: TushareDataStore,
+    start_date: str | date,
+    end_date: str | date,
+) -> int:
+    """分页获取已上市、已退市和暂停上市股票的当前主数据快照。"""
+    requested_start = _parse_date(start_date)
+    requested_end = _parse_date(end_date)
+    if requested_start > requested_end:
+        raise ValueError("start_date 不能晚于 end_date")
+    fields = ",".join(SOURCE_FIELDS["stock_basic"])
+    frames = [
+        _fetch_pages(
+            lambda limit, offset, list_status=list_status: pro.stock_basic(
+                list_status=list_status,
+                fields=fields,
+                limit=limit,
+                offset=offset,
+            )
+        )
+        for list_status in STOCK_BASIC_LIST_STATUSES
+    ]
+    source = pd.concat(frames, ignore_index=True)
+    _validate_columns(source, SOURCE_FIELDS["stock_basic"], "stock_basic")
+    data = _normalise_frame("stock_basic", source)
+    if data.column("list_date").null_count:
+        raise ValueError("stock_basic 返回记录缺少 list_date")
+    return store.write("stock_basic", data)
 
 
 def sync_daily_basic(
@@ -549,6 +581,7 @@ def sync_all(
 
     functions: tuple[MarketSyncSpec, ...] = (
         ("trade_cal", sync_trade_cal, CALENDAR_REQUEST_DAYS),
+        ("stock_basic", sync_stock_basic, None),
         ("daily", sync_daily, MARKET_WRITE_CHUNK_DAYS),
         ("daily_basic", sync_daily_basic, MARKET_WRITE_CHUNK_DAYS),
         ("stk_limit", sync_stk_limit, MARKET_WRITE_CHUNK_DAYS),
@@ -615,8 +648,8 @@ def _sync_all_dataset(
     missing = _missing_date_ranges(requested_start, requested_end, completed)
     total = 0
 
-    # 申万接口始终返回完整成员快照，一次调用即可覆盖全部缺失历史区间。
-    if dataset == "sw_industry" and missing:
+    # 证券主数据和申万成员接口都返回完整快照，一次调用即可覆盖全部缺失历史区间。
+    if dataset in {"stock_basic", "sw_industry"} and missing:
         total = function(pro, store, requested_start, requested_end)
         for range_start, range_end in missing:
             store._mark_sync_all_completed(dataset, range_start, range_end)
@@ -671,7 +704,9 @@ def sync_inc(
             calendar_end,
         )
     }
-    jobs: list[tuple[str, MarketSyncFunction, date, date]] = []
+    jobs: list[tuple[str, MarketSyncFunction, date, date]] = [
+        ("stock_basic", sync_stock_basic, current, current)
+    ]
     open_dates = _market_open_dates(store, calendar_start, current)
     if open_dates:
         stable_start = open_dates[-min(len(open_dates), INC_STABLE_TRADING_DAYS)]

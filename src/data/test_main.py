@@ -68,6 +68,7 @@ def run(
             "corporate_actions.dividends": "tushare",
             "corporate_actions.adjustment_factors": "tushare",
             "classification.industry": "tushare",
+            "reference.stocks": "tushare",
             "calendar.sessions": "tushare",
         }
     )
@@ -181,6 +182,7 @@ def run(
                 "classification.industry",
                 lambda: data.classification.industry(symbols=symbols),
             ),
+            ("reference.stocks", lambda: data.reference.stocks()),
             (
                 "calendar.sessions",
                 lambda: data.calendar.sessions(

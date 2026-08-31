@@ -61,6 +61,7 @@ _CAPABILITY_METHODS: Mapping[DataCapability, tuple[str, ...]] = {
     DataCapability.DIVIDENDS: ("dividends",),
     DataCapability.ADJUSTMENT_FACTORS: ("adjustment_factors",),
     DataCapability.INDUSTRY: ("industry",),
+    DataCapability.STOCKS: ("stocks",),
     DataCapability.SESSIONS: ("sessions", "previous_session"),
 }
 
@@ -150,6 +151,7 @@ class DataView:
         "fundamentals",
         "corporate_actions",
         "classification",
+        "reference",
         "calendar",
         "_adapters",
         "_source_config",
@@ -172,6 +174,7 @@ class DataView:
         self.fundamentals = FundamentalsReader(self)
         self.corporate_actions = CorporateActionsReader(self)
         self.classification = ClassificationReader(self)
+        self.reference = ReferenceReader(self)
         self.calendar = CalendarReader(self)
 
     @property
@@ -850,6 +853,44 @@ class ClassificationReader:
             table,
             identity=("symbol",),
             fields=("level", "industry_code", "industry_name"),
+            sort=(("symbol", "ascending"),),
+            sources=(source,),
+        )
+
+
+class ReferenceReader:
+    __slots__ = ("_data",)
+
+    def __init__(self, data: DataView) -> None:
+        self._data = data
+
+    def stocks(
+        self,
+        *,
+        exchange: str | None = None,
+        market: str | None = None,
+        currency: str | None = "CNY",
+        fields: Sequence[str] | None = None,
+    ) -> QueryResult:
+        route = "reference.stocks"
+        identity = ("symbol",)
+        selected, columns = _projection(route, identity, fields)
+        table, source = self._data._read(
+            route,
+            query=lambda adapter: _adapter_method(adapter, route, "stocks")(
+                as_of=self._data.as_of,
+                exchange=_optional_code(exchange, "exchange"),
+                market=_optional_code(market, "market"),
+                currency=_optional_code(currency, "currency"),
+                fetch_limit=self._data._max_result_rows + 1,
+                columns=columns,
+            ),
+            columns=columns,
+        )
+        return self._data._result(
+            table,
+            identity=identity,
+            fields=selected,
             sort=(("symbol", "ascending"),),
             sources=(source,),
         )

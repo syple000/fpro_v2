@@ -147,6 +147,9 @@ def _refresh_reference_tables(connection: duckdb.DuckDBPyConnection) -> None:
     connection.execute(
         "CREATE OR REPLACE TABLE data_internal.sw_industry AS SELECT * FROM tushare.sw_industry"
     )
+    connection.execute(
+        "CREATE OR REPLACE TABLE data_internal.stock_basic AS SELECT * FROM tushare.stock_basic"
+    )
 
 
 def _refresh_qmt_sync_ranges(

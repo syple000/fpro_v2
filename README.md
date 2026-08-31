@@ -11,7 +11,7 @@
 - `qmt_receiver`：供 platform 调用的实时接收、下载同步和 Parquet 存储组件，代码位于
   `src/qmt_receiver`。
 - `parquet_store`：本地、单进程的通用不可变 Parquet 存储，代码位于 `src/parquet_store`。
-- `tushare_data`：通过 quicksync/Tushare 增量拉取日线、财报、分红复权、申万行业和停复牌，
+- `tushare_data`：通过 quicksync/Tushare 增量拉取股票主数据、日线、财报、分红复权、申万行业和停复牌，
   代码位于 `src/tushare_data`。
 
 qmt-agent 的接口、Windows 启动方式和开发说明见 [docs/qmt_agent.md](docs/qmt_agent.md)。
