@@ -87,6 +87,28 @@ _QMT_CAPABILITIES = frozenset(
     }
 )
 
+_TUSHARE_CAPABILITY_DATASETS = {
+    DataCapability.DAILY_BARS: ("daily",),
+    DataCapability.REALTIME_QUOTES: ("daily",),
+    DataCapability.DAILY_METRICS: ("daily_basic",),
+    DataCapability.MONEYFLOW: ("moneyflow",),
+    DataCapability.SUSPENSIONS: ("suspend_d",),
+    DataCapability.PRICE_LIMITS: ("stk_limit",),
+    DataCapability.ST_STATUS: ("stock_st",),
+    DataCapability.INCOME: ("income",),
+    DataCapability.BALANCE_SHEET: ("balancesheet",),
+    DataCapability.CASHFLOW: ("cashflow",),
+    DataCapability.INDICATORS: ("fina_indicator",),
+    DataCapability.FORECAST: ("forecast",),
+    DataCapability.EXPRESS: ("express",),
+    DataCapability.AUDIT: ("fina_audit",),
+    DataCapability.DIVIDENDS: ("dividend",),
+    DataCapability.ADJUSTMENT_FACTORS: ("adj_factor",),
+    DataCapability.INDUSTRY: ("sw_industry",),
+    DataCapability.STOCKS: ("stock_basic",),
+    DataCapability.SESSIONS: ("trade_cal",),
+}
+
 _INCOME_SOURCE_FIELDS = {
     "basic_earnings_per_share": "basic_eps",
     "diluted_earnings_per_share": "diluted_eps",
@@ -341,7 +363,12 @@ class TushareAdapter:
     capabilities = _TUSHARE_CAPABILITIES
 
     def __init__(self, catalog: DataCatalog) -> None:
+        self._catalog = catalog
         self._connection = catalog.connection
+
+    def require_available(self, capability: DataCapability) -> None:
+        """在查询前检查该能力的直接已发布依赖。"""
+        self._catalog.require_available("tushare", _TUSHARE_CAPABILITY_DATASETS[capability])
 
     def daily_bars(
         self,
@@ -432,6 +459,7 @@ class TushareAdapter:
         direction: str,
         columns: tuple[str, ...] | None,
     ) -> pa.Table:
+        self._catalog.require_available("tushare", "adj_factor")
         query = f"""
             WITH raw_bars AS MATERIALIZED (
                 {raw_bars_sql}

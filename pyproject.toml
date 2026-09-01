@@ -22,6 +22,13 @@ data-crosscheck = [
     "pydantic>=2.10,<3.0",
     "pyarrow>=18.0,<24.0",
 ]
+data-cleaning = [
+    "pandas>=2.2,<3.0",
+    "pyarrow>=18.0,<24.0",
+    "requests>=2.32,<3.0",
+    "tushare>=1.4,<2.0",
+    "tzdata>=2025.2",
+]
 backtest = [
     "duckdb>=1.4,<2.0",
     "pandas>=2.2,<3.0",
@@ -67,6 +74,7 @@ qmt-agent = { requires-python = ">=3.11,<3.12" }
 backtest-momentum = "backtest.__main__:main"
 market-data-test = "market_data.test_main:main"
 data-crosscheck = "data_crosscheck.__main__:main"
+data-cleaning = "data_cleaning.__main__:main"
 qmt-agent = "qmt_agent.__main__:main"
 qmt-agent-start = "qmt_agent.windows_launcher:main"
 qmt-receiver-test = "qmt_receiver.test_main:main"
@@ -84,6 +92,7 @@ packages = [
     "src/fpro_common",
     "src/market_data",
     "src/data_crosscheck",
+    "src/data_cleaning",
     "src/parquet_store",
     "src/qmt_agent",
     "src/qmt_protocol",

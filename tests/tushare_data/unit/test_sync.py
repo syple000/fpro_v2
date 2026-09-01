@@ -558,6 +558,50 @@ def test_sync_all_force_refetches_completed_range(
     assert all(len(dataset_calls) == 2 for dataset_calls in calls.values())
 
 
+def test_sync_datasets_only_runs_selected_datasets(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, date, date]] = []
+
+    def record(dataset: str) -> Callable[..., int]:
+        def sync_dataset(
+            _pro: TushareProClient,
+            _store: TushareDataStore,
+            start_date: str | date,
+            end_date: str | date,
+        ) -> int:
+            calls.append(
+                (
+                    dataset,
+                    sync_module._parse_date(start_date),
+                    sync_module._parse_date(end_date),
+                )
+            )
+            return 1
+
+        return sync_dataset
+
+    monkeypatch.setattr(sync_module, "sync_daily", record("daily"))
+    monkeypatch.setattr(sync_module, "sync_adj_factor", record("adj_factor"))
+    pro, _ = _client(_market_responder)
+    with TushareDataStore(tmp_path) as store:
+        result = sync_module.sync_datasets(
+            pro,
+            store,
+            ("daily", "adj_factor"),
+            "20240102",
+            "20240103",
+            force=True,
+        )
+
+    assert result == {"daily": 1, "adj_factor": 1}
+    assert calls == [
+        ("daily", date(2024, 1, 2), date(2024, 1, 3)),
+        ("adj_factor", date(2024, 1, 2), date(2024, 1, 3)),
+    ]
+
+
 def test_sync_all_runs_datasets_in_parallel_after_calendar_barrier(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

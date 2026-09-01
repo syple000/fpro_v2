@@ -1,92 +1,27 @@
-"""策略边界和只读账户快照。"""
+"""把回测历史转换为共享动量决策的输入。"""
 
 from __future__ import annotations
 
-import math
-from collections.abc import Mapping
-from dataclasses import dataclass
-from types import MappingProxyType
-from typing import TYPE_CHECKING, Protocol
-
-from backtest.errors import BacktestConfigurationError
-from backtest.types import Position
-
-if TYPE_CHECKING:
-    from backtest.data import SessionData
+from backtest.data import SessionData
+from strategies import MomentumConfig, momentum_return, select_momentum_targets
 
 
-@dataclass(frozen=True, slots=True)
-class PositionView:
-    symbol: str
-    total_quantity: int
-    sellable_quantity: int
-    average_cost: float
-    last_price: float | None
-    market_value: float
-    stale_price: bool
+def monthly_momentum_targets(
+    data: SessionData,
+    *,
+    config: MomentumConfig,
+) -> dict[str, float] | None:
+    """只负责从回测数据中取出共享策略需要的两个收益端点。"""
 
-
-@dataclass(frozen=True, slots=True)
-class PortfolioView:
-    """策略可读、不可改的账户快照。"""
-
-    cash: float
-    total_equity: float
-    positions: Mapping[str, PositionView]
-
-    @classmethod
-    def from_positions(
-        cls,
-        *,
-        cash: float,
-        total_equity: float,
-        positions: Mapping[str, Position],
-    ) -> PortfolioView:
-        rows = {
-            symbol: PositionView(
-                symbol=symbol,
-                total_quantity=position.total_quantity,
-                sellable_quantity=position.sellable_quantity,
-                average_cost=position.average_cost,
-                last_price=position.last_price,
-                market_value=position.market_value,
-                stale_price=position.stale_price,
-            )
-            for symbol, position in positions.items()
-            if position.total_quantity > 0
-        }
-        return cls(
-            cash=cash,
-            total_equity=total_equity,
-            positions=MappingProxyType(rows),
+    if not data.is_month_end:
+        return None
+    old_session = data.session_index - config.lookback_sessions
+    recent_session = data.session_index - config.skip_sessions
+    scores: dict[str, float | None] = {}
+    for symbol in data.candidate_symbols():
+        indexes = {point.session_index: point.total_return_index for point in data.history(symbol)}
+        scores[symbol] = momentum_return(
+            indexes.get(old_session),
+            indexes.get(recent_session),
         )
-
-
-def validated_target_weights(weights: Mapping[str, float]) -> dict[str, float]:
-    """校验一组完整目标权重并返回稳定排序的普通字典。"""
-
-    normalized: dict[str, float] = {}
-    for symbol, weight in weights.items():
-        if not isinstance(symbol, str) or not symbol:
-            raise BacktestConfigurationError("目标权重证券代码不能为空")
-        if (
-            isinstance(weight, bool)
-            or not isinstance(weight, (int, float))
-            or not math.isfinite(weight)
-            or not 0 <= weight <= 1
-        ):
-            raise BacktestConfigurationError(f"{symbol} 目标权重必须位于 [0, 1]")
-        normalized[symbol] = float(weight)
-    if sum(normalized.values()) > 1.0 + 1e-9:
-        raise BacktestConfigurationError("目标权重之和不能超过 1")
-    return dict(sorted(normalized.items()))
-
-
-class Strategy(Protocol):
-    """收盘生成完整目标权重；返回 None 表示本日不调仓。"""
-
-    def on_close(
-        self,
-        data: SessionData,
-        portfolio: PortfolioView,
-    ) -> Mapping[str, float] | None: ...
+    return select_momentum_targets(scores, config)

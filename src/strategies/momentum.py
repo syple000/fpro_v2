@@ -1,14 +1,10 @@
-"""月度中期横截面动量策略。"""
+"""与回测或实盘无关的动量决策。"""
 
 from __future__ import annotations
 
 import math
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 from dataclasses import dataclass
-
-from backtest.data import HistoryPoint, SessionData
-from backtest.errors import BacktestConfigurationError
-from backtest.strategy import PortfolioView
 
 
 @dataclass(frozen=True, slots=True)
@@ -25,66 +21,45 @@ class MomentumConfig:
 
     def __post_init__(self) -> None:
         if self.lookback_sessions <= self.skip_sessions or self.skip_sessions < 0:
-            raise BacktestConfigurationError(
+            raise ValueError(
                 "lookback_sessions 必须大于 skip_sessions，且 skip_sessions 不能为负"
             )
         if not 0 < self.top_fraction <= 1:
-            raise BacktestConfigurationError("top_fraction 必须位于 (0, 1]")
+            raise ValueError("top_fraction 必须位于 (0, 1]")
         if self.max_positions < 1:
-            raise BacktestConfigurationError("max_positions 必须是正整数")
+            raise ValueError("max_positions 必须是正整数")
         if not 0 < self.gross_exposure <= 1:
-            raise BacktestConfigurationError("gross_exposure 必须位于 (0, 1]")
+            raise ValueError("gross_exposure 必须位于 (0, 1]")
         if not 0 < self.max_position_weight <= 1:
-            raise BacktestConfigurationError("max_position_weight 必须位于 (0, 1]")
+            raise ValueError("max_position_weight 必须位于 (0, 1]")
 
 
-class MonthlyMomentumStrategy:
-    """每月末收盘排名，下一交易日开盘执行的多头等权策略。"""
+def momentum_return(old_value: float | None, recent_value: float | None) -> float | None:
+    """用两个总收益指数端点计算动量；数据如何取得由运行环境负责。"""
 
-    def __init__(self, config: MomentumConfig | None = None) -> None:
-        self.config = config or MomentumConfig()
+    if old_value is None or recent_value is None or old_value <= 0:
+        return None
+    value = recent_value / old_value - 1.0
+    return value if math.isfinite(value) else None
 
-    def on_close(
-        self,
-        data: SessionData,
-        portfolio: PortfolioView,
-    ) -> Mapping[str, float] | None:
-        del portfolio
-        if not data.is_month_end:
-            return None
-        candidates = data.candidate_symbols()
-        scores: list[tuple[str, float]] = []
-        for symbol in candidates:
-            value = self._momentum_return(data.history(symbol), data.session_index)
-            if value is None or not math.isfinite(value):
-                continue
-            if self.config.require_positive_momentum and value <= 0:
-                continue
-            scores.append((symbol, value))
-        scores.sort(key=lambda item: (-item[1], item[0]))
-        fraction_count = max(math.ceil(len(scores) * self.config.top_fraction), 1) if scores else 0
-        selected = scores[: min(fraction_count, self.config.max_positions)]
-        if selected:
-            weight = min(
-                self.config.gross_exposure / len(selected),
-                self.config.max_position_weight,
-            )
-            targets = {symbol: weight for symbol, _ in selected}
-        else:
-            targets = {}
-        return targets
 
-    def _momentum_return(
-        self,
-        history: Sequence[HistoryPoint],
-        current_session_index: int,
-    ) -> float | None:
-        old_index = current_session_index - self.config.lookback_sessions
-        recent_index = current_session_index - self.config.skip_sessions
-        points = {point.session_index: point.total_return_index for point in history}
-        old = points.get(old_index)
-        recent = points.get(recent_index)
-        if old is None or recent is None or old <= 0:
-            return None
-        value = recent / old - 1.0
-        return value if math.isfinite(value) else None
+def select_momentum_targets(
+    scores: Mapping[str, float | None],
+    config: MomentumConfig,
+) -> dict[str, float]:
+    """按动量分数生成完整目标权重，回测和实盘使用同一决策。"""
+
+    ranked = [
+        (symbol, score)
+        for symbol, score in scores.items()
+        if score is not None
+        and math.isfinite(score)
+        and (not config.require_positive_momentum or score > 0)
+    ]
+    ranked.sort(key=lambda item: (-item[1], item[0]))
+    count = min(math.ceil(len(ranked) * config.top_fraction), config.max_positions)
+    selected = ranked[:count]
+    if not selected:
+        return {}
+    weight = min(config.gross_exposure / len(selected), config.max_position_weight)
+    return {symbol: weight for symbol, _ in selected}

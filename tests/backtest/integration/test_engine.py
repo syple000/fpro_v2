@@ -8,7 +8,6 @@ import pyarrow as pa
 from backtest.config import BacktestConfig
 from backtest.data import MarketData, SessionData
 from backtest.engine import BacktestEngine
-from backtest.strategy import PortfolioView
 from market_data import DataCatalog, DataReader, SourceConfig
 from tushare_data import TABLE_SCHEMAS, TushareDataStore
 
@@ -22,12 +21,7 @@ class OneShotStrategy:
         self.ordered = False
         self.visible_history: list[tuple[int, ...]] = []
 
-    def on_close(
-        self,
-        data: SessionData,
-        portfolio: PortfolioView,
-    ) -> dict[str, float] | None:
-        del portfolio
+    def __call__(self, data: SessionData) -> dict[str, float] | None:
         self.visible_history.append(
             tuple(point.session_index for point in data.history("000001.SZ"))
         )

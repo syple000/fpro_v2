@@ -211,6 +211,11 @@ alpha 数据逐日解锁。策略只读取当前和历史 session；若要精确
 
 这里仍需保证的是查询语义和运行一致性，而不是再次审查数据质量：
 
+- Tushare 根目录包含 `release.json` 时，`DataCatalog` 初始化和 `refresh()` 会加载
+  数据集发布状态；请求依赖 `UNAVAILABLE` 数据集时立即抛出
+  `DataSourceUnavailableError`；
+- 未复权日线只要求 `daily`，前复权日线还要求 `adj_factor`；一个数据集
+  不可用不会阻断无关能力；
 - `DataReader.at(as_of)` 只固定 PIT 时间，不复制文件，也不另开数据库连接；
 - `DataReader` 复用 `DataCatalog` 的单一连接，只有显式调用 `catalog.refresh()` 才重新加载 Manifest；
 - 未登记可见性规则的新表，严格 Reader 拒绝读取；

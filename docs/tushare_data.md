@@ -104,6 +104,23 @@ uv run --group tushare-data tushare-data-test \
 需要无视已有完成区间、完整重抓本次区间时增加 `--force`。`sync_inc` 的计划窗口本来就会
 每次重抓，因此也接受 `--force`，但不会扩大或改变滚动窗口。
 
+只重拉特定数据集和日期区间：
+
+```bash
+uv run --group tushare-data tushare-data-test \
+  --mode sync_all \
+  --datasets daily adj_factor \
+  --start-date 20200318 \
+  --end-date 20200318 \
+  --data-dir dataset/tushare \
+  --force
+```
+
+Python 入口为
+`sync_datasets(pro, store, ("daily", "adj_factor"), start_date, end_date, force=True)`。
+`datasets` 保持调用方顺序并顺序执行，用于数据清洗后的精确补数；未指定时
+`sync_all` 仍按原有方式并行同步全部数据集。
+
 后续持续刷新：
 
 ```bash

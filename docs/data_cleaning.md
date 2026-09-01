@@ -1,411 +1,368 @@
-# `data_cleaning`：离线数据清洗与发布
+# `data_cleaning`：离线数据检测、修复和发布
 
-`data_cleaning` 负责把已采集的原始数据检出、修正并发布为 Reader 可以直接信任的数据。
-第一阶段只处理 Tushare 离线数据，首个发布范围截至 `2026-08-22`；实时行情质量控制不在本阶段
-范围内。
-
-模块名称使用 `data_cleaning`，代码、测试和文档分别放在：
-
-```text
-src/data_cleaning/
-tests/data_cleaning/
-docs/data_cleaning.md
-```
-
-## 目标与边界
-
-数据清洗遵守以下规则：
-
-1. `dataset/tushare` 是原始数据，只读且永不原地修正；
-2. 检出与修正分开运行，检测命令不得修改任何数据；
-3. 修正只分为确定性的自动修正和需要人工决策的修正；
-4. 未解决的阻断问题只使对应数据类型不可用，不阻塞无关数据类型；
-5. 修正结果物化为普通 Parquet，Reader 不在查询时执行清洗或关联补丁；
-6. 每个发布版本都记录输入、规则、人工决策、截止日期和校验结果；
-7. 相同输入、规则和决策必须生成相同结果，并且可以切回旧发布版本。
-
-`data_cleaning` 不负责采集 Tushare/QMT 数据，不改变 `DataReader` 的 PIT 语义，也不在财务口径
-不明确时主动“平账”。
-
-### 与 `data_crosscheck` 的边界
-
-`data_crosscheck` 定位为 Tushare/QMT 数据交叉检查。它从 Tushare 股票池中做
-可重复抽样，将日线、财务和除权数据与 QMT 独立观测比较，用于发现单源内部
-规则难以发现的口径、缺失和数值差异。
-
-跨源差异只证明两个观测不一致，不证明 Tushare 或 QMT 任一方必然错误。因此：
-
-- `data_crosscheck` 不自动修改数据；
-- 交叉检查报告不直接决定 `AVAILABLE` / `UNAVAILABLE`；
-- 差异经语义核对并确认为源数据问题后，才转换为 `data_cleaning` 的 `MANUAL`
-  Issue，再通过 `PATCH`、`REFETCH` 或 `ACCEPT` 闭环；
-- `data_cleaning detect` 仍是全量、确定性的发布门禁；`data_crosscheck` 是抽样、跨源的
-  补充证据，二者不相互替代。
-
-## 总体流程
+`data_cleaning` 把 Tushare 采集数据变成 Reader 可以直接信任的版本化数据。
+它不在查询时跳过异常行，而是在回测前完成下面的闭环：
 
 ```text
 dataset/tushare
-       │
-       ▼
-data_cleaning detect
-       │
-       ├── AUTO_FIX：存在唯一、可验证的修正结果
-       └── MANUAL：必须重新采集、人工补丁或人工确认
-       │
-       ▼
-quality/decisions.jsonl
-       │
-       ▼
-data_cleaning publish
-       │
-       ├── 构建候选数据
-       ├── 应用修正
-       ├── 完整复检
-       └── 按数据类型判定可用性
-       │
-       ▼
+      ↓ detect
+稳定的问题报告
+      ↓ repair（可选：按数据集和日期定向重拉）
+      ↓ publish（自动修正 + 人工决策 + 完整复检）
 dataset/tushare_published/current
-       │
-       ▼
+      ↓
 DataCatalog → DataReader
 ```
 
-公开命令只保留 `detect` 和 `publish`。`publish` 内部完成构建、修正、复检和原子发布，不再暴露
-额外的中间命令。
+## 第一次使用：照着做即可
 
-## 目录规划
-
-代码使用直观的职责拆分，不建设通用规则引擎或任务 DAG：
-
-```text
-src/data_cleaning/
-├── __init__.py
-├── __main__.py          # detect、publish 命令
-├── models.py            # Issue、Decision、DatasetRelease
-├── detector.py          # 执行检测规则并生成问题清单
-├── cleaner.py           # 应用自动修正和人工决策
-├── publisher.py         # 物化、复检和原子发布
-└── rules/
-    ├── __init__.py
-    ├── common.py        # Schema、主键、日期、有限数等通用规则
-    ├── market.py        # 行情、交易约束和复权规则
-    ├── reference.py     # 日历、证券主数据和行业规则
-    └── fundamentals.py  # 财报、指标和公司行动规则
-
-tests/data_cleaning/
-├── unit/
-└── integration/
-```
-
-运行产生的数据与人工决策分开存放：
-
-```text
-quality/
-├── issues/
-│   └── 20260822.jsonl   # detect 自动生成，不人工编辑
-└── decisions.jsonl      # 人工决策，纳入版本控制
-
-dataset/tushare_published/
-├── current -> releases/20260822-v1
-└── releases/
-    └── 20260822-v1/
-        ├── daily/...
-        ├── daily_basic/...
-        ├── adj_factor/...
-        ├── ...
-        └── release.json
-```
-
-`current` 只指向已经完成复检的发布版本。未修改的不可变 Parquet 文件可以使用硬链接复用，发生
-修正或包含截止日之后数据的分区必须重新写入。
-
-## 核心模型
-
-### Issue
-
-每条检测规则输出统一的问题记录：
-
-```python
-@dataclass(frozen=True)
-class Issue:
-    issue_id: str
-    dataset: str
-    partition: str | None
-    key: dict[str, object]
-    rule_id: str
-    fix_mode: Literal["AUTO_FIX", "MANUAL"]
-    observed: dict[str, object]
-    suggested: dict[str, object] | None
-    message: str
-```
-
-`issue_id` 由数据类型、业务主键、规则编号和观测值确定性生成。原始值变化后，旧决策不会误用
-到新的问题上。
-
-### Decision
-
-人工决策只允许三种动作：
-
-```python
-@dataclass(frozen=True)
-class Decision:
-    issue_id: str
-    action: Literal["PATCH", "REFETCH", "ACCEPT"]
-    expected: dict[str, object] | None
-    values: dict[str, object] | None
-    reason: str
-```
-
-- `PATCH`：明确提供修正值；
-- `REFETCH`：要求重新采集，重新采集完成前问题仍未解决；
-- `ACCEPT`：人工确认观测值符合数据定义，不需要修改。
-
-`PATCH` 必须包含 `expected` 原值。实际原值与其不一致时拒绝应用，避免旧补丁覆盖已经更新的
-供应商数据。
-
-### DatasetRelease
-
-第一阶段只按数据类型控制可用性：
-
-```python
-@dataclass(frozen=True)
-class DatasetRelease:
-    dataset: str
-    status: Literal["AVAILABLE", "UNAVAILABLE"]
-    row_count: int
-    open_issue_ids: tuple[str, ...]
-```
-
-不增加行级质量状态，也不让 Reader 在每次查询时判断分区质量。需要更细粒度隔离时再扩展，
-不提前增加复杂度。
-
-## 检出
-
-检测命令示例：
+下面的命令都在项目根目录执行。先安装本模块的依赖：
 
 ```bash
-uv run python -m data_cleaning detect \
+uv sync --group data-cleaning
+```
+
+先记住两件事：
+
+- `repair` 只是向 Tushare 定向重拉原数据；
+- 可以确定正确值的自动修正，在 `publish` 时才写入发布目录。
+
+### 第 1 步：先用一天的数据练习检测
+
+`detect` 只读，不会修改原数据。下面只检查 `daily` 的一天：
+
+```bash
+uv run --group data-cleaning data-cleaning detect \
+  --input dataset/tushare \
+  --datasets daily \
+  --start 2024-07-23 \
+  --through 2024-07-23 \
+  --output quality/issues/practice.jsonl
+```
+
+这些参数的意思是：
+
+- `--input`：待检查的采集层目录；
+- `--datasets`：只检查指定数据集，可以空格分隔多个名称；
+- `--start`：检查区间的开始日；
+- `--through`：检查到哪一天，包含该日；
+- `--output`：问题报告保存位置，父目录会自动创建。
+
+命令最后会输出一行摘要，例如：
+
+```json
+{"datasets":["daily"],"issues":2,"manual":1,"auto_fix":1,"output":"quality/issues/practice.jsonl"}
+```
+
+- `issues`：共发现多少个问题；
+- `manual`：还需重拉或人工决策的问题数；
+- `auto_fix`：已经能算出唯一正确值，发布时会自动修正的问题数。
+
+当 `manual` 大于 0 时，命令退出码是 `1`。这表示“成功检出需处理的问题”，
+不是命令崩溃，报告已经正常生成。
+
+查看报告前 10 行：
+
+```bash
+sed -n '1,10p' quality/issues/practice.jsonl
+```
+
+第一行是本次检测的范围和数据指纹，后续每行是一个问题。问题中最常用的
+字段是 `issue_id`、`dataset`、`partition`、`key`、`fix_mode` 和 `suggested`。
+
+### 第 2 步：让程序尝试自动恢复原数据
+
+如果有 `manual` 问题，先运行 `repair`。它会将问题合并成尽可能少的
+“数据集 + 日期区间”请求，重拉后自动复检：
+
+```bash
+export TUSHARE_TOKEN='你的 token'
+
+uv run --group data-cleaning data-cleaning repair \
+  --input dataset/tushare \
+  --datasets daily \
+  --start 2024-07-23 \
+  --through 2024-07-23 \
+  --output quality/issues/practice-after-repair.jsonl
+```
+
+`repair` 会更新 `dataset/tushare` 中当前生效的采集版本，但不会更新已发布版本。
+如果重拉后 `manual` 变成 0，就不需要写人工决策。
+
+### 第 3 步：生成可发布的全量报告
+
+前两步带有 `--start`，只用于定位和修复局部问题，不能直接发布。正式发布前，
+要从数据起点检查到指定日期：
+
+```bash
+uv run --group data-cleaning data-cleaning detect \
+  --input dataset/tushare \
+  --through 2026-08-22 \
+  --output quality/issues/20260822-full.jsonl
+```
+
+这里故意不写 `--start` 和 `--datasets`，表示检查所有已登记数据集的全部有效历史。
+如果这次仍有 `manual`，最省事的做法是让 `repair` 处理整份报告范围：
+
+```bash
+export TUSHARE_TOKEN='你的 token'
+
+uv run --group data-cleaning data-cleaning repair \
+  --input dataset/tushare \
+  --through 2026-08-22 \
+  --output quality/issues/20260822-full.jsonl
+```
+
+它不会把所有历史数据重拉一遍，只会重拉问题建议中的数据集和日期区间。
+这份新报告没有 `--start` 限制，可以直接交给 `publish`。如果重拉后仍有
+`manual`，按本文的“人工决策”一节处理；不想人工判断时也可以直接发布，
+有问题的数据集会是 `UNAVAILABLE`，不会混入回测。
+
+### 第 4 步：发布清洗版本
+
+如果全量报告的 `manual` 是 0，直接发布，不需要决策文件：
+
+```bash
+uv run --group data-cleaning data-cleaning publish \
+  --input dataset/tushare \
+  --issues quality/issues/20260822-full.jsonl \
+  --output-root dataset/tushare_published \
+  --release 20260822-v1
+```
+
+`publish` 会应用 `auto_fix`、完整复检、写入不可变版本，最后将 `current`
+原子切换到新版本。发布成功后检查：
+
+```bash
+readlink dataset/tushare_published/current
+python -m json.tool dataset/tushare_published/current/release.json | sed -n '1,120p'
+```
+
+每个数据集应该是 `AVAILABLE`。如果某个数据集是 `UNAVAILABLE`，
+`open_issue_ids` 会列出它仍然没有解决的问题。该数据集会被隔离，其他已通过的
+数据集仍然可用。
+
+### 第 5 步：回测只读发布版本
+
+```bash
+uv run --group backtest backtest-momentum \
+  --start 2017-01-01 \
+  --end 2026-08-22 \
+  --tushare-dir dataset/tushare_published/current \
+  --qmt-dir dataset/qmt
+```
+
+不要在正式回测中把 `--tushare-dir` 指向 `dataset/tushare`：那是还没有经过发布门禁的
+采集层。如果回测依赖的数据集被隔离，Reader 会立即报
+`DataSourceUnavailableError`，不会跳过坏行后继续计算。
+
+### 日常最短流程
+
+已经熟悉后，只需记住：
+
+```text
+局部 repair → 不带 --start 的全量 detect → publish → 回测读 current
+```
+
+## 原则
+
+- `dataset/tushare` 是采集层；清洗不直接修改其 Parquet；
+- 只有正确值唯一且可复检时才自动修正；
+- 能用原供应商恢复的问题优先定向重拉；
+- 不插值价格、不前向填充行情和复权因子、不为财务报表强行“平账”；
+- 未解决问题只阻断对应数据集，不阻断无关数据集；
+- Reader 不读取问题清单，只读取已复检的 Parquet 和 `release.json`。
+
+## 三个命令（参数参考）
+
+### 1. 检测
+
+检测全部数据集：
+
+```bash
+uv run --group data-cleaning data-cleaning detect \
   --input dataset/tushare \
   --through 2026-08-22 \
   --output quality/issues/20260822.jsonl
 ```
 
-`detect` 必须：
-
-- 仅读取 Manifest 当前引用的 Parquet 文件；
-- 逐个数据类型运行已启用规则；
-- 输出 `AUTO_FIX` 和 `MANUAL` 问题；
-- 按数据类型、分区、主键和规则稳定排序；
-- 对相同输入生成相同的 `issue_id` 和输出内容；
-- 不创建发布数据，不修改原始 Manifest。
-
-第一版不引入 `WARNING` 等更多状态。尚不能明确判断对错的现象不启用为发布规则，保留在规则
-研究清单中，待字段语义确认后再加入。
-
-## 修正与发布
-
-发布命令示例：
+只检查特定数据集和日期区间：
 
 ```bash
-uv run python -m data_cleaning publish \
+uv run --group data-cleaning data-cleaning detect \
   --input dataset/tushare \
-  --through 2026-08-22 \
+  --datasets daily stk_limit adj_factor \
+  --start 2024-07-01 \
+  --through 2024-07-31 \
+  --output quality/issues/202407.jsonl
+```
+
+`detect` 为只读操作。未发现阻断问题时退出码为 0，存在 `MANUAL` 问题时为 1。
+
+### 2. 自动修复
+
+`repair` 先检测，再从问题中提取可定位的 `REFETCH` 建议，按数据集合并连续
+日期，强制重拉后重新检测。默认最多两轮，问题不再变化时提前停止。
+
+```bash
+export TUSHARE_TOKEN='你的 token'
+
+uv run --group data-cleaning data-cleaning repair \
+  --input dataset/tushare \
+  --datasets stk_limit adj_factor \
+  --start 2024-07-23 \
+  --through 2024-07-23 \
+  --output quality/issues/repair-20240723.jsonl
+```
+
+也可以直接使用采集层的定向同步能力：
+
+```bash
+uv run --group tushare-data tushare-data-test \
+  --mode sync_all \
+  --datasets daily adj_factor \
+  --start-date 20200318 \
+  --end-date 20200318 \
+  --data-dir dataset/tushare \
+  --force
+```
+
+`force` 不会先清空旧数据。新数据完整写入后，存储层按业务主键保留新版本。
+
+### 3. 发布
+
+`publish` 必须使用不带 `--start` 的全量报告。发布前会校验报告中的 Manifest
+指纹，防止将旧问题清单应用到已更新数据。
+
+```bash
+uv run --group data-cleaning data-cleaning publish \
+  --input dataset/tushare \
   --issues quality/issues/20260822.jsonl \
-  --decisions quality/decisions.jsonl \
+  --output-root dataset/tushare_published \
   --release 20260822-v1
 ```
 
-`publish` 按以下固定顺序运行：
-
-1. 校验问题清单与当前原始 Manifest 是否匹配；
-2. 在临时目录构建候选发布版本；
-3. 对未修改文件复用不可变 Parquet，对有变化的分区重新写入；
-4. 应用所有 `AUTO_FIX`；
-5. 应用匹配当前观测值的人工 `PATCH` 或 `ACCEPT`；
-6. 将 `REFETCH` 和没有决策的 `MANUAL` 问题保留为未解决；
-7. 过滤各数据类型业务日期晚于 `2026-08-22` 的记录；
-8. 对候选数据重新运行完整检测，而不是只相信修正函数；
-9. 生成 `release.json`，逐个数据类型记录可用性；
-10. 原子提交发布目录并更新 `current`。
-
-自动修正生成了新问题，或者人工补丁与 `expected` 不匹配时，对应数据类型必须标记为
-`UNAVAILABLE`。
-
-## 发布状态与 Reader
-
-`release.json` 是发布结果的唯一状态入口：
-
-```json
-{
-  "release_id": "20260822-v1",
-  "validated_through": "2026-08-22",
-  "ruleset_version": 1,
-  "datasets": {
-    "daily": {
-      "status": "AVAILABLE",
-      "row_count": 0,
-      "open_issue_ids": []
-    },
-    "adj_factor": {
-      "status": "UNAVAILABLE",
-      "row_count": 0,
-      "open_issue_ids": [
-        "adj_factor:920627.BJ:isolated_jump_v1"
-      ]
-    }
-  }
-}
-```
-
-可用性规则只有一条：
+只有确实写了人工决策文件时，才加上：
 
 ```text
-没有未解决的 MANUAL 问题且复检通过 → AVAILABLE
-否则                                  → UNAVAILABLE
+--decisions quality/decisions.jsonl
 ```
 
-`DataCatalog` 初始化时读取一次发布状态。可用数据仍直接注册为普通 Parquet 视图；访问不可用
-数据时立即抛出 `DataSourceUnavailableError`。该检查只需要一次常量集合查询，不增加 Parquet
-扫描、SQL JOIN、UDF 或逐行处理。
+发布成功后：
 
-不同能力按其实际依赖决定是否可用。例如：
+```text
+dataset/tushare_published/
+├── current -> releases/20260822-v1
+└── releases/
+    └── 20260822-v1/
+        ├── daily/...
+        ├── adj_factor/...
+        └── release.json
+```
 
-- 未复权日线只依赖 `daily`；
-- 前复权日线同时依赖 `daily` 和 `adj_factor`；
-- 涨跌停状态依赖 `stk_limit`；
-- 综合交易状态还依赖 `stock_st` 和 `suspend_d`。
+未修改分区用硬链复用活跃 Parquet；有自动修正或 `PATCH` 的分区重写。
+只有复检通过的数据集会对 Reader 开放。
 
-因此 `adj_factor` 不可用时仍可读取未复权日线，但前复权查询必须失败。
+## 已实现检查
 
-## 规则分类
+所有数据集执行：
 
-### 通用规则
+- Manifest 格式和引用文件存在性；
+- Parquet Schema 与 Tushare 登记 Schema 一致；
+- 分区路径与记录分区日期一致；
+- 分区内业务主键不重复；
+- 非空 Schema 字段不为空；
+- 浮点数不包含 `NaN` 或无穷值；
+- 稠密交易数据集不缺已知交易日分区。
 
-所有数据类型都执行：
+交易关键数据额外执行：
 
-- Arrow Schema 与登记 Schema 一致；
-- 业务主键非空且不重复；
-- Manifest 可解析且只引用存在的 Parquet 文件；
-- 日期字段合法，发布范围字段不晚于截止日；
-- 浮点字段不存在 `NaN` 或无穷值；
-- 已确认定义的枚举值位于允许集合；
-- 分区值与记录中的分区字段一致。
+- `daily`：关键字段完整、价格为正、成交量额非负、OHLC 关系正确；
+- `daily`：`pre_close + change` 与 `pct_chg` 独立指向同一收盘价时，
+  可自动修正不一致的 `close`；
+- `adj_factor`：因子为正数；
+- `stk_limit`：关键价格完整且 `down_limit <= pre_close <= up_limit`；
+- `trade_cal`：交易所和开市标记合法，每日覆盖 SSE、SZSE 和 BSE。
 
-### 自动修正规则
+关键行情、复权和涨跌停字段中的非有限数会建议重拉；其他可空数值字段
+中的非有限数在发布时确定性归一为 `null`。
 
-只有同时满足以下条件的规则才允许标记为 `AUTO_FIX`：
+## 人工决策
 
-- 正确结果唯一；
-- 规则是确定性的；
-- 不依赖主观阈值猜测；
-- 可以检查修正前的预期值；
-- 修正后能由独立规则重新验证。
+只有定向重拉之后仍然有 `MANUAL` 问题，才需要这一步。先从最新的全量报告
+中找到问题行：
 
-允许自动处理的典型情况包括：
+```bash
+rg '"kind":"issue"' quality/issues/20260822-full.jsonl
+```
 
-- 确定的类型、日期、时区和单位标准化；
-- 存在明确版本排序时的完全重复记录去重；
-- 多个独立字段共同确定唯一正确值；
-- 供应商重新采集后原始数据自然恢复。
+每个问题有三种处理方式。
 
-禁止自动插值价格或复权因子、前向填充缺失交易数据、裁剪异常价格、用上一条记录覆盖当前
-异常、对多个供应商取平均，以及为了满足恒等式而修改财务报表。
+### 方式 1：已从可信来源确认正确值
 
-## 数据类型实施顺序
+用编辑器打开 `quality/decisions.jsonl`，每个决策写成单独一行 JSON：
 
-### 第一批：交易关键数据
+```json
+{"issue_id":"daily:daily_ohlc_v1:...","action":"PATCH","expected":{"close":12.0},"values":{"close":10.5},"reason":"交易所历史行情核对"}
+```
 
-优先覆盖：
+- `issue_id`：从问题行原样复制；
+- `expected`：当前错误值，从问题的 `observed` 中复制；
+- `values`：经人工核对后要写入的正确值；
+- `reason`：记录正确值的核对来源。
 
-- `daily`；
-- `adj_factor`；
-- `stk_limit`；
-- `stock_st`；
-- `suspend_d`；
-- `trade_cal`。
+`expected` 是安全锁。如果采集层已经发生变化，它与当前值不同，补丁就会拒绝应用，
+避免把旧决策误用到新数据上。
 
-截至 `2026-08-22` 已发现问题的初始处置原则：
+### 方式 2：确认这是规则误报，原值正确
 
-| 问题 | 初始处置 |
-| --- | --- |
-| `603005.SH` 在 `2020-03-18` 的日线收盘价不一致 | 仅在多个独立字段唯一指向同一结果且修正后全部价格规则通过时 `AUTO_FIX` |
-| `stk_limit` 在 `2024-07-23` 的关键字段整分区为空 | `MANUAL/REFETCH`，禁止根据比例自行生成涨跌停价 |
-| `stock_st` 缺少完整交易日 | `MANUAL/REFETCH`，禁止默认前向填充 |
-| `adj_factor` 存在单日跳变后立即恢复 | `MANUAL`，核对公司行动或重新采集 |
-| 缺少 BSE 交易日历 | `MANUAL`，明确数据来源，禁止把 SSE 记录伪装为 Tushare BSE 原始数据 |
+```json
+{"issue_id":"daily:daily_ohlc_v1:...","action":"ACCEPT","reason":"交易所数据与第二数据源一致，确认为特殊行情"}
+```
 
-### 第二批：研究指标和分类
+`ACCEPT` 只适用于可以解释的业务规则。Manifest、Schema、重复主键、必填值、
+非有限数、空数据集和分区缺口等硬性问题不能用 `ACCEPT` 绕过。
 
-覆盖：
+### 方式 3：暂时无法确认
 
-- `daily_basic`；
-- `moneyflow`；
-- `stock_basic`；
-- `sw_industry`。
+不写决策即可，发布时该数据集会保持 `UNAVAILABLE`。如果需要显式留下“待重拉”
+的审计记录，可以写：
 
-`free_share > float_share`、moneyflow 与日线成交额差异、多个行业记录同时有效等现象，在字段
-定义和历史版本语义确认之前不自动修正。
+```json
+{"issue_id":"daily:daily_ohlc_v1:...","action":"REFETCH","reason":"暂无可信数据源，不发布该数据集"}
+```
 
-### 第三批：财务与公司行动
+写完决策后，在发布命令中增加：
 
-覆盖：
+```text
+--decisions quality/decisions.jsonl
+```
 
-- `income`；
-- `balancesheet`；
-- `cashflow`；
-- `fina_indicator`；
-- `forecast`；
-- `express`；
-- `fina_audit`；
-- `dividend`。
+## 常见问题
 
-第一版只对明确的结构、主键、日期、枚举和版本错误启用阻断规则。财务恒等式差异和供应商
-口径差异只用于人工核验，不自动修改金额。
+- `detect` 或 `repair` 退出码是 1：查看摘要中的 `manual`。大于 0 时是正常的检测结果。
+- `repair` 提示没有 token：先执行 `export TUSHARE_TOKEN='你的 token'`。
+- `publish` 提示报告带有 `start`：重新执行不带 `--start` 的全量 `detect` 或 `repair`。
+- `publish` 提示 Manifest 指纹不匹配：原数据在报告生成后被更新了，重新生成全量报告。
+- `publish` 提示版本已存在：发布版本不可覆盖，将 `--release` 改为新名称，例如 `20260822-v2`。
+- 回测提示 `DataSourceUnavailableError`：查看 `release.json` 中该数据集的 `open_issue_ids`，
+  修复后以新的 `--release` 重新发布。
 
-## 实施阶段
+## 发布门禁
 
-### 阶段一：框架和通用规则
+`release.json` 对每个数据集记录 `AVAILABLE` / `UNAVAILABLE`、行数和未解决
+`issue_id`。`DataCatalog` 初始化时只读取一次该状态：
 
-- 建立 `src/data_cleaning` 包和两个公开命令；
-- 实现三种核心模型与稳定 JSONL 编解码；
-- 接入 Manifest、Schema、主键、日期和有限数检查；
-- 验证检测过程只读且结果确定。
+- 请求依赖的数据集可用：正常扫描 Parquet；
+- 任一实际依赖不可用：立即抛出 `DataSourceUnavailableError`；
+- `adj_factor` 不可用不影响未复权 `daily`，但会阻断前复权查询。
 
-### 阶段二：交易关键数据
+当前隔离粒度是数据集级，没有静默删行或部分结果。
 
-- 实现六个交易关键数据类型的规则；
-- 完成自动修正和 `decisions.jsonl` 应用；
-- 实现候选目录、分区重写、截止日过滤和完整复检；
-- 生成第一个 `20260822-v1` 候选版本。
+## 与 `data_crosscheck` 的边界
 
-### 阶段三：发布与读取集成
+`data_crosscheck` 抽样比较 Tushare 和 QMT，只证明两个来源的观测是否一致。
+交叉检查差异经语义核对并确认为源数据问题后，再转换为本模块的人工 Issue。
 
-- 实现 `release.json` 和按数据类型的可用状态；
-- 原子更新 `current`；
-- 让 `DataCatalog` 读取发布状态；
-- 验证不可用依赖明确失败、可用数据仍直接扫描 Parquet。
-
-### 阶段四：扩展其余数据类型
-
-- 加入研究指标、分类、财务和公司行动规则；
-- 对尚不明确的规则先补充数据定义和测试样本；
-- 只有经过确认的规则才能进入发布门禁。
-
-## 验收标准
-
-首个发布版本必须满足：
-
-- `dataset/tushare` 的文件内容和 Manifest 完全未改变；
-- 相同输入、规则版本和人工决策可以重复生成相同结果；
-- 所有自动修正问题在候选数据复检中消失；
-- `AVAILABLE` 数据类型不存在未解决的人工问题；
-- 输出 Schema 与 Tushare 登记 Schema 一致，主键不重复；
-- 发布数据不包含 `2026-08-22` 之后的记录；
-- `release.json` 可以解释每个数据类型为何可用或不可用；
-- Reader 不读取问题清单或人工决策文件；
-- 可用数据查询不增加 SQL JOIN、UDF 或逐行清洗；
-- 切换 `current` 到旧发布目录即可回滚。
-
-第一阶段完成的标志是生成一个截至 `2026-08-22` 的可审计发布版本，并让现有 PIT Reader 对
-可用数据类型直接读取该版本、对不可用依赖明确失败。
+`data_cleaning detect` 是全量、确定性的发布门禁；`data_crosscheck` 是抽样、跨源的
+补充证据，二者不相互替代。

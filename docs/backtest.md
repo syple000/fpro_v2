@@ -36,21 +36,18 @@
 下一交易日重复
 ```
 
-策略接口只有一个方法：
+引擎只接收一个普通函数：
 
 ```python
-class Strategy(Protocol):
-    def on_close(
-        self,
-        data: SessionData,
-        portfolio: PortfolioView,
-    ) -> Mapping[str, float] | None: ...
+def strategy(data: SessionData) -> Mapping[str, float] | None:
+    ...
 ```
 
 - 返回 `None`：今天不调仓；
 - 返回权重字典：这是完整目标组合，未出现的旧持仓目标为零。
 
-没有初始化回调、盘前回调、事件总线或命令 Context。
+没有 Strategy 基类、账户快照、初始化回调、盘前回调、事件总线或命令 Context。当前策略不读取
+账户，因此不为未来可能出现的账户型策略提前建立结构。
 
 ## 3. 正确性是否足够
 
@@ -121,7 +118,8 @@ class Strategy(Protocol):
 - 默认排除 ST；
 - 下一交易日开盘调仓。
 
-动量计算位于策略文件中，不放在数据基础设施中。
+动量收益计算、排序和目标权重位于 `strategies/momentum.py`，不依赖回测，可以原样用于实盘。
+`backtest/strategy.py` 只从已经释放的历史中取出所需端点。
 
 ## 6. 如何运行
 
@@ -131,9 +129,13 @@ class Strategy(Protocol):
 uv run --group backtest backtest-momentum \
   --start 2017-01-01 \
   --end 2026-08-22 \
-  --tushare-dir dataset/tushare \
+  --tushare-dir dataset/tushare_published/current \
   --qmt-dir dataset/qmt
 ```
+
+`dataset/tushare_published/current` 是通过数据清洗和发布门禁的当前版本。
+正式回测不应直接读取采集层 `dataset/tushare`，完整用法见
+[`data_cleaning`](data_cleaning.md)。
 
 需要保存结果时，显式指定一个尚不存在的目录：
 
@@ -141,6 +143,8 @@ uv run --group backtest backtest-momentum \
 uv run --group backtest backtest-momentum \
   --start 2017-01-01 \
   --end 2026-08-22 \
+  --tushare-dir dataset/tushare_published/current \
+  --qmt-dir dataset/qmt \
   --output-dir runs/my-first-backtest
 ```
 

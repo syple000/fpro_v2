@@ -193,6 +193,9 @@ class DataView:
             raise DataSourceNotConfiguredError(f"逻辑数据集 {route!r} 未配置来源") from None
         adapter = self._adapters[source_id]
         try:
+            require_available = getattr(adapter, "require_available", None)
+            if callable(require_available):
+                require_available(DataCapability(route))
             table = query(adapter)
         except (
             DataCapabilityNotSupportedError,

@@ -18,6 +18,7 @@ from tushare_data import (
     TushareDataStore,
     create_pro_client,
     sync_all,
+    sync_datasets,
     sync_inc,
 )
 
@@ -35,6 +36,7 @@ def run(
     requests_per_minute: int,
     max_concurrency: int,
     force: bool,
+    datasets: tuple[str, ...] | None,
 ) -> None:
     """按命令行选择完整区间同步或自动滚动增量同步。"""
     pro = create_pro_client(
@@ -44,11 +46,14 @@ def run(
         max_concurrency=max_concurrency,
     )
     with TushareDataStore(data_dir) as store:
-        result = (
-            sync_all(pro, store, start_date, end_date, force=force)
-            if mode == "sync_all"
-            else sync_inc(pro, store, current_date, force=force)
-        )
+        if mode == "sync_all":
+            result = (
+                sync_datasets(pro, store, datasets, start_date, end_date, force=force)
+                if datasets
+                else sync_all(pro, store, start_date, end_date, force=force)
+            )
+        else:
+            result = sync_inc(pro, store, current_date, force=force)
     for dataset, fetched in result.items():
         logger.info(
             "%s 完成：本次返回并写入=%d，字段数=%d",
@@ -80,6 +85,12 @@ def main() -> None:
         help="sync_all 忽略完成区间并重抓；sync_inc 的计划窗口本来就会重抓",
     )
     parser.add_argument(
+        "--datasets",
+        nargs="+",
+        choices=tuple(TABLE_SCHEMAS),
+        help="sync_all 只同步指定数据集，例如 daily adj_factor",
+    )
+    parser.add_argument(
         "--requests-per-minute",
         type=int,
         default=DEFAULT_REQUESTS_PER_MINUTE,
@@ -94,6 +105,8 @@ def main() -> None:
     args = parser.parse_args()
     if not args.token:
         parser.error("请通过环境变量 TUSHARE_TOKEN 或 --token 提供 Token")
+    if args.mode == "sync_inc" and args.datasets:
+        parser.error("--datasets 只能与 --mode sync_all 一起使用")
 
     configure_beijing_logging(logging.INFO)
     run(
@@ -107,6 +120,7 @@ def main() -> None:
         args.requests_per_minute,
         args.max_concurrency,
         args.force,
+        tuple(args.datasets) if args.datasets else None,
     )
 
 

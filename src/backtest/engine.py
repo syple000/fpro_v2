@@ -3,17 +3,17 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import date, datetime, time
 
 from backtest.config import BacktestConfig
 from backtest.corporate_actions import CorporateActionProcessor
-from backtest.data import MarketData, event_time
+from backtest.data import MarketData, SessionData, event_time
 from backtest.execution import LOT_SIZE, ExecutionEngine
 from backtest.portfolio import Portfolio
-from backtest.strategy import PortfolioView, Strategy, validated_target_weights
 from backtest.types import EquitySnapshot, Fill, OrderReason, OrderResult, OrderSide
+from strategies import validate_target_weights
 
 
 @dataclass(frozen=True, slots=True)
@@ -32,7 +32,7 @@ class BacktestEngine:
         *,
         config: BacktestConfig,
         data: MarketData,
-        strategy: Strategy,
+        strategy: Callable[[SessionData], Mapping[str, float] | None],
     ) -> None:
         self.config = config
         self.data = data
@@ -91,14 +91,11 @@ class BacktestEngine:
             self.actions.capture_record_date(close_at, self.portfolio)
             self._equity.append(self.portfolio.snapshot(session))
 
-            targets = self.strategy.on_close(
-                self.data.session_data(session, session_index),
-                self._portfolio_view(),
-            )
+            targets = self.strategy(self.data.session_data(session, session_index))
             next_session = self.data.next_session(session)
             if targets is not None and next_session is not None:
                 self._submit_rebalance(
-                    validated_target_weights(targets),
+                    validate_target_weights(targets),
                     submitted_at=close_at,
                     earliest_session=next_session,
                 )
@@ -110,13 +107,6 @@ class BacktestEngine:
             orders=tuple(self.execution.results),
             fills=tuple(self.execution.fills),
             equity=tuple(self._equity),
-        )
-
-    def _portfolio_view(self) -> PortfolioView:
-        return PortfolioView.from_positions(
-            cash=self.portfolio.cash,
-            total_equity=self.portfolio.total_equity,
-            positions=self.portfolio.positions,
         )
 
     def _submit_rebalance(

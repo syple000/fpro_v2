@@ -8,6 +8,7 @@
 - `market_data`：基于 DuckDB 的统一读取层，由 `DataCatalog` 管理物理快照、`DataReader` 提供 PIT 查询。
 - `data_crosscheck`：Tushare/QMT 数据交叉检查；抽样比较日线、财务和除权数据，
   只报告差异，不代替全量清洗和发布门禁。
+- `data_cleaning`：Tushare 离线数据的全量检测、定向重拉修复、人工决策和版本发布。
 - `backtest`：入门级日频 A 股回测，覆盖 PIT 股票池、次日开盘成交、T+1、费用和公司行动。
 - `qmt_agent`：东北证券 miniQMT 行情接入服务，代码位于 `src/qmt_agent`。
 - `qmt_receiver`：供 platform 调用的实时接收、下载同步和 Parquet 存储组件，代码位于
@@ -24,6 +25,7 @@ Parquet 存储的接口和最简示例见 [docs/parquet_store.md](docs/parquet_s
 Tushare 历史数据字段、增量规则和验证方式见 [docs/tushare_data.md](docs/tushare_data.md)。
 统一 PIT Reader 见 [docs/market_data.md](docs/market_data.md)。
 Tushare/QMT 数据交叉检查见 [docs/data_crosscheck.md](docs/data_crosscheck.md)。
+Tushare 离线数据清洗和发布见 [docs/data_cleaning.md](docs/data_cleaning.md)。
 回测系统的架构、业务规则、风险点和实施顺序见 [docs/backtest.md](docs/backtest.md)。
 
 ## 时间规范

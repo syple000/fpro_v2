@@ -9,6 +9,7 @@ from pathlib import Path
 import duckdb
 import pyarrow as pa
 
+from market_data.errors import DataSourceUnavailableError
 from qmt_receiver.schemas import TABLE_SCHEMAS as QMT_TABLE_SCHEMAS
 from qmt_receiver.storage import load_sync_ranges
 from tushare_data.schemas import TABLE_SCHEMAS
@@ -39,6 +40,7 @@ class DataCatalog:
         }
         self._connection = duckdb.connect(":memory:")
         self._connection.execute("SET parquet_metadata_cache = true")
+        self._unavailable: dict[str, frozenset[str]] = {}
         self.refresh()
 
     @property
@@ -49,6 +51,7 @@ class DataCatalog:
     def refresh(self) -> None:
         """根据最新 Manifest 重新注册原始视图和小型参考表。"""
         for source, (root, schemas) in self._sources.items():
+            self._unavailable[source] = _load_unavailable_datasets(root, schemas)
             self._connection.execute(f"CREATE SCHEMA IF NOT EXISTS {_quote_identifier(source)}")
             for table, schema in schemas.items():
                 _register_parquet_view(
@@ -60,6 +63,15 @@ class DataCatalog:
                 )
         _refresh_reference_tables(self._connection)
         _refresh_qmt_sync_ranges(self._connection, self._sources["qmt"][0])
+
+    def require_available(self, source: str, datasets: str | tuple[str, ...]) -> None:
+        """要求已发布来源的底层数据集可用。"""
+        required = (datasets,) if isinstance(datasets, str) else datasets
+        unavailable = sorted(set(required) & self._unavailable.get(source, frozenset()))
+        if unavailable:
+            raise DataSourceUnavailableError(
+                f"数据源 {source!r} 的已发布数据集不可用: {unavailable}"
+            )
 
     def close(self) -> None:
         """关闭 DuckDB 连接。"""
@@ -182,3 +194,27 @@ def _quote_identifier(value: str) -> str:
 
 def _quote_string(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
+
+
+def _load_unavailable_datasets(
+    root: Path,
+    schemas: Mapping[str, pa.Schema],
+) -> frozenset[str]:
+    release_path = root / "release.json"
+    if not release_path.exists():
+        return frozenset()
+    try:
+        payload = json.loads(release_path.read_text(encoding="utf-8"))
+        datasets = payload["datasets"]
+    except (OSError, json.JSONDecodeError, KeyError) as exc:
+        raise ValueError(f"发布状态无法读取: {release_path}") from exc
+    if not isinstance(datasets, dict):
+        raise ValueError(f"发布状态格式无效: {release_path}")
+    unavailable: set[str] = set()
+    for dataset in schemas:
+        state = datasets.get(dataset)
+        if not isinstance(state, dict) or state.get("status") not in {"AVAILABLE", "UNAVAILABLE"}:
+            raise ValueError(f"发布状态缺少有效数据集 {dataset!r}: {release_path}")
+        if state["status"] == "UNAVAILABLE":
+            unavailable.add(dataset)
+    return frozenset(unavailable)

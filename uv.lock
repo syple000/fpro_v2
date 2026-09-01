@@ -303,6 +303,13 @@ backtest = [
     { name = "pandas" },
     { name = "pyarrow" },
 ]
+data-cleaning = [
+    { name = "pandas" },
+    { name = "pyarrow" },
+    { name = "requests" },
+    { name = "tushare" },
+    { name = "tzdata" },
+]
 data-crosscheck = [
     { name = "duckdb" },
     { name = "httpx2" },
@@ -358,6 +365,13 @@ backtest = [
     { name = "duckdb", specifier = ">=1.4,<2.0" },
     { name = "pandas", specifier = ">=2.2,<3.0" },
     { name = "pyarrow", specifier = ">=18.0,<24.0" },
+]
+data-cleaning = [
+    { name = "pandas", specifier = ">=2.2,<3.0" },
+    { name = "pyarrow", specifier = ">=18.0,<24.0" },
+    { name = "requests", specifier = ">=2.32,<3.0" },
+    { name = "tushare", specifier = ">=1.4,<2.0" },
+    { name = "tzdata", specifier = ">=2025.2" },
 ]
 data-crosscheck = [
     { name = "duckdb", specifier = ">=1.4,<2.0" },

@@ -579,27 +579,7 @@ def sync_all(
     if requested_start > requested_end:
         raise ValueError("start_date 不能晚于 end_date")
 
-    functions: tuple[MarketSyncSpec, ...] = (
-        ("trade_cal", sync_trade_cal, CALENDAR_REQUEST_DAYS),
-        ("stock_basic", sync_stock_basic, None),
-        ("daily", sync_daily, MARKET_WRITE_CHUNK_DAYS),
-        ("daily_basic", sync_daily_basic, MARKET_WRITE_CHUNK_DAYS),
-        ("stk_limit", sync_stk_limit, MARKET_WRITE_CHUNK_DAYS),
-        ("stock_st", sync_stock_st, MARKET_WRITE_CHUNK_DAYS),
-        ("adj_factor", sync_adj_factor, MARKET_WRITE_CHUNK_DAYS),
-        ("suspend_d", sync_suspend_d, MARKET_WRITE_CHUNK_DAYS),
-        ("moneyflow", sync_moneyflow, MARKET_WRITE_CHUNK_DAYS),
-        ("dividend", sync_dividend, MARKET_WRITE_CHUNK_DAYS),
-        ("forecast", sync_forecast, 366),
-        ("express", sync_express, 366),
-        ("income", sync_income, 366),
-        ("balancesheet", sync_balancesheet, 366),
-        ("cashflow", sync_cashflow, 366),
-        ("fina_indicator", sync_fina_indicator, 366),
-        ("sw_industry", sync_sw_industry, CALENDAR_REQUEST_DAYS),
-        # 审计意见只能逐只股票查询；不切日期，避免每个分块重复遍历股票清单。
-        ("fina_audit", sync_fina_audit, None),
-    )
+    functions = _sync_specs()
 
     # 交易日历是日频接口的共同依赖，先完整提交；其余数据集再并行回填。
     result = {
@@ -632,6 +612,70 @@ def sync_all(
         for dataset, future in futures.items():
             result[dataset] = future.result()
     return result
+
+
+def sync_datasets(
+    pro: TushareProClient,
+    store: TushareDataStore,
+    datasets: Iterable[str],
+    start_date: str | date,
+    end_date: str | date,
+    *,
+    force: bool = False,
+) -> dict[str, int]:
+    """按指定日期区间同步指定数据集。
+
+    这是定向补数入口；``force=True`` 时忽略已完成区间并重拉。
+    """
+    requested_start = _parse_date(start_date)
+    requested_end = _parse_date(end_date)
+    if requested_start > requested_end:
+        raise ValueError("start_date 不能晚于 end_date")
+
+    specs = {spec[0]: spec for spec in _sync_specs()}
+    selected = tuple(dict.fromkeys(datasets))
+    if not selected:
+        raise ValueError("datasets 不能为空")
+    unknown = [dataset for dataset in selected if dataset not in specs]
+    if unknown:
+        raise ValueError(f"未知数据集: {unknown}")
+
+    result: dict[str, int] = {}
+    # 顺序执行可避免多个定向任务同时补写共享的交易日历。
+    for dataset in selected:
+        result[dataset] = _sync_all_dataset(
+            pro,
+            store,
+            requested_start,
+            requested_end,
+            specs[dataset],
+            force=force,
+        )
+    return result
+
+
+def _sync_specs() -> tuple[MarketSyncSpec, ...]:
+    return (
+        ("trade_cal", sync_trade_cal, CALENDAR_REQUEST_DAYS),
+        ("stock_basic", sync_stock_basic, None),
+        ("daily", sync_daily, MARKET_WRITE_CHUNK_DAYS),
+        ("daily_basic", sync_daily_basic, MARKET_WRITE_CHUNK_DAYS),
+        ("stk_limit", sync_stk_limit, MARKET_WRITE_CHUNK_DAYS),
+        ("stock_st", sync_stock_st, MARKET_WRITE_CHUNK_DAYS),
+        ("adj_factor", sync_adj_factor, MARKET_WRITE_CHUNK_DAYS),
+        ("suspend_d", sync_suspend_d, MARKET_WRITE_CHUNK_DAYS),
+        ("moneyflow", sync_moneyflow, MARKET_WRITE_CHUNK_DAYS),
+        ("dividend", sync_dividend, MARKET_WRITE_CHUNK_DAYS),
+        ("forecast", sync_forecast, 366),
+        ("express", sync_express, 366),
+        ("income", sync_income, 366),
+        ("balancesheet", sync_balancesheet, 366),
+        ("cashflow", sync_cashflow, 366),
+        ("fina_indicator", sync_fina_indicator, 366),
+        ("sw_industry", sync_sw_industry, CALENDAR_REQUEST_DAYS),
+        # 审计意见只能逐只股票查询；不切日期，避免每个分块重复遍历股票清单。
+        ("fina_audit", sync_fina_audit, None),
+    )
 
 
 def _sync_all_dataset(
