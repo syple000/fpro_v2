@@ -32,8 +32,13 @@ _ROUTES = {
 
 @dataclass(frozen=True, slots=True)
 class CompletedRun:
+    """一次运行返回给调用者的三个直接结果。"""
+
+    # 每个交易日、订单和成交的详细模拟结果。
     result: BacktestResult
+    # 收益率、回撤、波动率、Sharpe、换手率和费用等汇总指标。
     metrics: dict[str, Any]
+    # 实际写入结果的目录；未要求保存文件时为 None。
     output_dir: Path | None
 
 

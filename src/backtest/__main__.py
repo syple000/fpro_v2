@@ -20,17 +20,59 @@ def _date(value: str) -> date:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="运行 A 股月度中期动量回测")
-    parser.add_argument("--start", type=_date, default=date(2017, 1, 1))
-    parser.add_argument("--end", type=_date, default=date(2026, 8, 22))
-    parser.add_argument("--initial-cash", type=float, default=10_000_000.0)
-    parser.add_argument("--tushare-dir", type=Path, default=Path("dataset/tushare"))
-    parser.add_argument("--qmt-dir", type=Path, default=Path("dataset/qmt"))
-    parser.add_argument("--output-dir", type=Path)
-    parser.add_argument("--lookback", type=int, default=120)
-    parser.add_argument("--skip", type=int, default=20)
-    parser.add_argument("--top-fraction", type=float, default=0.10)
-    parser.add_argument("--max-positions", type=int, default=30)
+    parser = argparse.ArgumentParser(
+        description="运行 A 股月度中期动量回测",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument("--start", type=_date, default=date(2017, 1, 1), help="回测开始日期")
+    parser.add_argument("--end", type=_date, default=date(2026, 8, 22), help="回测结束日期")
+    parser.add_argument(
+        "--initial-cash",
+        type=float,
+        default=10_000_000.0,
+        help="初始现金，单位为人民币元",
+    )
+    parser.add_argument(
+        "--tushare-dir",
+        type=Path,
+        default=Path("dataset/tushare"),
+        help="Tushare 数据根目录",
+    )
+    parser.add_argument(
+        "--qmt-dir",
+        type=Path,
+        default=Path("dataset/qmt"),
+        help="QMT 数据根目录",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        help="结果输出目录；不指定时不写文件",
+    )
+    parser.add_argument(
+        "--lookback",
+        type=int,
+        default=120,
+        help="动量区间较早端点距当前的交易日数",
+    )
+    parser.add_argument(
+        "--skip",
+        type=int,
+        default=20,
+        help="动量计算跳过最近多少个交易日",
+    )
+    parser.add_argument(
+        "--top-fraction",
+        type=float,
+        default=0.10,
+        help="选择动量排名靠前的比例，0.10 表示前 10%%",
+    )
+    parser.add_argument(
+        "--max-positions",
+        type=int,
+        default=30,
+        help="最大持仓股票数量",
+    )
     args = parser.parse_args()
     config = BacktestConfig(
         start_date=args.start,

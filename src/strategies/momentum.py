@@ -9,14 +9,25 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True, slots=True)
 class MomentumConfig:
-    """过去 lookback 日至 skip 日的收益率排名参数。"""
+    """月度动量策略参数。
 
+    默认比较“当前交易日前第 120 日”到“第 20 日”的累计收益，在月末选择排名靠前的股票并
+    等权持有。这里的比例都使用小数，例如 0.10 表示 10%。
+    """
+
+    # 动量区间较早的端点距离当前多少个交易日。默认 120。
     lookback_sessions: int = 120
+    # 动量区间较近的端点距离当前多少个交易日。默认跳过最近 20 日，避免追逐短期波动。
     skip_sessions: int = 20
+    # 从拥有有效动量分数的股票中取排名前多少比例。0.10 表示前 10%。
     top_fraction: float = 0.10
+    # 最多持有多少只股票；最终数量还会受到 top_fraction 限制。
     max_positions: int = 30
+    # 所有目标持仓权重之和。0.98 表示计划使用 98% 资金，留下约 2% 现金缓冲。
     gross_exposure: float = 0.98
+    # 单只股票的最大目标权重。0.05 表示最多占总资产 5%。
     max_position_weight: float = 0.05
+    # True 时只买入动量收益大于 0 的股票；没有合格股票时保持现金。
     require_positive_momentum: bool = False
 
     def __post_init__(self) -> None:
