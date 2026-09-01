@@ -6,9 +6,9 @@ from pathlib import Path
 import pyarrow as pa
 
 from backtest.config import BacktestConfig, ExecutionConfig, FeeConfig
-from backtest.data import DataPortal
+from backtest.data import DataPortal, SessionData
 from backtest.engine import BacktestEngine
-from backtest.strategy import BacktestData, StrategyContext
+from backtest.strategy import PortfolioView
 from market_data import DataCatalog, DataReader, SourceConfig
 from tushare_data import TABLE_SCHEMAS, TushareDataStore
 
@@ -23,17 +23,16 @@ class OneShotStrategy:
     def __init__(self) -> None:
         self.ordered = False
 
-    def initialize(self, context: StrategyContext) -> None:
-        del context
-
-    def on_pre_open(self, context: StrategyContext, data: BacktestData) -> None:
-        del context, data
-
-    def on_close(self, context: StrategyContext, data: BacktestData) -> None:
+    def on_close(
+        self,
+        data: SessionData,
+        portfolio: PortfolioView,
+    ) -> dict[str, float] | None:
+        del data, portfolio
         if not self.ordered:
-            context.rebalance({"000001.SZ": 0.5})
             self.ordered = True
-        del data
+            return {"000001.SZ": 0.5}
+        return None
 
 
 def test_close_signal_only_fills_at_next_open(tmp_path: Path) -> None:
@@ -114,9 +113,6 @@ def test_close_signal_only_fills_at_next_open(tmp_path: Path) -> None:
         start_date=sessions[0],
         end_date=sessions[-1],
         initial_cash=100_000.0,
-        tushare_root=tushare_root,
-        qmt_root=tmp_path / "qmt",
-        output_root=tmp_path / "runs",
         fee=FeeConfig(commission_rate=0, minimum_commission=0),
         execution=ExecutionConfig(slippage_bps=0, max_previous_volume_participation=None),
     )
@@ -133,7 +129,7 @@ def test_close_signal_only_fills_at_next_open(tmp_path: Path) -> None:
         ).run()
 
     assert len(result.fills) == 1
-    assert result.orders[0].submitted_at.date() == sessions[0]
+    assert result.orders[0].order.submitted_at.date() == sessions[0]
     assert result.fills[0].filled_at.date() == sessions[1]
     assert result.fills[0].market_price == 11.0
     assert result.equity[0].total_equity == 100_000.0

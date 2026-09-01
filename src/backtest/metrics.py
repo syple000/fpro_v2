@@ -115,20 +115,14 @@ def calculate_metrics(result: BacktestResult, config: BacktestConfig) -> dict[st
         daily_rf = (1 + config.risk_free_rate) ** (1 / config.annualization_sessions) - 1
         excess = [value - daily_rf for value in returns]
         if daily_std > 0:
-            sharpe = statistics.fmean(excess) / daily_std * math.sqrt(
-                config.annualization_sessions
-            )
+            sharpe = statistics.fmean(excess) / daily_std * math.sqrt(config.annualization_sessions)
         downside = math.sqrt(statistics.fmean(min(value, 0.0) ** 2 for value in excess))
         if downside > 0:
-            sortino = statistics.fmean(excess) / downside * math.sqrt(
-                config.annualization_sessions
-            )
+            sortino = statistics.fmean(excess) / downside * math.sqrt(config.annualization_sessions)
     drawdown = _drawdown(equity)
     max_drawdown = abs(drawdown["max_drawdown"])
     calmar = (
-        _safe_divide(annualized_return, max_drawdown)
-        if annualized_return is not None
-        else None
+        _safe_divide(annualized_return, max_drawdown) if annualized_return is not None else None
     )
     positives = [value for value in returns if value > 0]
     negatives = [value for value in returns if value < 0]
@@ -147,11 +141,7 @@ def calculate_metrics(result: BacktestResult, config: BacktestConfig) -> dict[st
     stamp_tax = sum(fill.stamp_tax for fill in result.fills)
     transfer_fee = sum(fill.transfer_fee for fill in result.fills)
     slippage = sum(fill.slippage_cost for fill in result.fills)
-    rejected = [
-        order
-        for order in result.orders
-        if order.status in {OrderStatus.REJECTED, OrderStatus.EXPIRED}
-    ]
+    rejected = [order for order in result.orders if order.status is OrderStatus.NOT_FILLED]
     reason_counts: dict[str, int] = defaultdict(int)
     for order in rejected:
         reason_counts[order.reason.value] += 1
@@ -192,9 +182,6 @@ def calculate_metrics(result: BacktestResult, config: BacktestConfig) -> dict[st
             / max(sum(row.holding_count for row in result.equity), 1)
         ),
         "corporate_action_event_count": len(result.corporate_actions),
-        "benchmark": config.benchmark,
-        "benchmark_return": None,
-        "excess_return": None,
         "annualization_sessions": config.annualization_sessions,
         "risk_free_rate": config.risk_free_rate,
         "yearly_returns": yearly,

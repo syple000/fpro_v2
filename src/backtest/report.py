@@ -69,10 +69,13 @@ def render_report(
         f"<tr><td>{html.escape(year)}</td><td>{_percent(value)}</td></tr>"
         for year, value in metrics["yearly_returns"].items()
     )
-    blocked_rows = "".join(
-        f"<tr><td>{html.escape(reason)}</td><td>{count}</td></tr>"
-        for reason, count in metrics["blocked_order_reasons"].items()
-    ) or '<tr><td colspan="2">无</td></tr>'
+    blocked_rows = (
+        "".join(
+            f"<tr><td>{html.escape(reason)}</td><td>{count}</td></tr>"
+            for reason, count in metrics["blocked_order_reasons"].items()
+        )
+        or '<tr><td colspan="2">无</td></tr>'
+    )
     warnings = "".join(f"<li>{html.escape(item)}</li>" for item in result.warnings)
     strategy_rows = "".join(
         f"<tr><td>{html.escape(str(key))}</td><td>{html.escape(str(value))}</td></tr>"
@@ -107,7 +110,7 @@ code {{ word-break: break-all; }}
 <body>
 <h1>月度中期动量回测报告</h1>
 <p class="subtle">运行 ID：<code>{html.escape(result.run_id)}</code> ·
-{metrics['start_session']} 至 {metrics['end_session']} · {metrics['session_count']} 个交易日</p>
+{metrics["start_session"]} 至 {metrics["end_session"]} · {metrics["session_count"]} 个交易日</p>
 <div class="cards">{cards}</div>
 <section><h2>账户净值</h2>{chart}</section>
 <div class="columns">
@@ -116,15 +119,15 @@ code {{ word-break: break-all; }}
 </div>
 <div class="columns">
 <section><h2>交易与账户</h2><table>
-<tr><td>订单数</td><td>{metrics['order_count']}</td></tr>
-<tr><td>成交数</td><td>{metrics['trade_count']}</td></tr>
-<tr><td>佣金</td><td>{_number(metrics['commission'])}</td></tr>
-<tr><td>印花税</td><td>{_number(metrics['stamp_tax'])}</td></tr>
-<tr><td>过户费</td><td>{_number(metrics['transfer_fee'])}</td></tr>
-<tr><td>滑点成本</td><td>{_number(metrics['slippage_cost'])}</td></tr>
-<tr><td>平均持仓数</td><td>{_number(metrics['average_holding_count'])}</td></tr>
-<tr><td>平均资金利用率</td><td>{_percent(metrics['average_capital_utilization'])}</td></tr>
-<tr><td>stale 持仓日占比</td><td>{_percent(metrics['stale_position_day_ratio'])}</td></tr>
+<tr><td>订单数</td><td>{metrics["order_count"]}</td></tr>
+<tr><td>成交数</td><td>{metrics["trade_count"]}</td></tr>
+<tr><td>佣金</td><td>{_number(metrics["commission"])}</td></tr>
+<tr><td>印花税</td><td>{_number(metrics["stamp_tax"])}</td></tr>
+<tr><td>过户费</td><td>{_number(metrics["transfer_fee"])}</td></tr>
+<tr><td>滑点成本</td><td>{_number(metrics["slippage_cost"])}</td></tr>
+<tr><td>平均持仓数</td><td>{_number(metrics["average_holding_count"])}</td></tr>
+<tr><td>平均资金利用率</td><td>{_percent(metrics["average_capital_utilization"])}</td></tr>
+<tr><td>stale 持仓日占比</td><td>{_percent(metrics["stale_position_day_ratio"])}</td></tr>
 </table></section>
 <section><h2>策略参数</h2><table>{strategy_rows}</table></section>
 </div>
@@ -132,8 +135,8 @@ code {{ word-break: break-all; }}
 <p>信号在月末 16:05 使用当时已释放的日线生成，订单最早下一交易日 09:30 撮合。
 动量收益通过每日 <code>close / pre_close</code> 链接为 PIT 总收益指数；
 账户成交和估值始终使用未复权价格。</p>
-<p>最大回撤区间：{metrics['drawdown_start']} → {metrics['drawdown_trough']}；
-恢复日：{metrics['drawdown_recovery'] or '尚未恢复'}。</p>
+<p>最大回撤区间：{metrics["drawdown_start"]} → {metrics["drawdown_trough"]}；
+恢复日：{metrics["drawdown_recovery"] or "尚未恢复"}。</p>
 <ul>{warnings}</ul>
 </section>
 </body>

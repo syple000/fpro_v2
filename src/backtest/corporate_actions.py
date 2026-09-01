@@ -6,11 +6,11 @@ import math
 from collections import defaultdict
 from datetime import date, datetime, timedelta
 
-from backtest.broker import SimBroker
 from backtest.config import CorporateActionConfig
 from backtest.errors import UnsupportedCorporateActionError
+from backtest.execution import ExecutionEngine
 from backtest.portfolio import Portfolio
-from backtest.types import CorporateAction, CorporateActionEvent
+from backtest.types import CorporateAction, CorporateActionEvent, OrderReason
 
 
 class CorporateActionProcessor:
@@ -48,9 +48,7 @@ class CorporateActionProcessor:
         for action in self._record.get(event_time.date(), ()):
             if action.visible_at > event_time:
                 continue
-            quantity = portfolio.capture_entitlement(
-                action.action_id, action.symbol
-            )
+            quantity = portfolio.capture_entitlement(action.action_id, action.symbol)
             if quantity:
                 self.events.append(
                     CorporateActionEvent(
@@ -69,17 +67,15 @@ class CorporateActionProcessor:
         event_time: datetime,
         *,
         portfolio: Portfolio,
-        broker: SimBroker,
+        execution: ExecutionEngine,
     ) -> None:
         start = (
-            self._last_pre_open + timedelta(days=1)
-            if self._last_pre_open
-            else event_time.date()
+            self._last_pre_open + timedelta(days=1) if self._last_pre_open else event_time.date()
         )
         current = start
         while current <= event_time.date():
             for action in self._ex.get(current, ()):
-                self._apply_ex_date(action, event_time, portfolio, broker)
+                self._apply_ex_date(action, event_time, portfolio, execution)
             for action in self._pay.get(current, ()):
                 self._apply_pay_date(action, event_time, portfolio)
             for action in self._listing.get(current, ()):
@@ -92,72 +88,111 @@ class CorporateActionProcessor:
         action: CorporateAction,
         event_time: datetime,
         portfolio: Portfolio,
-        broker: SimBroker,
+        execution: ExecutionEngine,
     ) -> None:
         if action.action_id in self._processed_ex:
             return
-        position_quantity = portfolio.positions.get(action.symbol)
-        current_quantity = position_quantity.total_quantity if position_quantity else 0
-        entitlement = portfolio.entitlement(action.action_id)
-        if action.visible_at > event_time:
-            if current_quantity and self.config.strict_unknown_actions:
-                raise UnsupportedCorporateActionError(
-                    f"{action.symbol} 的除权事件在 {event_time.date()} 尚不可见"
-                )
+        position = portfolio.positions.get(action.symbol)
+        current_quantity = position.total_quantity if position else 0
+        if not self._is_visible(action, event_time, current_quantity):
             self._processed_ex.add(action.action_id)
             return
-        if entitlement is None:
-            if current_quantity and self.config.strict_unknown_actions:
-                raise UnsupportedCorporateActionError(
-                    f"{action.symbol} 除权时缺少登记日权益快照: {action.action_id}"
-                )
-            entitlement = 0
+        entitlement = self._entitlement(action, portfolio, current_quantity)
         if entitlement:
             # 收盘目标股数跨除权日会失真；保守撤销，等待策略下次重算。
-            broker.cancel_symbol_for_corporate_action(action.symbol, event_time, portfolio)
+            execution.cancel_symbol(action.symbol, reason=OrderReason.CORPORATE_ACTION)
+        self._recognize_cash(action, event_time, portfolio, entitlement)
+        self._recognize_stock(action, event_time, portfolio, entitlement)
+        self._processed_ex.add(action.action_id)
+
+    def _is_visible(
+        self,
+        action: CorporateAction,
+        event_time: datetime,
+        current_quantity: int,
+    ) -> bool:
+        if action.visible_at <= event_time:
+            return True
+        if current_quantity and self.config.strict_unknown_actions:
+            raise UnsupportedCorporateActionError(
+                f"{action.symbol} 的除权事件在 {event_time.date()} 尚不可见"
+            )
+        return False
+
+    def _entitlement(
+        self,
+        action: CorporateAction,
+        portfolio: Portfolio,
+        current_quantity: int,
+    ) -> int:
+        entitlement = portfolio.entitlement(action.action_id)
+        if entitlement is not None:
+            return entitlement
+        if current_quantity and self.config.strict_unknown_actions:
+            raise UnsupportedCorporateActionError(
+                f"{action.symbol} 除权时缺少登记日权益快照: {action.action_id}"
+            )
+        return 0
+
+    def _recognize_cash(
+        self,
+        action: CorporateAction,
+        event_time: datetime,
+        portfolio: Portfolio,
+        entitlement: int,
+    ) -> None:
         cash_per_share = self._cash_per_share(action, entitlement)
         cash_amount = round(entitlement * cash_per_share + 1e-9, 2)
-        if cash_amount:
-            if action.pay_date is None and self.config.strict_unknown_actions:
-                raise UnsupportedCorporateActionError(
-                    f"{action.symbol} 现金分红缺少派息日: {action.action_id}"
-                )
-            portfolio.recognize_dividend(action.action_id, cash_amount)
+        if not cash_amount:
+            return
+        if action.pay_date is None and self.config.strict_unknown_actions:
+            raise UnsupportedCorporateActionError(
+                f"{action.symbol} 现金分红缺少派息日: {action.action_id}"
+            )
+        portfolio.recognize_dividend(action.action_id, cash_amount)
+        self.events.append(
+            CorporateActionEvent(
+                event_time=event_time,
+                action_id=action.action_id,
+                symbol=action.symbol,
+                event_type="DIVIDEND_RECEIVABLE",
+                quantity=entitlement,
+                amount=cash_amount,
+                note="除息日确认应收股利",
+            )
+        )
+
+    def _recognize_stock(
+        self,
+        action: CorporateAction,
+        event_time: datetime,
+        portfolio: Portfolio,
+        entitlement: int,
+    ) -> None:
+        if not action.stock_dividend:
+            return
+        if action.listing_date is None and entitlement and self.config.strict_unknown_actions:
+            raise UnsupportedCorporateActionError(
+                f"{action.symbol} 送转缺少红股上市日: {action.action_id}"
+            )
+        new_quantity = portfolio.apply_stock_dividend(
+            action_id=action.action_id,
+            symbol=action.symbol,
+            entitlement_quantity=entitlement,
+            ratio=action.stock_dividend,
+        )
+        if new_quantity:
             self.events.append(
                 CorporateActionEvent(
                     event_time=event_time,
                     action_id=action.action_id,
                     symbol=action.symbol,
-                    event_type="DIVIDEND_RECEIVABLE",
-                    quantity=entitlement,
-                    amount=cash_amount,
-                    note="除息日确认应收股利",
+                    event_type="STOCK_DIVIDEND",
+                    quantity=new_quantity,
+                    amount=0.0,
+                    note=f"送转比例 {action.stock_dividend:.8f}",
                 )
             )
-        if action.stock_dividend:
-            if action.listing_date is None and entitlement and self.config.strict_unknown_actions:
-                raise UnsupportedCorporateActionError(
-                    f"{action.symbol} 送转缺少红股上市日: {action.action_id}"
-                )
-            new_quantity = portfolio.apply_stock_dividend(
-                action_id=action.action_id,
-                symbol=action.symbol,
-                entitlement_quantity=entitlement,
-                ratio=action.stock_dividend,
-            )
-            if new_quantity:
-                self.events.append(
-                    CorporateActionEvent(
-                        event_time=event_time,
-                        action_id=action.action_id,
-                        symbol=action.symbol,
-                        event_type="STOCK_DIVIDEND",
-                        quantity=new_quantity,
-                        amount=0.0,
-                        note=f"送转比例 {action.stock_dividend:.8f}",
-                    )
-                )
-        self._processed_ex.add(action.action_id)
 
     def _cash_per_share(self, action: CorporateAction, entitlement: int) -> float:
         if self.config.dividend_mode == "disabled":
@@ -179,9 +214,7 @@ class CorporateActionProcessor:
                 )
             return 0.0
         if not math.isfinite(value) or value < 0:
-            raise UnsupportedCorporateActionError(
-                f"{action.symbol} 每股现金分红无效: {value}"
-            )
+            raise UnsupportedCorporateActionError(f"{action.symbol} 每股现金分红无效: {value}")
         if self.config.dividend_mode == "before_tax":
             return value * (1 - self.config.fixed_dividend_tax_rate)
         return value

@@ -3,9 +3,9 @@ from __future__ import annotations
 from datetime import date, datetime
 from zoneinfo import ZoneInfo
 
-from backtest.broker import SimBroker
 from backtest.config import CorporateActionConfig, ExecutionConfig, FeeConfig
 from backtest.corporate_actions import CorporateActionProcessor
+from backtest.execution import ExecutionEngine
 from backtest.portfolio import Portfolio
 from backtest.types import CorporateAction
 
@@ -36,24 +36,22 @@ def test_dividend_receivable_and_stock_listing_are_separate_events() -> None:
         stock_dividend=0.1,
     )
     processor = CorporateActionProcessor((action,), CorporateActionConfig())
-    broker = SimBroker(
-        run_id="run",
-        strategy_id="test",
+    execution = ExecutionEngine(
         execution=ExecutionConfig(),
         fees=FeeConfig(),
     )
 
     processor.capture_record_date(_at(2, 16, 5), portfolio)
-    processor.pre_open(_at(3), portfolio=portfolio, broker=broker)
+    processor.pre_open(_at(3), portfolio=portfolio, execution=execution)
     assert portfolio.dividend_receivable == 50.0
     assert position.total_quantity == 110
     assert position.sellable_quantity == 100
     assert position.pending_listing_quantity == 10
 
-    processor.pre_open(_at(4), portfolio=portfolio, broker=broker)
+    processor.pre_open(_at(4), portfolio=portfolio, execution=execution)
     assert portfolio.dividend_receivable == 0.0
     assert portfolio.cash == 10_050.0
-    processor.pre_open(_at(5), portfolio=portfolio, broker=broker)
+    processor.pre_open(_at(5), portfolio=portfolio, execution=execution)
     assert position.pending_listing_quantity == 0
     assert position.sellable_quantity == 110
     assert [event.event_type for event in processor.events] == [

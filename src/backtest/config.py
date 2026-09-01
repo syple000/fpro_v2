@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import asdict, dataclass, field
 from datetime import date
 from pathlib import Path
@@ -11,7 +12,12 @@ from backtest.errors import BacktestConfigurationError
 
 
 def _finite_non_negative(value: float, name: str) -> None:
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        or value < 0
+    ):
         raise BacktestConfigurationError(f"{name} 必须是非负数")
 
 
@@ -102,18 +108,13 @@ class CorporateActionConfig:
 
 @dataclass(frozen=True, slots=True)
 class BacktestConfig:
-    """一次日频 A 股回测的完整运行配置。"""
+    """会影响回测结果的业务配置。"""
 
     start_date: date
     end_date: date
     initial_cash: float = 10_000_000.0
     annualization_sessions: int = 252
     risk_free_rate: float = 0.0
-    seed: int = 0
-    benchmark: str | None = None
-    tushare_root: Path = Path("dataset/tushare")
-    qmt_root: Path = Path("dataset/qmt")
-    output_root: Path = Path("runs")
     fee: FeeConfig = field(default_factory=FeeConfig)
     execution: ExecutionConfig = field(default_factory=ExecutionConfig)
     universe: UniverseConfig = field(default_factory=UniverseConfig)
@@ -124,15 +125,12 @@ class BacktestConfig:
             raise BacktestConfigurationError("start_date/end_date 必须是 date")
         if self.start_date > self.end_date:
             raise BacktestConfigurationError("start_date 不能晚于 end_date")
-        if self.initial_cash <= 0:
+        if not math.isfinite(self.initial_cash) or self.initial_cash <= 0:
             raise BacktestConfigurationError("initial_cash 必须大于 0")
         if self.annualization_sessions < 1:
             raise BacktestConfigurationError("annualization_sessions 必须是正整数")
-        if not isinstance(self.seed, int) or isinstance(self.seed, bool):
-            raise BacktestConfigurationError("seed 必须是整数")
-        object.__setattr__(self, "tushare_root", Path(self.tushare_root).expanduser().resolve())
-        object.__setattr__(self, "qmt_root", Path(self.qmt_root).expanduser().resolve())
-        object.__setattr__(self, "output_root", Path(self.output_root).expanduser().resolve())
+        if not math.isfinite(self.risk_free_rate) or self.risk_free_rate <= -1:
+            raise BacktestConfigurationError("risk_free_rate 必须为有限值且大于 -1")
 
     def to_dict(self) -> dict[str, Any]:
         """返回稳定、可 JSON 序列化的配置。"""
@@ -140,6 +138,27 @@ class BacktestConfig:
         payload = asdict(self)
         for name in ("start_date", "end_date"):
             payload[name] = payload[name].isoformat()
-        for name in ("tushare_root", "qmt_root", "output_root"):
-            payload[name] = str(payload[name])
         return payload
+
+
+@dataclass(frozen=True, slots=True)
+class RunOptions:
+    """不影响策略结果的路径和产物选项。"""
+
+    tushare_root: Path = Path("dataset/tushare")
+    qmt_root: Path = Path("dataset/qmt")
+    output_root: Path = Path("runs")
+    audit_data_hashes: bool = False
+
+    def __post_init__(self) -> None:
+        for name in ("tushare_root", "qmt_root", "output_root"):
+            value = Path(getattr(self, name)).expanduser().resolve()
+            object.__setattr__(self, name, value)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "tushare_root": str(self.tushare_root),
+            "qmt_root": str(self.qmt_root),
+            "output_root": str(self.output_root),
+            "audit_data_hashes": self.audit_data_hashes,
+        }

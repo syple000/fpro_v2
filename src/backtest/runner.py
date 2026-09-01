@@ -13,7 +13,7 @@ from backtest.artifacts import (
     environment_metadata,
     write_artifacts,
 )
-from backtest.config import BacktestConfig
+from backtest.config import BacktestConfig, RunOptions
 from backtest.data import DataPortal
 from backtest.engine import BacktestEngine, BacktestResult
 from backtest.metrics import calculate_metrics
@@ -44,10 +44,12 @@ class CompletedRun:
 def run_monthly_momentum(
     config: BacktestConfig,
     strategy_config: MomentumConfig | None = None,
+    options: RunOptions | None = None,
 ) -> CompletedRun:
     """正式运行月度中期动量策略。"""
 
     workspace = Path(__file__).resolve().parents[2]
+    run_options = options or RunOptions()
     strategy = MonthlyMomentumStrategy(strategy_config)
     strategy_metadata: dict[str, Any] = {
         "strategy_id": strategy.strategy_id,
@@ -56,7 +58,10 @@ def run_monthly_momentum(
         "decision_time": "16:05",
         "earliest_execution": "下一交易日 09:30",
     }
-    data_snapshot = build_data_snapshot(config.tushare_root)
+    data_snapshot = build_data_snapshot(
+        run_options.tushare_root,
+        hash_files=run_options.audit_data_hashes,
+    )
     code = code_fingerprint(workspace)
     run_id = deterministic_run_id(
         config=config,
@@ -66,8 +71,8 @@ def run_monthly_momentum(
     )
     environment = environment_metadata(workspace, code)
     with DataCatalog(
-        tushare_root=config.tushare_root,
-        qmt_root=config.qmt_root,
+        tushare_root=run_options.tushare_root,
+        qmt_root=run_options.qmt_root,
     ) as catalog:
         reader = DataReader(
             catalog,
@@ -90,6 +95,7 @@ def run_monthly_momentum(
     strategy_metadata["rebalance_log"] = strategy.rebalance_log
     output_dir = write_artifacts(
         config=config,
+        options=run_options,
         result=result,
         metrics=metrics,
         strategy=strategy_metadata,

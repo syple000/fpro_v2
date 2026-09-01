@@ -5,6 +5,7 @@ from backtest.config import (
     CorporateActionConfig,
     ExecutionConfig,
     FeeConfig,
+    RunOptions,
     UniverseConfig,
 )
 from backtest.errors import (
@@ -26,6 +27,7 @@ __all__ = [
     "CorporateActionConfig",
     "ExecutionConfig",
     "FeeConfig",
+    "RunOptions",
     "UniverseConfig",
     "UnsupportedCorporateActionError",
 ]

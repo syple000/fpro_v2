@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass
 from typing import Any
 
+from backtest.data import HistoryPoint, SessionData
 from backtest.errors import BacktestConfigurationError
-from backtest.strategy import BacktestData, StrategyContext
+from backtest.strategy import PortfolioView
 
 
 @dataclass(frozen=True, slots=True)
@@ -49,23 +51,18 @@ class MonthlyMomentumStrategy:
         self.config = config or MomentumConfig()
         self.rebalance_log: list[dict[str, object]] = []
 
-    def initialize(self, context: StrategyContext) -> None:
-        del context
-
-    def on_pre_open(self, context: StrategyContext, data: BacktestData) -> None:
-        del context, data
-
-    def on_close(self, context: StrategyContext, data: BacktestData) -> None:
+    def on_close(
+        self,
+        data: SessionData,
+        portfolio: PortfolioView,
+    ) -> Mapping[str, float] | None:
+        del portfolio
         if not data.is_month_end:
-            return
+            return None
         candidates = data.candidate_symbols()
         scores: list[tuple[str, float]] = []
         for symbol in candidates:
-            value = data.momentum_return(
-                symbol,
-                lookback=self.config.lookback_sessions,
-                skip=self.config.skip_sessions,
-            )
+            value = self._momentum_return(data.history(symbol), data.session_index)
             if value is None or not math.isfinite(value):
                 continue
             if self.config.require_positive_momentum and value <= 0:
@@ -83,7 +80,6 @@ class MonthlyMomentumStrategy:
         else:
             weight = 0.0
             targets = {}
-        context.rebalance(targets)
         self.rebalance_log.append(
             {
                 "session": data.session.isoformat(),
@@ -96,3 +92,19 @@ class MonthlyMomentumStrategy:
                 "selected_symbols": [symbol for symbol, _ in selected],
             }
         )
+        return targets
+
+    def _momentum_return(
+        self,
+        history: Sequence[HistoryPoint],
+        current_session_index: int,
+    ) -> float | None:
+        old_index = current_session_index - self.config.lookback_sessions
+        recent_index = current_session_index - self.config.skip_sessions
+        points = {point.session_index: point.total_return_index for point in history}
+        old = points.get(old_index)
+        recent = points.get(recent_index)
+        if old is None or recent is None or old <= 0:
+            return None
+        value = recent / old - 1.0
+        return value if math.isfinite(value) else None

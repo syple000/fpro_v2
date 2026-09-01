@@ -1,4 +1,4 @@
-"""回测内核共享的少量固定模型。"""
+"""回测内核共享的固定数据模型。"""
 
 from __future__ import annotations
 
@@ -7,34 +7,17 @@ from datetime import date, datetime
 from enum import StrEnum
 
 
-class EventType(StrEnum):
-    PRE_OPEN = "PRE_OPEN"
-    MARKET_OPEN = "MARKET_OPEN"
-    DAILY_READY = "DAILY_READY"
-    DAILY_METRICS_READY = "DAILY_METRICS_READY"
-
-
 class OrderSide(StrEnum):
     BUY = "BUY"
     SELL = "SELL"
 
 
-class OrderType(StrEnum):
-    MARKET = "MARKET"
-
-
-class TimeInForce(StrEnum):
-    DAY = "DAY"
-
-
 class OrderStatus(StrEnum):
-    NEW = "NEW"
-    ACCEPTED = "ACCEPTED"
-    PARTIALLY_FILLED = "PARTIALLY_FILLED"
+    """一次开盘撮合后的最终结果，不表达瞬时状态。"""
+
     FILLED = "FILLED"
-    CANCELLED = "CANCELLED"
-    REJECTED = "REJECTED"
-    EXPIRED = "EXPIRED"
+    PARTIALLY_FILLED = "PARTIALLY_FILLED"
+    NOT_FILLED = "NOT_FILLED"
 
 
 class OrderReason(StrEnum):
@@ -50,7 +33,7 @@ class OrderReason(StrEnum):
     CAPACITY = "CAPACITY"
     CORPORATE_ACTION = "CORPORATE_ACTION"
     DELISTED = "DELISTED"
-    CANCELLED_BY_STRATEGY = "CANCELLED_BY_STRATEGY"
+    END_OF_BACKTEST = "END_OF_BACKTEST"
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,7 +44,6 @@ class DailyBar:
     close: float | None
     pre_close: float | None
     volume: float | None
-    amount: float | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -73,37 +55,38 @@ class MarketStatus:
     st_type: str | None
 
 
-@dataclass(slots=True)
+@dataclass(frozen=True, slots=True)
 class Order:
+    """等待下一个开盘尝试一次的订单意图。"""
+
     order_id: str
-    run_id: str
-    strategy_id: str
     symbol: str
     side: OrderSide
     quantity: int
     submitted_at: datetime
     earliest_fill_at: datetime
-    order_type: OrderType = OrderType.MARKET
-    time_in_force: TimeInForce = TimeInForce.DAY
     target_weight: float | None = None
-    filled_quantity: int = 0
-    status: OrderStatus = OrderStatus.NEW
-    reason: OrderReason = OrderReason.NONE
-    frozen_cash: float = 0.0
-
-    @property
-    def remaining_quantity(self) -> int:
-        return self.quantity - self.filled_quantity
 
 
 @dataclass(frozen=True, slots=True)
-class OrderEvent:
-    order_id: str
-    event_time: datetime
-    status: OrderStatus
+class OrderResult:
+    """订单经过一次开盘撮合后的不可变最终结果。"""
+
+    order: Order
     filled_quantity: int
-    remaining_quantity: int
-    reason: OrderReason
+    reason: OrderReason = OrderReason.NONE
+
+    @property
+    def remaining_quantity(self) -> int:
+        return self.order.quantity - self.filled_quantity
+
+    @property
+    def status(self) -> OrderStatus:
+        if self.filled_quantity == self.order.quantity:
+            return OrderStatus.FILLED
+        if self.filled_quantity > 0:
+            return OrderStatus.PARTIALLY_FILLED
+        return OrderStatus.NOT_FILLED
 
 
 @dataclass(frozen=True, slots=True)
@@ -133,16 +116,10 @@ class Position:
     total_quantity: int = 0
     sellable_quantity: int = 0
     pending_listing_quantity: int = 0
-    frozen_quantity: int = 0
     average_cost: float = 0.0
     last_price: float | None = None
     realized_pnl: float = 0.0
     stale_price: bool = False
-    opened_on: date | None = None
-
-    @property
-    def available_to_sell(self) -> int:
-        return max(self.sellable_quantity - self.frozen_quantity, 0)
 
     @property
     def market_value(self) -> float:
@@ -161,7 +138,6 @@ class Position:
 class EquitySnapshot:
     session: date
     cash: float
-    frozen_cash: float
     dividend_receivable: float
     market_value: float
     total_equity: float

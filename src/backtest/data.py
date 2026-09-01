@@ -10,7 +10,7 @@ from collections import defaultdict, deque
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
-from typing import TypedDict
+from typing import TYPE_CHECKING, TypedDict
 from zoneinfo import ZoneInfo
 
 import pyarrow as pa
@@ -18,9 +18,11 @@ import pyarrow.compute as pc
 
 from backtest.config import BacktestConfig
 from backtest.errors import BacktestDataError
-from backtest.strategy import BacktestData
 from backtest.types import CorporateAction, DailyBar, MarketStatus
 from market_data import ALL_SYMBOLS, DataReader
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 
@@ -33,20 +35,17 @@ def event_time(session: date, value: time) -> datetime:
 class HistoryPoint:
     session_index: int
     total_return_index: float
-    raw_close: float
     volume: float | None
 
 
 class StockRow(TypedDict):
     symbol: str
     exchange: str | None
-    market: str | None
-    currency: str | None
     listing_date: date
 
 
-class PortalDataView(BacktestData):
-    """策略侧视图；不暴露 DataReader、未来 K 线或开盘撮合字段。"""
+class SessionData:
+    """绑定单个交易日的策略数据，只返回已经释放的历史。"""
 
     __slots__ = ("_portal", "_session", "_session_index")
 
@@ -60,6 +59,10 @@ class PortalDataView(BacktestData):
         return self._session
 
     @property
+    def session_index(self) -> int:
+        return self._session_index
+
+    @property
     def is_month_end(self) -> bool:
         next_session = self._portal.next_session(self._session)
         return next_session is not None and next_session.month != self._session.month
@@ -67,13 +70,8 @@ class PortalDataView(BacktestData):
     def candidate_symbols(self) -> tuple[str, ...]:
         return self._portal.candidate_symbols(self._session, self._session_index)
 
-    def momentum_return(self, symbol: str, *, lookback: int, skip: int) -> float | None:
-        return self._portal.momentum_return(
-            symbol,
-            current_session_index=self._session_index,
-            lookback=lookback,
-            skip=skip,
-        )
+    def history(self, symbol: str) -> Sequence[HistoryPoint]:
+        return self._portal.history(symbol)
 
     def close(self, symbol: str) -> float | None:
         bar = self._portal.released_bars.get(symbol)
@@ -95,7 +93,6 @@ class DataPortal:
         self.history_window = history_window
         self.sessions: tuple[date, ...] = ()
         self._all_sessions: tuple[date, ...] = ()
-        self._session_to_index: dict[date, int] = {}
         self._bars: pa.Table | None = None
         self._day_offsets: dict[date, tuple[int, int]] = {}
         self._prepared_session: date | None = None
@@ -107,9 +104,6 @@ class DataPortal:
         )
         self._last_total_return_index: dict[str, float] = {}
         self._stock_cache: dict[date, tuple[StockRow, ...]] = {}
-        self._status_cache: dict[
-            tuple[date, time, tuple[str, ...], tuple[str, ...]], dict[str, MarketStatus]
-        ] = {}
         self.corporate_actions: tuple[CorporateAction, ...] = ()
 
     def load(self) -> None:
@@ -124,23 +118,19 @@ class DataPortal:
             fields=("is_open",),
         )
         all_sessions = [
-            row["cal_date"]
-            for row in calendar.table.to_pylist()
-            if row["is_open"] is True
+            row["cal_date"] for row in calendar.table.to_pylist() if row["is_open"] is True
         ]
         self._all_sessions = tuple(all_sessions)
         self.sessions = tuple(item for item in all_sessions if item <= self.config.end_date)
         if not self.sessions:
             raise BacktestDataError("配置区间内没有交易日")
-        self._session_to_index = {session: index for index, session in enumerate(self.sessions)}
-
         final_as_of = event_time(self.config.end_date, time(23, 59, 59))
         result = self.reader.at(final_as_of).market.bars(
             symbols=ALL_SYMBOLS,
             frequency="1d",
             start=self.config.start_date,
             end=final_as_of,
-            fields=("open", "close", "pre_close", "volume", "amount"),
+            fields=("open", "close", "pre_close", "volume"),
             adjustment="none",
         )
         self._bars = result.table
@@ -153,12 +143,12 @@ class DataPortal:
     @staticmethod
     def _build_day_offsets(table: pa.Table) -> dict[date, tuple[int, int]]:
         dates = pc.cast(table.column("interval_start"), pa.date32())
-        counts = pa.Table.from_arrays([dates], names=["session"]).group_by(
-            "session"
-        ).aggregate([("session", "count")])
-        ordered = sorted(
-            (item["session"], item["session_count"]) for item in counts.to_pylist()
+        counts = (
+            pa.Table.from_arrays([dates], names=["session"])
+            .group_by("session")
+            .aggregate([("session", "count")])
         )
+        ordered = sorted((item["session"], item["session_count"]) for item in counts.to_pylist())
         offsets: dict[date, tuple[int, int]] = {}
         offset = 0
         for session, count in ordered:
@@ -169,10 +159,14 @@ class DataPortal:
         return offsets
 
     def _load_corporate_actions(self, final_as_of: datetime) -> tuple[CorporateAction, ...]:
-        table = self.reader.at(final_as_of).corporate_actions.dividends(
-            symbols=ALL_SYMBOLS,
-            visible_end=final_as_of,
-        ).table
+        table = (
+            self.reader.at(final_as_of)
+            .corporate_actions.dividends(
+                symbols=ALL_SYMBOLS,
+                visible_end=final_as_of,
+            )
+            .table
+        )
         actions: list[CorporateAction] = []
         for ordinal, row in enumerate(table.to_pylist()):
             stock_dividend = row.get("stock_dividend")
@@ -193,9 +187,12 @@ class DataPortal:
                 ),
                 "ordinal": ordinal,
             }
-            action_id = "CA" + hashlib.sha256(
-                json.dumps(identity, sort_keys=True).encode("utf-8")
-            ).hexdigest()[:16]
+            action_id = (
+                "CA"
+                + hashlib.sha256(json.dumps(identity, sort_keys=True).encode("utf-8")).hexdigest()[
+                    :16
+                ]
+            )
             actions.append(
                 CorporateAction(
                     action_id=action_id,
@@ -232,7 +229,6 @@ class DataPortal:
                 close=row.get("close"),
                 pre_close=row.get("pre_close"),
                 volume=row.get("volume"),
-                amount=row.get("amount"),
             )
         self._prepared_session = session
         self._prepared_bars = prepared
@@ -259,13 +255,17 @@ class DataPortal:
                 HistoryPoint(
                     session_index=session_index,
                     total_return_index=total_return_index,
-                    raw_close=close,
                     volume=bar.volume,
                 )
             )
 
-    def strategy_view(self, session: date, session_index: int) -> PortalDataView:
-        return PortalDataView(self, session, session_index)
+    def session_data(self, session: date, session_index: int) -> SessionData:
+        return SessionData(self, session, session_index)
+
+    def history(self, symbol: str) -> tuple[HistoryPoint, ...]:
+        """返回截至当前模拟时点已经释放的有限历史。"""
+
+        return tuple(self._history.get(symbol, ()))
 
     def previous_volumes(self, symbols: Iterable[str]) -> dict[str, float | None]:
         result: dict[str, float | None] = {}
@@ -273,33 +273,6 @@ class DataPortal:
             history = self._history.get(symbol)
             result[symbol] = history[-1].volume if history else None
         return result
-
-    def momentum_return(
-        self,
-        symbol: str,
-        *,
-        current_session_index: int,
-        lookback: int,
-        skip: int,
-    ) -> float | None:
-        if lookback <= skip or skip < 0:
-            raise ValueError("lookback 必须大于 skip，且 skip 不能为负")
-        history = self._history.get(symbol)
-        if not history:
-            return None
-        old_index = current_session_index - lookback
-        recent_index = current_session_index - skip
-        old: HistoryPoint | None = None
-        recent: HistoryPoint | None = None
-        for point in history:
-            if point.session_index == old_index:
-                old = point
-            if point.session_index == recent_index:
-                recent = point
-        if old is None or recent is None or old.total_return_index <= 0:
-            return None
-        value = recent.total_return_index / old.total_return_index - 1.0
-        return value if math.isfinite(value) else None
 
     def candidate_symbols(self, session: date, session_index: int) -> tuple[str, ...]:
         rows = self._stocks(session, time(16, 5))
@@ -323,16 +296,18 @@ class DataPortal:
         cached = self._stock_cache.get(session)
         if cached is not None:
             return cached
-        table = self.reader.at(event_time(session, at)).reference.stocks(
-            currency=self.config.universe.currency,
-            fields=("exchange", "market", "currency", "listing_date"),
-        ).table
+        table = (
+            self.reader.at(event_time(session, at))
+            .reference.stocks(
+                currency=self.config.universe.currency,
+                fields=("exchange", "listing_date"),
+            )
+            .table
+        )
         rows = tuple(
             StockRow(
                 symbol=row["symbol"],
                 exchange=row["exchange"],
-                market=row["market"],
-                currency=row["currency"],
                 listing_date=row["listing_date"],
             )
             for row in table.to_pylist()
@@ -360,14 +335,14 @@ class DataPortal:
         normalized = tuple(sorted(set(symbols)))
         if not normalized:
             return {}
-        key = (session, at, normalized, fields)
-        cached = self._status_cache.get(key)
-        if cached is not None:
-            return cached
-        table = self.reader.at(event_time(session, at)).market.status(
-            symbols=normalized,
-            fields=fields,
-        ).table
+        table = (
+            self.reader.at(event_time(session, at))
+            .market.status(
+                symbols=normalized,
+                fields=fields,
+            )
+            .table
+        )
         result: dict[str, MarketStatus] = {}
         for row in table.to_pylist():
             result[row["symbol"]] = MarketStatus(
@@ -377,7 +352,6 @@ class DataPortal:
                 down_limit=row.get("down_limit"),
                 st_type=row.get("st_type"),
             )
-        self._status_cache[key] = result
         return result
 
     def next_session(self, session: date) -> date | None:

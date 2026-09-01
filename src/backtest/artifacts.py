@@ -16,7 +16,7 @@ from typing import Any
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from backtest.config import BacktestConfig
+from backtest.config import BacktestConfig, RunOptions
 from backtest.engine import BacktestResult
 from backtest.errors import ArtifactError
 from backtest.report import render_report
@@ -40,45 +40,63 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def build_data_snapshot(root: Path) -> dict[str, Any]:
-    """记录实际使用的 Manifest、活动文件大小和内容哈希。"""
+def _read_manifest(
+    root: Path,
+    manifest_path: Path,
+    *,
+    hash_files: bool,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    try:
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ArtifactError(f"无法读取 Manifest: {manifest_path}") from exc
+    names = payload.get("files") if isinstance(payload, dict) else None
+    if not isinstance(names, list) or any(not isinstance(name, str) for name in names):
+        raise ArtifactError(f"Manifest 格式无效: {manifest_path}")
+    manifest = {
+        "path": manifest_path.relative_to(root).as_posix(),
+        "size": manifest_path.stat().st_size,
+        "sha256": _sha256(manifest_path),
+    }
+    files: list[dict[str, Any]] = []
+    for name in names:
+        data_path = manifest_path.parent / name
+        if not data_path.is_file():
+            raise ArtifactError(f"Manifest 引用文件不存在: {data_path}")
+        row = {
+            "path": data_path.relative_to(root).as_posix(),
+            "size": data_path.stat().st_size,
+        }
+        if hash_files:
+            row["sha256"] = _sha256(data_path)
+        files.append(row)
+    return manifest, files
+
+
+def build_data_snapshot(root: Path, *, hash_files: bool = False) -> dict[str, Any]:
+    """默认绑定 Manifest；审计模式才读取并哈希全部数据文件。"""
 
     files: list[dict[str, Any]] = []
     manifests: list[dict[str, Any]] = []
     for dataset in USED_TUSHARE_DATASETS:
-        dataset_root = root / dataset
-        for manifest_path in sorted(dataset_root.rglob("_manifest.json")):
-            try:
-                payload = json.loads(manifest_path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError) as exc:
-                raise ArtifactError(f"无法读取 Manifest: {manifest_path}") from exc
-            names = payload.get("files") if isinstance(payload, dict) else None
-            if not isinstance(names, list) or any(not isinstance(name, str) for name in names):
-                raise ArtifactError(f"Manifest 格式无效: {manifest_path}")
-            manifest_rel = manifest_path.relative_to(root).as_posix()
-            manifests.append(
-                {
-                    "path": manifest_rel,
-                    "size": manifest_path.stat().st_size,
-                    "sha256": _sha256(manifest_path),
-                }
-            )
-            for name in names:
-                data_path = manifest_path.parent / name
-                if not data_path.is_file():
-                    raise ArtifactError(f"Manifest 引用文件不存在: {data_path}")
-                files.append(
-                    {
-                        "path": data_path.relative_to(root).as_posix(),
-                        "size": data_path.stat().st_size,
-                        "sha256": _sha256(data_path),
-                    }
-                )
+        for path in sorted((root / dataset).rglob("_manifest.json")):
+            manifest, referenced = _read_manifest(root, path, hash_files=hash_files)
+            manifests.append(manifest)
+            files.extend(referenced)
     digest = hashlib.sha256()
+    for row in manifests:
+        digest.update(f"{row['path']}:{row['sha256']}\n".encode())
     for row in files:
-        digest.update(f"{row['path']}:{row['size']}:{row['sha256']}\n".encode())
+        digest.update(f"{row['path']}:{row['size']}\n".encode())
+    content_digest = None
+    if hash_files:
+        content = hashlib.sha256()
+        for row in files:
+            content.update(f"{row['path']}:{row['sha256']}\n".encode())
+        content_digest = content.hexdigest()
     return {
         "snapshot_id": digest.hexdigest(),
+        "content_snapshot_id": content_digest,
         "source": "tushare",
         "root": str(root),
         "datasets": list(USED_TUSHARE_DATASETS),
@@ -87,7 +105,7 @@ def build_data_snapshot(root: Path) -> dict[str, Any]:
         "total_bytes": sum(row["size"] for row in files),
         "manifests": manifests,
         "files": files,
-        "retention": "content_hash_only",
+        "retention": "content_hash_only" if hash_files else "manifest_reference",
     }
 
 
@@ -171,13 +189,14 @@ def _parquet(path: Path, rows: list[dict[str, Any]]) -> None:
 def write_artifacts(
     *,
     config: BacktestConfig,
+    options: RunOptions,
     result: BacktestResult,
     metrics: dict[str, Any],
     strategy: dict[str, Any],
     data_snapshot: dict[str, Any],
     environment: dict[str, Any],
 ) -> Path:
-    output_root = config.output_root
+    output_root = options.output_root
     output_root.mkdir(parents=True, exist_ok=True)
     final = output_root / result.run_id
     temporary = output_root / f".{result.run_id}.tmp-{os.getpid()}"
@@ -185,41 +204,29 @@ def write_artifacts(
         raise ArtifactError(f"运行目录已存在，不覆盖: {final}")
     temporary.mkdir()
     _json(temporary / "config.json", config.to_dict())
+    _json(temporary / "run_options.json", options.to_dict())
     _json(temporary / "environment.json", environment)
     _json(temporary / "data_snapshot.json", data_snapshot)
     _json(temporary / "strategy.json", strategy)
     _json(temporary / "metrics.json", metrics)
-    _parquet(temporary / "events.parquet", list(result.events))
     _parquet(
         temporary / "orders.parquet",
         [
             {
-                **asdict(order),
-                "side": order.side.value,
-                "order_type": order.order_type.value,
-                "time_in_force": order.time_in_force.value,
-                "status": order.status.value,
-                "reason": order.reason.value,
-            }
-            for order in result.orders
-        ],
-    )
-    _parquet(
-        temporary / "order_events.parquet",
-        [
-            {
-                **asdict(row),
+                **asdict(row.order),
+                "side": row.order.side.value,
+                "filled_quantity": row.filled_quantity,
+                "remaining_quantity": row.remaining_quantity,
                 "status": row.status.value,
                 "reason": row.reason.value,
             }
-            for row in result.order_events
+            for row in result.orders
         ],
     )
     _parquet(
         temporary / "fills.parquet",
         [{**asdict(fill), "side": fill.side.value} for fill in result.fills],
     )
-    _parquet(temporary / "positions.parquet", list(result.positions))
     _parquet(
         temporary / "corporate_actions.parquet",
         [asdict(row) for row in result.corporate_actions],

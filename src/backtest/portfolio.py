@@ -19,16 +19,10 @@ class Portfolio:
         if not math.isfinite(initial_cash) or initial_cash <= 0:
             raise ValueError("initial_cash 必须是有限正数")
         self.cash = float(initial_cash)
-        self.frozen_cash = 0.0
         self.positions: dict[str, Position] = {}
         self._receivables: dict[str, float] = {}
         self._entitlements: dict[str, int] = {}
         self._pending_stock: dict[str, tuple[str, int]] = {}
-        self.total_fees = 0.0
-        self.total_commission = 0.0
-        self.total_stamp_tax = 0.0
-        self.total_transfer_fee = 0.0
-        self.realized_pnl = 0.0
         self._last_equity: float | None = None
 
     @property
@@ -41,7 +35,7 @@ class Portfolio:
 
     @property
     def total_equity(self) -> float:
-        return self.cash + self.frozen_cash + self.dividend_receivable + self.market_value
+        return self.cash + self.dividend_receivable + self.market_value
 
     def position(self, symbol: str) -> Position:
         return self.positions.setdefault(symbol, Position(symbol=symbol))
@@ -53,31 +47,6 @@ class Portfolio:
             position.sellable_quantity = position.total_quantity - position.pending_listing_quantity
         self.assert_invariants()
 
-    def freeze_position(self, symbol: str, quantity: int) -> bool:
-        position = self.position(symbol)
-        if quantity <= 0 or position.available_to_sell < quantity:
-            return False
-        position.frozen_quantity += quantity
-        self.assert_invariants()
-        return True
-
-    def release_position(self, symbol: str, quantity: int) -> None:
-        position = self.position(symbol)
-        if quantity < 0 or quantity > position.frozen_quantity:
-            raise AccountInvariantError(f"{symbol} 释放冻结持仓数量无效: {quantity}")
-        position.frozen_quantity -= quantity
-        self.assert_invariants()
-
-    def freeze_cash_for_immediate_fill(self, amount: float) -> bool:
-        if not math.isfinite(amount) or amount <= 0:
-            raise AccountInvariantError("冻结金额必须是有限正数")
-        if self.cash + _EPSILON < amount:
-            return False
-        self.cash -= amount
-        self.frozen_cash += amount
-        self.assert_invariants()
-        return True
-
     def apply_fill(self, fill: Fill) -> None:
         """应用一笔已经通过券商约束检查的成交。"""
 
@@ -85,17 +54,13 @@ class Portfolio:
         fee = fill.total_fee
         if fill.side is OrderSide.BUY:
             cost = fill.notional + fee
-            if self.frozen_cash + _EPSILON < cost:
-                raise AccountInvariantError("成交消耗超过冻结资金")
-            self.frozen_cash -= cost
+            if self.cash + _EPSILON < cost:
+                raise AccountInvariantError("买入成交消耗超过可用资金")
+            self.cash -= cost
             old_cost = position.average_cost * position.total_quantity
             position.total_quantity += fill.quantity
             position.average_cost = (old_cost + cost) / position.total_quantity
-            if position.opened_on is None:
-                position.opened_on = fill.filled_at.date()
         else:
-            if fill.quantity > position.frozen_quantity:
-                raise AccountInvariantError("卖出成交超过冻结持仓")
             if (
                 fill.quantity > position.total_quantity
                 or fill.quantity > position.sellable_quantity
@@ -106,19 +71,11 @@ class Portfolio:
             self.cash += proceeds
             position.total_quantity -= fill.quantity
             position.sellable_quantity -= fill.quantity
-            position.frozen_quantity -= fill.quantity
             position.realized_pnl += pnl
-            self.realized_pnl += pnl
             if position.total_quantity == 0:
                 position.average_cost = 0.0
-                position.opened_on = None
                 position.last_price = None
                 position.stale_price = False
-
-        self.total_fees += fee
-        self.total_commission += fill.commission
-        self.total_stamp_tax += fill.stamp_tax
-        self.total_transfer_fee += fill.transfer_fee
         self.assert_invariants()
 
     def mark_to_market(self, prices: Mapping[str, float]) -> None:
@@ -214,15 +171,12 @@ class Portfolio:
         quantity = position.total_quantity
         loss = position.market_value
         position.realized_pnl -= position.average_cost * quantity
-        self.realized_pnl -= position.average_cost * quantity
         position.total_quantity = 0
         position.sellable_quantity = 0
         position.pending_listing_quantity = 0
-        position.frozen_quantity = 0
         position.average_cost = 0.0
         position.last_price = None
         position.stale_price = False
-        position.opened_on = None
         self.assert_invariants()
         return quantity, loss
 
@@ -236,7 +190,6 @@ class Portfolio:
         return EquitySnapshot(
             session=session,
             cash=self.cash,
-            frozen_cash=self.frozen_cash,
             dividend_receivable=self.dividend_receivable,
             market_value=self.market_value,
             total_equity=equity,
@@ -246,7 +199,7 @@ class Portfolio:
         )
 
     def assert_invariants(self) -> None:
-        values = (self.cash, self.frozen_cash, self.dividend_receivable, self.market_value)
+        values = (self.cash, self.dividend_receivable, self.market_value)
         if any(not math.isfinite(value) or value < -_EPSILON for value in values):
             raise AccountInvariantError(f"账户出现负数或非有限值: {values}")
         for symbol, position in self.positions.items():
@@ -254,7 +207,6 @@ class Portfolio:
                 position.total_quantity,
                 position.sellable_quantity,
                 position.pending_listing_quantity,
-                position.frozen_quantity,
             )
             if any(value < 0 for value in quantities):
                 raise AccountInvariantError(f"{symbol} 持仓数量为负: {quantities}")
@@ -263,5 +215,3 @@ class Portfolio:
                 > position.total_quantity
             ):
                 raise AccountInvariantError(f"{symbol} 可卖与待上市数量超过总持仓")
-            if position.frozen_quantity > position.sellable_quantity:
-                raise AccountInvariantError(f"{symbol} 冻结数量超过可卖数量")
