@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from decimal import ROUND_HALF_UP, Decimal
 
-from backtest.config import ExecutionConfig, FeeConfig
+from backtest.config import BacktestConfig
 from backtest.types import (
     DailyBar,
     Fill,
@@ -30,27 +30,22 @@ def _round_price(value: float, tick: float) -> float:
     return float(rounded)
 
 
+LOT_SIZE = 100
+PRICE_TICK = 0.01
+
+
 class FeeModel:
     """按成交日选择印花税与过户费政策。"""
 
-    def __init__(self, config: FeeConfig) -> None:
-        self.config = config
+    def __init__(self, commission_rate: float = 0.0003, minimum_commission: float = 5.0) -> None:
+        self.commission_rate = commission_rate
+        self.minimum_commission = minimum_commission
 
     def calculate(self, *, side: OrderSide, notional: float, session: date) -> tuple[float, ...]:
-        commission = _round_money(
-            max(self.config.minimum_commission, notional * self.config.commission_rate)
-        )
-        stamp_rate = (
-            self.config.stamp_tax_rate_from_2023_08_28
-            if session >= date(2023, 8, 28)
-            else self.config.stamp_tax_rate_before_2023_08_28
-        )
+        commission = _round_money(max(self.minimum_commission, notional * self.commission_rate))
+        stamp_rate = 0.0005 if session >= date(2023, 8, 28) else 0.001
         stamp_tax = _round_money(notional * stamp_rate) if side is OrderSide.SELL else 0.0
-        transfer_rate = (
-            self.config.transfer_fee_rate_from_2022_04_29
-            if session >= date(2022, 4, 29)
-            else self.config.transfer_fee_rate_before_2022_04_29
-        )
+        transfer_rate = 0.00001 if session >= date(2022, 4, 29) else 0.00002
         transfer_fee = _round_money(notional * transfer_rate)
         return commission, stamp_tax, transfer_fee
 
@@ -75,9 +70,9 @@ class _OpenInputs:
 class ExecutionEngine:
     """订单在目标开盘尝试一次，输出结果和成交，不持有账户引用。"""
 
-    def __init__(self, *, execution: ExecutionConfig, fees: FeeConfig) -> None:
-        self.execution = execution
-        self.fee_model = FeeModel(fees)
+    def __init__(self, config: BacktestConfig) -> None:
+        self.config = config
+        self.fee_model = FeeModel(config.commission_rate, config.minimum_commission)
         self.pending_orders: list[Order] = []
         self.results: list[OrderResult] = []
         self.fills: list[Fill] = []
@@ -166,11 +161,10 @@ class ExecutionEngine:
             sellable_quantities=dict(sellable_quantities),
         )
         sells = [order for order in eligible if order.side is OrderSide.SELL]
-        buy_orders = [order for order in eligible if order.side is OrderSide.BUY]
+        buys = [order for order in eligible if order.side is OrderSide.BUY]
         before = len(self.fills)
         available_cash = self._execute_sells(sells, inputs, event_time, cash)
-        buys = self._prepare_buys(buy_orders, inputs)
-        self._execute_buys(buys, event_time, available_cash)
+        self._execute_buys(buys, inputs, event_time, available_cash)
         return self.fills[before:]
 
     def _execute_sells(
@@ -192,30 +186,20 @@ class ExecutionEngine:
             self.results.append(OrderResult(order, fill.quantity, decision.partial_reason))
         return cash
 
-    def _prepare_buys(
+    def _execute_buys(
         self,
         orders: list[Order],
         inputs: _OpenInputs,
-    ) -> list[tuple[Order, _Decision]]:
-        buys: list[tuple[Order, _Decision]] = []
+        event_time: datetime,
+        cash: float,
+    ) -> None:
         for order in orders:
             decision = self._decision(order, inputs)
             if isinstance(decision, OrderReason):
                 self._reject(order, decision)
-            else:
-                buys.append((order, decision))
-        return buys
-
-    def _execute_buys(
-        self,
-        buys: list[tuple[Order, _Decision]],
-        event_time: datetime,
-        cash: float,
-    ) -> None:
-        allocations = self._allocate_buys(buys, cash, event_time.date())
-        for order, decision in buys:
+                continue
             quantity = self._affordable_quantity(
-                allocations.get(order.order_id, 0),
+                decision.quantity,
                 decision.execution_price,
                 cash,
                 event_time.date(),
@@ -270,16 +254,13 @@ class ExecutionEngine:
         order: Order,
         previous_volume: float | None,
     ) -> tuple[int, OrderReason]:
-        participation = self.execution.max_previous_volume_participation
+        participation = self.config.max_volume_fraction
         if participation is None:
             return order.quantity, OrderReason.NONE
         if previous_volume is None or not math.isfinite(previous_volume) or previous_volume <= 0:
             return 0, OrderReason.CAPACITY
-        capacity = (
-            math.floor(previous_volume * participation / self.execution.lot_size)
-            * self.execution.lot_size
-        )
-        if order.side is OrderSide.SELL and order.quantity < self.execution.lot_size:
+        capacity = math.floor(previous_volume * participation / LOT_SIZE) * LOT_SIZE
+        if order.side is OrderSide.SELL and order.quantity < LOT_SIZE:
             capacity = math.floor(previous_volume * participation)
         quantity = min(order.quantity, capacity)
         reason = OrderReason.CAPACITY if quantity < order.quantity else OrderReason.NONE
@@ -292,11 +273,11 @@ class ExecutionEngine:
     ) -> OrderReason | None:
         if order.quantity <= 0:
             return OrderReason.INVALID_QUANTITY
-        if order.side is OrderSide.BUY and order.quantity % self.execution.lot_size:
+        if order.side is OrderSide.BUY and order.quantity % LOT_SIZE:
             return OrderReason.INVALID_QUANTITY
-        is_odd_sell = order.side is OrderSide.SELL and order.quantity % self.execution.lot_size
+        is_odd_sell = order.side is OrderSide.SELL and order.quantity % LOT_SIZE
         is_full_exit = order.quantity == total_quantity
-        if is_odd_sell and not (self.execution.allow_odd_lot_full_exit and is_full_exit):
+        if is_odd_sell and not is_full_exit:
             return OrderReason.INVALID_QUANTITY
         return None
 
@@ -310,11 +291,9 @@ class ExecutionEngine:
             return OrderReason.SUSPENDED
         if bar is None or bar.open is None or not math.isfinite(bar.open) or bar.open <= 0:
             return OrderReason.MISSING_OPEN
-        if self.execution.strict_price_limits and (
-            status.up_limit is None or status.down_limit is None
-        ):
+        if status.up_limit is None or status.down_limit is None:
             return OrderReason.MISSING_PRICE_LIMIT
-        tolerance = self.execution.price_tick / 2
+        tolerance = PRICE_TICK / 2
         if (
             order.side is OrderSide.BUY
             and status.up_limit is not None
@@ -337,44 +316,14 @@ class ExecutionEngine:
     ) -> float:
         direction = 1.0 if side is OrderSide.BUY else -1.0
         execution_price = _round_price(
-            market_price * (1 + direction * self.execution.slippage_bps / 10_000),
-            self.execution.price_tick,
+            market_price * (1 + direction * self.config.slippage_bps / 10_000),
+            PRICE_TICK,
         )
         if status.up_limit is not None:
             execution_price = min(execution_price, status.up_limit)
         if status.down_limit is not None:
             execution_price = max(execution_price, status.down_limit)
         return execution_price
-
-    def _allocate_buys(
-        self,
-        buys: list[tuple[Order, _Decision]],
-        cash: float,
-        session: date,
-    ) -> dict[str, int]:
-        requested = sum(
-            self._total_buy_cost(decision.quantity, decision.execution_price, session)
-            for _, decision in buys
-        )
-        scale = min(cash / requested, 1.0) if requested > 0 else 0.0
-        allocations = {
-            order.order_id: math.floor(decision.quantity * scale / self.execution.lot_size)
-            * self.execution.lot_size
-            for order, decision in buys
-        }
-        total = sum(
-            self._total_buy_cost(allocations[order.order_id], decision.execution_price, session)
-            for order, decision in buys
-            if allocations[order.order_id] > 0
-        )
-        if total <= cash or total <= 0:
-            return allocations
-        second_scale = cash / total
-        return {
-            order_id: math.floor(quantity * second_scale / self.execution.lot_size)
-            * self.execution.lot_size
-            for order_id, quantity in allocations.items()
-        }
 
     def _affordable_quantity(
         self,
@@ -383,16 +332,12 @@ class ExecutionEngine:
         cash: float,
         session: date,
     ) -> int:
-        lots = maximum // self.execution.lot_size
-        low, high = 0, lots
-        while low < high:
-            middle = (low + high + 1) // 2
-            quantity = middle * self.execution.lot_size
-            if self._total_buy_cost(quantity, price, session) <= cash + 1e-6:
-                low = middle
-            else:
-                high = middle - 1
-        return low * self.execution.lot_size
+        transfer_rate = 0.00001 if session >= date(2022, 4, 29) else 0.00002
+        estimated_per_share = price * (1 + self.config.commission_rate + transfer_rate)
+        quantity = min(maximum, math.floor(cash / estimated_per_share / LOT_SIZE) * LOT_SIZE)
+        while quantity > 0 and self._total_buy_cost(quantity, price, session) > cash + 1e-6:
+            quantity -= LOT_SIZE
+        return quantity
 
     def _total_buy_cost(self, quantity: int, price: float, session: date) -> float:
         notional = _round_money(quantity * price)

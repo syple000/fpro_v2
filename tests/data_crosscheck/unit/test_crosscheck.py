@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pyarrow as pa
 
-from data_validation import (
+from data_crosscheck import (
     compare_daily,
     compare_dividends,
     compare_financial,

@@ -1,3 +1,5 @@
+"""开盘执行与账户记账的边界测试。"""
+
 from __future__ import annotations
 
 from datetime import date, datetime
@@ -5,12 +7,25 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from backtest.config import ExecutionConfig, FeeConfig
+from backtest.config import BacktestConfig
 from backtest.execution import ExecutionEngine, FeeModel
 from backtest.portfolio import Portfolio
 from backtest.types import DailyBar, MarketStatus, OrderReason, OrderSide, OrderStatus
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
+
+
+def _execution() -> ExecutionEngine:
+    return ExecutionEngine(
+        BacktestConfig(
+            start_date=date(2024, 1, 1),
+            end_date=date(2024, 1, 31),
+            slippage_bps=0,
+            max_volume_fraction=None,
+            commission_rate=0,
+            minimum_commission=0,
+        )
+    )
 
 
 def _time(day: int, hour: int = 9, minute: int = 30) -> datetime:
@@ -63,10 +78,7 @@ def _execute(
 
 def test_buy_is_t1_locked_and_can_only_be_sold_next_session() -> None:
     portfolio = Portfolio(100_000.0)
-    execution = ExecutionEngine(
-        execution=ExecutionConfig(slippage_bps=0, max_previous_volume_participation=None),
-        fees=FeeConfig(commission_rate=0, minimum_commission=0),
-    )
+    execution = _execution()
     buy = execution.submit_order(
         symbol="000001.SZ",
         side=OrderSide.BUY,
@@ -117,10 +129,7 @@ def test_untradeable_open_has_explicit_reason(
     reason: OrderReason,
 ) -> None:
     portfolio = Portfolio(100_000.0)
-    execution = ExecutionEngine(
-        execution=ExecutionConfig(slippage_bps=0, max_previous_volume_participation=None),
-        fees=FeeConfig(),
-    )
+    execution = _execution()
     order = execution.submit_order(
         symbol="000001.SZ",
         side=OrderSide.BUY,
@@ -138,10 +147,7 @@ def test_untradeable_open_has_explicit_reason(
 
 def test_execution_returns_fills_before_account_applies_them() -> None:
     portfolio = Portfolio(100_000.0)
-    execution = ExecutionEngine(
-        execution=ExecutionConfig(slippage_bps=0, max_previous_volume_participation=None),
-        fees=FeeConfig(commission_rate=0, minimum_commission=0),
-    )
+    execution = _execution()
     execution.submit_order(
         symbol="000001.SZ",
         side=OrderSide.BUY,
@@ -163,8 +169,40 @@ def test_execution_returns_fills_before_account_applies_them() -> None:
     assert portfolio.cash < 100_000.0
 
 
+def test_multiple_buys_never_overdraw_cash() -> None:
+    portfolio = Portfolio(1_500.0)
+    execution = _execution()
+    for symbol in ("000001.SZ", "000002.SZ"):
+        execution.submit_order(
+            symbol=symbol,
+            side=OrderSide.BUY,
+            quantity=100,
+            submitted_at=_time(2, 16, 5),
+            earliest_fill_at=_time(3),
+        )
+    bars = {
+        symbol: DailyBar(symbol, date(2024, 1, 3), 10.0, 10.0, 10.0, 100_000.0)
+        for symbol in ("000001.SZ", "000002.SZ")
+    }
+    statuses = {symbol: MarketStatus(symbol, False, 11.0, 9.0, None) for symbol in bars}
+    fills = execution.execute_open(
+        event_time=_time(3),
+        bars=bars,
+        statuses=statuses,
+        previous_volumes={symbol: 100_000.0 for symbol in bars},
+        cash=portfolio.cash,
+        total_quantities={},
+        sellable_quantities={},
+    )
+    for fill in fills:
+        portfolio.apply_fill(fill)
+
+    assert portfolio.cash >= 0
+    assert sum(fill.notional + fill.total_fee for fill in fills) <= 1_500.0
+
+
 def test_fee_policy_changes_on_effective_dates() -> None:
-    model = FeeModel(FeeConfig(commission_rate=0, minimum_commission=0))
+    model = FeeModel(commission_rate=0, minimum_commission=0)
     _, old_stamp, old_transfer = model.calculate(
         side=OrderSide.SELL,
         notional=1_000_000,

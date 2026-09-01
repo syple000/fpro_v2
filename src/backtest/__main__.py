@@ -7,7 +7,7 @@ import json
 from datetime import date
 from pathlib import Path
 
-from backtest.config import BacktestConfig, RunOptions, UniverseConfig
+from backtest.config import BacktestConfig, RunOptions
 from backtest.runner import run_monthly_momentum
 from strategies import MomentumConfig
 
@@ -26,22 +26,16 @@ def main() -> None:
     parser.add_argument("--initial-cash", type=float, default=10_000_000.0)
     parser.add_argument("--tushare-dir", type=Path, default=Path("dataset/tushare"))
     parser.add_argument("--qmt-dir", type=Path, default=Path("dataset/qmt"))
-    parser.add_argument("--output-dir", type=Path, default=Path("runs"))
+    parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--lookback", type=int, default=120)
     parser.add_argument("--skip", type=int, default=20)
     parser.add_argument("--top-fraction", type=float, default=0.10)
     parser.add_argument("--max-positions", type=int, default=30)
-    parser.add_argument(
-        "--audit-data-hashes",
-        action="store_true",
-        help="读取并哈希全部输入 Parquet；默认只绑定 Manifest",
-    )
     args = parser.parse_args()
     config = BacktestConfig(
         start_date=args.start,
         end_date=args.end,
         initial_cash=args.initial_cash,
-        universe=UniverseConfig(minimum_listing_sessions=250, exclude_st=True),
     )
     strategy = MomentumConfig(
         lookback_sessions=args.lookback,
@@ -55,12 +49,11 @@ def main() -> None:
         RunOptions(
             tushare_root=args.tushare_dir,
             qmt_root=args.qmt_dir,
-            output_root=args.output_dir,
-            audit_data_hashes=args.audit_data_hashes,
+            output_dir=args.output_dir,
         ),
     )
     summary = {
-        "output_dir": str(completed.output_dir),
+        "output_dir": str(completed.output_dir) if completed.output_dir else None,
         "total_return": completed.metrics["total_return"],
         "annualized_return": completed.metrics["annualized_return"],
         "max_drawdown": completed.metrics["max_drawdown"],

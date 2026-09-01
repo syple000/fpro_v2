@@ -85,8 +85,6 @@ def validated_target_weights(weights: Mapping[str, float]) -> dict[str, float]:
 class Strategy(Protocol):
     """收盘生成完整目标权重；返回 None 表示本日不调仓。"""
 
-    strategy_id: str
-
     def on_close(
         self,
         data: SessionData,

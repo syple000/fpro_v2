@@ -1,4 +1,8 @@
-"""随机抽样并比较 Tushare 与 QMT 的日线、财务和除权数据。"""
+"""Tushare/QMT 数据交叉检查。
+
+本模块通过可重复抽样比较两个来源，只报告缺失和数值差异，不根据
+某一来源的值自动判定另一来源错误，也不负责数据清洗或发布门禁。
+"""
 
 from __future__ import annotations
 
@@ -21,6 +25,8 @@ from qmt_receiver.sync import SyncResult, sync_all
 
 @dataclass(frozen=True, slots=True)
 class Difference:
+    """两个来源在同一业务键上的观测差异，不表示任一方已被判定为错误。"""
+
     check: str
     code: str
     date: str
@@ -31,23 +37,29 @@ class Difference:
 
 @dataclass(frozen=True, slots=True)
 class CheckResult:
+    """一类跨源比较的结果。"""
+
     name: str
     compared: int
     differences: tuple[Difference, ...]
 
     @property
     def passed(self) -> bool:
+        """是否未发现跨源差异，不表示已完成全量数据质量认证。"""
         return not self.differences
 
 
 @dataclass(frozen=True, slots=True)
-class ValidationReport:
+class CrosscheckReport:
+    """一次抽样交叉检查的样本、同步和比较结果。"""
+
     stocks: tuple[str, ...]
     sync: SyncResult
     checks: tuple[CheckResult, ...]
 
     @property
     def passed(self) -> bool:
+        """是否所有抽样比较均未发现差异。"""
         return all(check.passed for check in self.checks)
 
 
@@ -213,7 +225,7 @@ _FINANCIAL_FIELDS = {
 }
 
 
-def validate_sample(
+def crosscheck_sample(
     client: QmtAgentClient,
     *,
     tushare_root: str | Path,
@@ -222,7 +234,7 @@ def validate_sample(
     end_date: date,
     sample_size: int = 20,
     seed: int = 0,
-) -> ValidationReport:
+) -> CrosscheckReport:
     """从 Tushare 日线随机抽股票，拉取 QMT 数据并完成四类比较。"""
     with DataCatalog(tushare_root=tushare_root, qmt_root=qmt_root) as catalog:
         stocks = sample_stocks(
@@ -266,7 +278,7 @@ def validate_sample(
             compare_financial(catalog.connection, stocks, start_date, end_date),
             compare_dividends(catalog.connection, stocks, start_date, end_date),
         )
-    return ValidationReport(tuple(stocks), sync_result, checks)
+    return CrosscheckReport(tuple(stocks), sync_result, checks)
 
 
 def sample_stocks(
@@ -522,9 +534,7 @@ def compare_financial(
                 if qmt_field not in qmt_row:
                     continue
                 candidates = (
-                    (tushare_fields,)
-                    if isinstance(tushare_fields, str)
-                    else tushare_fields
+                    (tushare_fields,) if isinstance(tushare_fields, str) else tushare_fields
                 )
                 qmt_value = qmt_row[qmt_field]
                 values = [ts_row[field] for field in candidates if ts_row[field] is not None]
@@ -543,11 +553,7 @@ def compare_financial(
                     tushare_value = min(values, key=lambda value: abs(value - qmt_value))
                 else:
                     tushare_value = ts_row[candidates[0]]
-                atol = (
-                    0.005001
-                    if qmt_field in {"s_fa_eps_basic", "s_fa_eps_diluted"}
-                    else 1e-4
-                )
+                atol = 0.005001 if qmt_field in {"s_fa_eps_basic", "s_fa_eps_diluted"} else 1e-4
                 compared += _compare(
                     differences,
                     f"financial_{qmt_table}",

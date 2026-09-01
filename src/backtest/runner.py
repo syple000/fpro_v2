@@ -1,4 +1,4 @@
-"""构造固定数据源、运行策略并保存全部产物。"""
+"""连接数据、策略、引擎和可选输出。"""
 
 from __future__ import annotations
 
@@ -6,17 +6,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from backtest.artifacts import (
-    build_data_snapshot,
-    code_fingerprint,
-    deterministic_run_id,
-    environment_metadata,
-    write_artifacts,
-)
 from backtest.config import BacktestConfig, RunOptions
-from backtest.data import DataPortal
+from backtest.data import MarketData
 from backtest.engine import BacktestEngine, BacktestResult
 from backtest.metrics import calculate_metrics
+from backtest.output import write_results
 from market_data import DataCatalog, DataReader, SourceConfig
 from strategies import MomentumConfig, MonthlyMomentumStrategy
 
@@ -36,9 +30,9 @@ _ROUTES = {
 
 @dataclass(frozen=True, slots=True)
 class CompletedRun:
-    output_dir: Path
     result: BacktestResult
     metrics: dict[str, Any]
+    output_dir: Path | None
 
 
 def run_monthly_momentum(
@@ -46,30 +40,8 @@ def run_monthly_momentum(
     strategy_config: MomentumConfig | None = None,
     options: RunOptions | None = None,
 ) -> CompletedRun:
-    """正式运行月度中期动量策略。"""
-
-    workspace = Path(__file__).resolve().parents[2]
     run_options = options or RunOptions()
     strategy = MonthlyMomentumStrategy(strategy_config)
-    strategy_metadata: dict[str, Any] = {
-        "strategy_id": strategy.strategy_id,
-        **strategy.config.to_dict(),
-        "signal": "close/pre_close 链接的 PIT 总收益指数",
-        "decision_time": "16:05",
-        "earliest_execution": "下一交易日 09:30",
-    }
-    data_snapshot = build_data_snapshot(
-        run_options.tushare_root,
-        hash_files=run_options.audit_data_hashes,
-    )
-    code = code_fingerprint(workspace)
-    run_id = deterministic_run_id(
-        config=config,
-        strategy=strategy_metadata,
-        data_snapshot=data_snapshot,
-        code=code,
-    )
-    environment = environment_metadata(workspace, code)
     with DataCatalog(
         tushare_root=run_options.tushare_root,
         qmt_root=run_options.qmt_root,
@@ -79,27 +51,18 @@ def run_monthly_momentum(
             sources=SourceConfig(_ROUTES),
             max_result_rows=20_000_000,
         )
-        portal = DataPortal(
+        data = MarketData(
             reader,
             config,
             history_window=max(strategy.config.lookback_sessions + 5, 300),
         )
-        portal.load()
         result = BacktestEngine(
-            run_id=run_id,
             config=config,
-            portal=portal,
+            data=data,
             strategy=strategy,
         ).run()
     metrics = calculate_metrics(result, config)
-    strategy_metadata["rebalance_log"] = strategy.rebalance_log
-    output_dir = write_artifacts(
-        config=config,
-        options=run_options,
-        result=result,
-        metrics=metrics,
-        strategy=strategy_metadata,
-        data_snapshot=data_snapshot,
-        environment=environment,
-    )
-    return CompletedRun(output_dir=output_dir, result=result, metrics=metrics)
+    output_dir = None
+    if run_options.output_dir is not None:
+        output_dir = write_results(run_options.output_dir, config, result, metrics)
+    return CompletedRun(result=result, metrics=metrics, output_dir=output_dir)

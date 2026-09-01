@@ -19,7 +19,3 @@ class AccountInvariantError(BacktestError):
 
 class UnsupportedCorporateActionError(BacktestError):
     """持仓遇到了第一版尚不能正确记账的公司行动。"""
-
-
-class ArtifactError(BacktestError):
-    """运行产物无法安全落盘。"""

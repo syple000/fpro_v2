@@ -303,7 +303,7 @@ backtest = [
     { name = "pandas" },
     { name = "pyarrow" },
 ]
-data-validation = [
+data-crosscheck = [
     { name = "duckdb" },
     { name = "httpx2" },
     { name = "pyarrow" },
@@ -359,7 +359,7 @@ backtest = [
     { name = "pandas", specifier = ">=2.2,<3.0" },
     { name = "pyarrow", specifier = ">=18.0,<24.0" },
 ]
-data-validation = [
+data-crosscheck = [
     { name = "duckdb", specifier = ">=1.4,<2.0" },
     { name = "httpx2", specifier = ">=2.0,<3.0" },
     { name = "pyarrow", specifier = ">=18.0,<24.0" },

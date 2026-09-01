@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import date, datetime
 from zoneinfo import ZoneInfo
 
-from backtest.config import CorporateActionConfig, ExecutionConfig, FeeConfig
+from backtest.config import BacktestConfig
 from backtest.corporate_actions import CorporateActionProcessor
 from backtest.execution import ExecutionEngine
 from backtest.portfolio import Portfolio
@@ -35,10 +35,9 @@ def test_dividend_receivable_and_stock_listing_are_separate_events() -> None:
         cash_dividend_before_tax=0.6,
         stock_dividend=0.1,
     )
-    processor = CorporateActionProcessor((action,), CorporateActionConfig())
+    processor = CorporateActionProcessor((action,))
     execution = ExecutionEngine(
-        execution=ExecutionConfig(),
-        fees=FeeConfig(),
+        BacktestConfig(start_date=date(2024, 1, 1), end_date=date(2024, 1, 5))
     )
 
     processor.capture_record_date(_at(2, 16, 5), portfolio)
@@ -54,11 +53,4 @@ def test_dividend_receivable_and_stock_listing_are_separate_events() -> None:
     processor.pre_open(_at(5), portfolio=portfolio, execution=execution)
     assert position.pending_listing_quantity == 0
     assert position.sellable_quantity == 110
-    assert [event.event_type for event in processor.events] == [
-        "RECORD_ENTITLEMENT",
-        "DIVIDEND_RECEIVABLE",
-        "STOCK_DIVIDEND",
-        "DIVIDEND_PAID",
-        "STOCK_LISTED",
-    ]
     portfolio.assert_invariants()

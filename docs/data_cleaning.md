@@ -27,6 +27,21 @@ docs/data_cleaning.md
 `data_cleaning` 不负责采集 Tushare/QMT 数据，不改变 `DataReader` 的 PIT 语义，也不在财务口径
 不明确时主动“平账”。
 
+### 与 `data_crosscheck` 的边界
+
+`data_crosscheck` 定位为 Tushare/QMT 数据交叉检查。它从 Tushare 股票池中做
+可重复抽样，将日线、财务和除权数据与 QMT 独立观测比较，用于发现单源内部
+规则难以发现的口径、缺失和数值差异。
+
+跨源差异只证明两个观测不一致，不证明 Tushare 或 QMT 任一方必然错误。因此：
+
+- `data_crosscheck` 不自动修改数据；
+- 交叉检查报告不直接决定 `AVAILABLE` / `UNAVAILABLE`；
+- 差异经语义核对并确认为源数据问题后，才转换为 `data_cleaning` 的 `MANUAL`
+  Issue，再通过 `PATCH`、`REFETCH` 或 `ACCEPT` 闭环；
+- `data_cleaning detect` 仍是全量、确定性的发布门禁；`data_crosscheck` 是抽样、跨源的
+  补充证据，二者不相互替代。
+
 ## 总体流程
 
 ```text

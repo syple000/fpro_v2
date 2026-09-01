@@ -1,9 +1,7 @@
-"""绑定模拟时钟、批量释放行情的 DataPortal。"""
+"""绑定模拟日期，只向策略提供已经释放的市场数据。"""
 
 from __future__ import annotations
 
-import hashlib
-import json
 import math
 from bisect import bisect_left
 from collections import defaultdict, deque
@@ -47,10 +45,10 @@ class StockRow(TypedDict):
 class SessionData:
     """绑定单个交易日的策略数据，只返回已经释放的历史。"""
 
-    __slots__ = ("_portal", "_session", "_session_index")
+    __slots__ = ("_market", "_session", "_session_index")
 
-    def __init__(self, portal: DataPortal, session: date, session_index: int) -> None:
-        self._portal = portal
+    def __init__(self, market: MarketData, session: date, session_index: int) -> None:
+        self._market = market
         self._session = session
         self._session_index = session_index
 
@@ -64,21 +62,21 @@ class SessionData:
 
     @property
     def is_month_end(self) -> bool:
-        next_session = self._portal.next_session(self._session)
+        next_session = self._market.next_session(self._session)
         return next_session is not None and next_session.month != self._session.month
 
     def candidate_symbols(self) -> tuple[str, ...]:
-        return self._portal.candidate_symbols(self._session, self._session_index)
+        return self._market.candidate_symbols(self._session, self._session_index)
 
     def history(self, symbol: str) -> Sequence[HistoryPoint]:
-        return self._portal.history(symbol)
+        return self._market.history(symbol)
 
     def close(self, symbol: str) -> float | None:
-        bar = self._portal.released_bars.get(symbol)
+        bar = self._market.released_bars.get(symbol)
         return bar.close if bar is not None else None
 
 
-class DataPortal:
+class MarketData:
     """全市场行情只读取一次，并按事件时钟逐日释放。"""
 
     def __init__(
@@ -174,28 +172,9 @@ class DataPortal:
                 stock_dividend = (row.get("stock_bonus_rate") or 0.0) + (
                     row.get("stock_conversion_rate") or 0.0
                 )
-            identity = {
-                "symbol": row["symbol"],
-                "visible_at": row["visible_at"].isoformat(),
-                "end_date": row["end_date"].isoformat() if row["end_date"] else None,
-                "ann_date": row["ann_date"].isoformat() if row["ann_date"] else None,
-                "ex_date": row["ex_date"].isoformat() if row["ex_date"] else None,
-                "implementation_ann_date": (
-                    row["implementation_ann_date"].isoformat()
-                    if row["implementation_ann_date"]
-                    else None
-                ),
-                "ordinal": ordinal,
-            }
-            action_id = (
-                "CA"
-                + hashlib.sha256(json.dumps(identity, sort_keys=True).encode("utf-8")).hexdigest()[
-                    :16
-                ]
-            )
             actions.append(
                 CorporateAction(
-                    action_id=action_id,
+                    action_id=f"CA{ordinal:08d}",
                     symbol=row["symbol"],
                     visible_at=row["visible_at"],
                     record_date=row.get("record_date"),
@@ -211,7 +190,7 @@ class DataPortal:
 
     def prepare_session(self, session: date) -> Mapping[str, DailyBar]:
         if self._bars is None:
-            raise BacktestDataError("DataPortal 尚未 load()")
+            raise BacktestDataError("MarketData 尚未 load()")
         if self._prepared_session == session:
             return self._prepared_bars
         try:
@@ -279,12 +258,12 @@ class DataPortal:
         symbols = tuple(
             row["symbol"]
             for row in rows
-            if row.get("exchange") in self.config.universe.exchanges
+            if row.get("exchange") in {"BSE", "SSE", "SZSE"}
             and self._listing_age(row["listing_date"], session_index)
-            >= self.config.universe.minimum_listing_sessions
+            >= self.config.minimum_listing_sessions
             and row["symbol"] in self.released_bars
         )
-        if not self.config.universe.exclude_st or not symbols:
+        if not self.config.exclude_st or not symbols:
             return tuple(sorted(symbols))
         statuses = self.statuses(session, symbols, fields=("st_type",), at=time(16, 5))
         return tuple(sorted(symbol for symbol in symbols if statuses[symbol].st_type is None))
@@ -299,7 +278,7 @@ class DataPortal:
         table = (
             self.reader.at(event_time(session, at))
             .reference.stocks(
-                currency=self.config.universe.currency,
+                currency="CNY",
                 fields=("exchange", "listing_date"),
             )
             .table

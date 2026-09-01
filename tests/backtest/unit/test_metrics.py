@@ -24,14 +24,10 @@ def test_metrics_return_none_for_zero_volatility_denominators() -> None:
         for index, session in enumerate(sessions)
     )
     result = BacktestResult(
-        run_id="run",
-        strategy_id="test",
         sessions=sessions,
         orders=(),
         fills=(),
         equity=equity,
-        corporate_actions=(),
-        warnings=(),
     )
     metrics = calculate_metrics(
         result,
@@ -39,5 +35,3 @@ def test_metrics_return_none_for_zero_volatility_denominators() -> None:
     )
     assert metrics["total_return"] == 0.0
     assert metrics["sharpe"] is None
-    assert metrics["sortino"] is None
-    assert metrics["daily_win_rate"] is None

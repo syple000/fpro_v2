@@ -67,11 +67,9 @@ class Portfolio:
             ):
                 raise AccountInvariantError("卖出成交超过总持仓或可卖持仓")
             proceeds = fill.notional - fee
-            pnl = (fill.execution_price - position.average_cost) * fill.quantity - fee
             self.cash += proceeds
             position.total_quantity -= fill.quantity
             position.sellable_quantity -= fill.quantity
-            position.realized_pnl += pnl
             if position.total_quantity == 0:
                 position.average_cost = 0.0
                 position.last_price = None
@@ -162,15 +160,12 @@ class Portfolio:
         self.assert_invariants()
         return quantity
 
-    def write_off(self, symbol: str) -> tuple[int, float]:
+    def write_off(self, symbol: str) -> None:
         """终止上市且没有估值依据时，把剩余股份明确核销为零。"""
 
         position = self.positions.get(symbol)
         if position is None or position.total_quantity == 0:
-            return 0, 0.0
-        quantity = position.total_quantity
-        loss = position.market_value
-        position.realized_pnl -= position.average_cost * quantity
+            return
         position.total_quantity = 0
         position.sellable_quantity = 0
         position.pending_listing_quantity = 0
@@ -178,7 +173,6 @@ class Portfolio:
         position.last_price = None
         position.stale_price = False
         self.assert_invariants()
-        return quantity, loss
 
     def snapshot(self, session: date) -> EquitySnapshot:
         equity = self.total_equity

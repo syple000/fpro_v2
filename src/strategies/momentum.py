@@ -4,8 +4,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Mapping, Sequence
-from dataclasses import asdict, dataclass
-from typing import Any
+from dataclasses import dataclass
 
 from backtest.data import HistoryPoint, SessionData
 from backtest.errors import BacktestConfigurationError
@@ -38,18 +37,12 @@ class MomentumConfig:
         if not 0 < self.max_position_weight <= 1:
             raise BacktestConfigurationError("max_position_weight 必须位于 (0, 1]")
 
-    def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
-
 
 class MonthlyMomentumStrategy:
     """每月末收盘排名，下一交易日开盘执行的多头等权策略。"""
 
-    strategy_id = "monthly_medium_term_momentum_v1"
-
     def __init__(self, config: MomentumConfig | None = None) -> None:
         self.config = config or MomentumConfig()
-        self.rebalance_log: list[dict[str, object]] = []
 
     def on_close(
         self,
@@ -78,20 +71,7 @@ class MonthlyMomentumStrategy:
             )
             targets = {symbol: weight for symbol, _ in selected}
         else:
-            weight = 0.0
             targets = {}
-        self.rebalance_log.append(
-            {
-                "session": data.session.isoformat(),
-                "candidate_count": len(candidates),
-                "scored_count": len(scores),
-                "selected_count": len(selected),
-                "weight_per_position": weight,
-                "minimum_selected_score": selected[-1][1] if selected else None,
-                "maximum_selected_score": selected[0][1] if selected else None,
-                "selected_symbols": [symbol for symbol, _ in selected],
-            }
-        )
         return targets
 
     def _momentum_return(

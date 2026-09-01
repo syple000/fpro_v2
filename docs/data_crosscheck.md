@@ -1,6 +1,17 @@
-# Tushare/QMT 数据复核
+# Tushare/QMT 数据交叉检查
 
-`data_validation` 从 Tushare 日线股票池中做可重复随机抽样，直接调用
+`data_crosscheck` 的职责是比较两个独立数据源对同一业务事实的观测，发现缺失、
+数值和口径差异。它是数据质量体系中的“跨源交叉检查”，不是数据清洗器，也不是
+发布门禁。
+
+跨源差异只表示 Tushare 与 QMT 不一致，不表示任一方已被判定为错误。本模块不会
+用 QMT 覆盖 Tushare，不会生成自动补丁，也不直接将数据集标记为可用或不可用。差异
+需要结合字段定义、交易所或其他证据人工定性；确认为源数据问题后，再进入
+`data_cleaning` 的 `MANUAL` Issue 和 `PATCH` / `REFETCH` / `ACCEPT` 流程。
+
+## 当前实现
+
+当前实现从 Tushare 日线股票池中做可重复随机抽样，直接调用
 `qmt_receiver.sync_all(..., force=True)` 强制下载并落地样本股票，然后完成四类比较：
 
 - QMT 不复权日线与 Tushare `daily`；
@@ -37,8 +48,8 @@ QMT 的单日汇总事件比较。`allotNum/allotPrice/gugai/dr` 暂无可直接
 miniQMT 登录并启动 qmt-agent 后运行：
 
 ```bash
-uv sync --group data-validation
-uv run --group data-validation data-validation \
+uv sync --group data-crosscheck
+uv run --group data-crosscheck data-crosscheck \
   --tushare-dir dataset/tushare \
   --qmt-dir dataset/qmt \
   --start-date 2024-01-01 \
@@ -48,8 +59,17 @@ uv run --group data-validation data-validation \
 ```
 
 命令输出 JSON 报告。`checks[].compared` 是实际比较的字段数，`differences` 给出代码、日期、
-字段和两边的值；全部通过时退出码为 0，存在差异时为 1。相同 `seed` 和股票池会得到相同
-样本。
+字段和两边的值；未发现差异时退出码为 0，存在差异时为 1。`passed=true`
+只表示本次抽样的已比较字段没有差异，不表示已完成全市场数据质量认证。相同 `seed`
+和股票池会得到相同样本；QMT 数据源本身更新后，比较结果仍可能变化。
+
+## 边界和限制
+
+- 这是抽样验证，不代替 Schema、主键、分区、日期、有限数和全量完整性检查；
+- 抽样母集来自 Tushare `daily`，因此无法单独证明 Tushare 股票池本身完整；
+- 当前命令会强制拉取并写入 QMT 样本数据，不是纯只读操作；
+- 两个供应商的相同值也不构成业务真值证明，关键差异仍需要第三方证据或人工核对；
+- 交叉检查报告是人工复核证据，不直接作为 Reader 运行时输入。
 
 QMT 接口和字段以[迅投 XtData 官方文档](https://dict.thinktrader.net/nativeApi/xtdata.html)
 为准。不同券商版本新增的字段不会丢失，但只有已建立明确同义关系的字段进入自动数值比较。

@@ -5,8 +5,8 @@ from pathlib import Path
 
 import pyarrow as pa
 
-from backtest.config import BacktestConfig, ExecutionConfig, FeeConfig
-from backtest.data import DataPortal, SessionData
+from backtest.config import BacktestConfig
+from backtest.data import MarketData, SessionData
 from backtest.engine import BacktestEngine
 from backtest.strategy import PortfolioView
 from market_data import DataCatalog, DataReader, SourceConfig
@@ -18,17 +18,19 @@ def _table(dataset: str, *rows: dict[str, object]) -> pa.Table:
 
 
 class OneShotStrategy:
-    strategy_id = "one_shot"
-
     def __init__(self) -> None:
         self.ordered = False
+        self.visible_history: list[tuple[int, ...]] = []
 
     def on_close(
         self,
         data: SessionData,
         portfolio: PortfolioView,
     ) -> dict[str, float] | None:
-        del data, portfolio
+        del portfolio
+        self.visible_history.append(
+            tuple(point.session_index for point in data.history("000001.SZ"))
+        )
         if not self.ordered:
             self.ordered = True
             return {"000001.SZ": 0.5}
@@ -113,19 +115,21 @@ def test_close_signal_only_fills_at_next_open(tmp_path: Path) -> None:
         start_date=sessions[0],
         end_date=sessions[-1],
         initial_cash=100_000.0,
-        fee=FeeConfig(commission_rate=0, minimum_commission=0),
-        execution=ExecutionConfig(slippage_bps=0, max_previous_volume_participation=None),
+        commission_rate=0,
+        minimum_commission=0,
+        slippage_bps=0,
+        max_volume_fraction=None,
     )
     with DataCatalog(tushare_root=tushare_root, qmt_root=tmp_path / "qmt") as catalog:
-        portal = DataPortal(
+        data = MarketData(
             DataReader(catalog, sources=SourceConfig(routes)),
             config,
         )
+        strategy = OneShotStrategy()
         result = BacktestEngine(
-            run_id="run",
             config=config,
-            portal=portal,
-            strategy=OneShotStrategy(),
+            data=data,
+            strategy=strategy,
         ).run()
 
     assert len(result.fills) == 1
@@ -133,3 +137,4 @@ def test_close_signal_only_fills_at_next_open(tmp_path: Path) -> None:
     assert result.fills[0].filled_at.date() == sessions[1]
     assert result.fills[0].market_price == 11.0
     assert result.equity[0].total_equity == 100_000.0
+    assert strategy.visible_history == [(0,), (0, 1), (0, 1, 2)]

@@ -118,7 +118,6 @@ class Position:
     pending_listing_quantity: int = 0
     average_cost: float = 0.0
     last_price: float | None = None
-    realized_pnl: float = 0.0
     stale_price: bool = False
 
     @property
@@ -126,12 +125,6 @@ class Position:
         if self.last_price is None:
             return 0.0
         return self.total_quantity * self.last_price
-
-    @property
-    def unrealized_pnl(self) -> float:
-        if self.last_price is None:
-            return 0.0
-        return (self.last_price - self.average_cost) * self.total_quantity
 
 
 @dataclass(frozen=True, slots=True)
@@ -158,14 +151,3 @@ class CorporateAction:
     cash_dividend: float | None
     cash_dividend_before_tax: float | None
     stock_dividend: float
-
-
-@dataclass(frozen=True, slots=True)
-class CorporateActionEvent:
-    event_time: datetime
-    action_id: str
-    symbol: str
-    event_type: str
-    quantity: int
-    amount: float
-    note: str
