@@ -2,8 +2,55 @@
 
 本文定义 fpro_v2 第一版回测系统的目标、边界、架构、业务规则、风险点和实施顺序。
 
-第一版聚焦中国 A 股日频交易，使用现有 `data` 模块提供的 PIT 数据接口，构建一个事件驱动、
+第一版聚焦中国 A 股日频交易，使用现有 `market_data` 模块提供的 PIT 数据接口，构建一个事件驱动、
 账户级记账、结果可复现的回测内核。分钟和 Tick 回放在日频系统稳定后扩展，不进入第一版内核。
+
+## 当前实现与运行
+
+代码已按本文边界落在 `src/backtest/`，示例策略位于 `src/strategies/`：
+
+```text
+src/backtest/
+├── config.py              # 运行、费用、股票池、公司行动配置
+├── types.py               # 订单、成交、持仓、净值固定模型
+├── data.py                # DataPortal、滚动历史和 PIT 策略视图
+├── strategy.py            # Strategy 协议和只读 StrategyContext
+├── broker.py              # 订单状态机、开盘撮合、费用、滑点和容量
+├── portfolio.py           # 现金、持仓、T+1、应收款和账户不变量
+├── corporate_actions.py   # 分红、送转、红股上市和退市核销
+├── engine.py              # 09:25/09:30/16:05/17:05 事件循环
+├── metrics.py             # 收益、风险、换手和交易统计
+├── report.py              # 无外部资源的单文件 HTML 报告
+├── artifacts.py           # 数据/代码指纹与 JSON/Parquet 产物
+└── runner.py              # 正式运行入口
+
+src/strategies/
+└── momentum.py            # 月度中期横截面动量
+```
+
+运行默认样例：
+
+```bash
+uv run --group backtest backtest-momentum \
+  --start 2017-01-01 \
+  --end 2026-08-22 \
+  --tushare-dir dataset/tushare \
+  --qmt-dir dataset/qmt \
+  --output-dir runs
+```
+
+默认策略使用过去第 120 至第 20 个交易日之间的 PIT 总收益，月末排名，选择前 10% 中最强的
+30 只股票，目标总仓位 98%、单只不超过 5%，信号生成后的下一交易日开盘成交。总收益指数使用
+当时已经释放的 `close / pre_close` 逐日链接；它与 Tushare PIT 前复权区间收益等价，同时账户
+仍用未复权价格成交、估值并显式入账分红送转。
+
+每次正式运行生成本文第 19 节所列产物，并额外保存 `order_events.parquet`，从而保留每次订单
+状态变化。当前快照记录所有实际使用文件的 SHA-256，但没有复制或硬链接 7.86 亿字节源文件，
+因此 `retention=content_hash_only`：可以检测数据变化，不能在源文件被删除后独立恢复。
+
+当前没有指数行情能力，报告会把基准与超额收益明确写为 `null`，不会用股票日线拼出一个伪指数。
+配股、换股和吸收合并也没有对应源数据；系统可以严格处理已识别的现金分红、送转和退市，但不能
+发现数据源没有表达的事件。这两项属于后续数据能力，不在报告中伪装成已覆盖。
 
 ## 1. 目标与非目标
 
@@ -44,7 +91,7 @@
 
 ## 3. 现有数据基础
 
-现有 [`data`](data.md) 模块已经提供：
+现有 [`market_data`](market_data.md) 模块已经提供：
 
 - `DataCatalog`：根据 Manifest 注册当前有效的 Tushare/QMT Parquet；
 - `DataReader.at(as_of)`：创建严格绑定时点的 PIT 数据视图；

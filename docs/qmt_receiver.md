@@ -9,7 +9,7 @@ from qmt_receiver import QmtAgentClient, QmtDataStore, QmtReceiver
 
 with (
     QmtAgentClient("http://127.0.0.1:8765") as client,
-    QmtDataStore("data/qmt") as store,
+    QmtDataStore("dataset/qmt") as store,
 ):
     receiver = QmtReceiver(client, store, timeout_ms=30_000)
 
@@ -95,7 +95,7 @@ from qmt_receiver import QmtAgentClient, QmtDataStore, sync_all
 
 with (
     QmtAgentClient() as client,
-    QmtDataStore("data/qmt") as store,
+    QmtDataStore("dataset/qmt") as store,
 ):
     result = sync_all(
         client,

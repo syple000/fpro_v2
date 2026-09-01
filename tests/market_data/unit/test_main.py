@@ -6,7 +6,7 @@ from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from data.test_main import run
+from market_data.test_main import run
 
 QUERY_NAMES = {
     "market.bars.daily",

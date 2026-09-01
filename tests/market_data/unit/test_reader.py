@@ -9,7 +9,7 @@ from zoneinfo import ZoneInfo
 import pyarrow as pa
 import pytest
 
-from data import (
+from market_data import (
     ALL_SYMBOLS,
     DataAdapter,
     DataCapability,
@@ -22,8 +22,8 @@ from data import (
     DataView,
     SourceConfig,
 )
-from data.adapters import QmtAdapter, TushareAdapter
-from data.reader import (
+from market_data.adapters import QmtAdapter, TushareAdapter
+from market_data.reader import (
     _CAPABILITY_METHODS,
     CalendarReader,
     ClassificationReader,

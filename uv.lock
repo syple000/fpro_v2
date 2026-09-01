@@ -298,14 +298,10 @@ version = "0.1.0"
 source = { editable = "." }
 
 [package.dev-dependencies]
-data = [
+backtest = [
     { name = "duckdb" },
-    { name = "httpx2" },
     { name = "pandas" },
     { name = "pyarrow" },
-    { name = "pydantic" },
-    { name = "requests" },
-    { name = "tzdata" },
 ]
 data-validation = [
     { name = "duckdb" },
@@ -321,6 +317,15 @@ dev = [
     { name = "pyright" },
     { name = "pytest" },
     { name = "ruff" },
+]
+market-data = [
+    { name = "duckdb" },
+    { name = "httpx2" },
+    { name = "pandas" },
+    { name = "pyarrow" },
+    { name = "pydantic" },
+    { name = "requests" },
+    { name = "tzdata" },
 ]
 parquet-store = [
     { name = "pyarrow" },
@@ -349,14 +354,10 @@ tushare-data = [
 [package.metadata]
 
 [package.metadata.requires-dev]
-data = [
+backtest = [
     { name = "duckdb", specifier = ">=1.4,<2.0" },
-    { name = "httpx2", specifier = ">=2.0,<3.0" },
     { name = "pandas", specifier = ">=2.2,<3.0" },
     { name = "pyarrow", specifier = ">=18.0,<24.0" },
-    { name = "pydantic", specifier = ">=2.10,<3.0" },
-    { name = "requests", specifier = ">=2.32,<3.0" },
-    { name = "tzdata", specifier = ">=2025.2" },
 ]
 data-validation = [
     { name = "duckdb", specifier = ">=1.4,<2.0" },
@@ -372,6 +373,15 @@ dev = [
     { name = "pyright", specifier = ">=1.1,<2.0" },
     { name = "pytest", specifier = ">=8.3,<9.0" },
     { name = "ruff", specifier = ">=0.9,<1.0" },
+]
+market-data = [
+    { name = "duckdb", specifier = ">=1.4,<2.0" },
+    { name = "httpx2", specifier = ">=2.0,<3.0" },
+    { name = "pandas", specifier = ">=2.2,<3.0" },
+    { name = "pyarrow", specifier = ">=18.0,<24.0" },
+    { name = "pydantic", specifier = ">=2.10,<3.0" },
+    { name = "requests", specifier = ">=2.32,<3.0" },
+    { name = "tzdata", specifier = ">=2025.2" },
 ]
 parquet-store = [{ name = "pyarrow", specifier = ">=18.0,<24.0" }]
 qmt-agent = [

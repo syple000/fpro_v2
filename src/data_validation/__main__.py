@@ -13,8 +13,8 @@ from qmt_receiver import QmtAgentClient
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="随机抽样复核 Tushare 与 QMT 数据")
-    parser.add_argument("--tushare-dir", default="data/tushare")
-    parser.add_argument("--qmt-dir", default="data/qmt")
+    parser.add_argument("--tushare-dir", default="dataset/tushare")
+    parser.add_argument("--qmt-dir", default="dataset/qmt")
     parser.add_argument("--qmt-url", default="http://127.0.0.1:8765")
     parser.add_argument("--start-date", required=True, type=date.fromisoformat)
     parser.add_argument("--end-date", required=True, type=date.fromisoformat)

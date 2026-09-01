@@ -4,7 +4,7 @@ from collections.abc import Sequence
 from datetime import date
 from pathlib import Path
 
-from data import DataCatalog
+from market_data import DataCatalog
 from qmt_protocol import (
     BalanceRecord,
     DividendFactor,

@@ -5,7 +5,6 @@ from pathlib import Path
 
 import pyarrow as pa
 
-from data import DataCatalog
 from data_validation import (
     compare_daily,
     compare_dividends,
@@ -13,6 +12,7 @@ from data_validation import (
     compare_qmt_front_ratio,
     sample_stocks,
 )
+from market_data import DataCatalog
 from qmt_protocol import (
     BalanceRecord,
     CashFlowRecord,

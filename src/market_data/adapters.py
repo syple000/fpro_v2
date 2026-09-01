@@ -11,8 +11,8 @@ import duckdb
 import pyarrow as pa
 import pyarrow.compute as pc
 
-from data.catalog import DataCatalog
-from data.errors import (
+from market_data.catalog import DataCatalog
+from market_data.errors import (
     DataCapabilityNotSupportedError,
     DataSourceUnavailableError,
 )

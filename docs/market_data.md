@@ -1,6 +1,6 @@
-# `data`：研究、回测与实盘的数据读取接口
+# `market_data`：研究、回测与实盘的数据读取接口
 
-`data` 只解决两个问题：
+`market_data` 只解决两个问题：
 
 1. 给定一个时间，当时能看到哪些数据；
 2. 研究、回测和实盘如何通过同一个接口读取 Tushare/QMT 数据。
@@ -376,14 +376,14 @@ Reader 创建时校验所有已配置的 `source_id` 是否注册并支持对应
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from data import DataCatalog, DataReader, SourceConfig
+from market_data import DataCatalog, DataReader, SourceConfig
 
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 
 with DataCatalog(
-    tushare_root="data/tushare",
-    qmt_root="data/qmt",
+    tushare_root="dataset/tushare",
+    qmt_root="dataset/qmt",
 ) as catalog:
     reader = DataReader(
         catalog,
@@ -860,16 +860,16 @@ fundamentals.statements(kind="cash_flow")
 
 ## 全接口冒烟测试
 
-`data-test` 会以一个 symbol 调用 Reader 的全部公共查询方法。`bars()` 分别使用 Tushare 日线和
+`market-data-test` 会以一个 symbol 调用 Reader 的全部公共查询方法。`bars()` 分别使用 Tushare 日线和
 QMT 1 分钟线，`current()` 使用 QMT 实时事件（QMT 无数据时落空 CSV）；`statements()` 和
 `disclosures()` 会覆盖所有 kind，其他方法各调用一次。每个查询结果写成独立 CSV，上一交易日也
 单独落盘，并生成记录参数、字段、来源和行数的 `manifest.json`：
 
 ```bash
-uv run data-test \
-  --tushare-dir data/tushare \
-  --qmt-dir data/qmt \
-  --output-dir data/test/data_reader \
+uv run market-data-test \
+  --tushare-dir dataset/tushare \
+  --qmt-dir dataset/qmt \
+  --output-dir dataset/test/data_reader \
   --symbol 000001.SZ \
   --periods 10 \
   --lookback-days 365 \
@@ -877,7 +877,7 @@ uv run data-test \
 ```
 
 `--as-of` 默认为当前上海时间；需要复现历史结果时应显式传入带时区时间。默认输出目录是
-`data/test/data_reader`，重复运行会覆盖同名测试结果文件。单个查询失败不会阻止后续方法继续
+`dataset/test/data_reader`，重复运行会覆盖同名测试结果文件。单个查询失败不会阻止后续方法继续
 执行；失败项写入 manifest 的 `errors`，删除对应的旧 CSV，并使命令最终返回非零状态。
 
 ## 验收条件

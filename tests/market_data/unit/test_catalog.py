@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pyarrow as pa
 
-from data import DataCatalog
+from market_data import DataCatalog
 from tushare_data import TABLE_SCHEMAS, TushareDataStore
 
 

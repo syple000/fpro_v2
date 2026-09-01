@@ -13,10 +13,10 @@ from zoneinfo import ZoneInfo
 import pyarrow as pa
 import pyarrow.csv as pa_csv
 
-from data import DataCatalog, DataReader, QueryResult, SourceConfig
+from market_data import DataCatalog, DataReader, QueryResult, SourceConfig
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
-DEFAULT_OUTPUT_DIR = Path("data/test/data_reader")
+DEFAULT_OUTPUT_DIR = Path("dataset/test/data_reader")
 
 
 @dataclass(frozen=True, slots=True)
@@ -307,8 +307,8 @@ def _positive_int(value: object, name: str) -> int:
 def main() -> None:
     now = datetime.now(SHANGHAI)
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--tushare-dir", type=Path, default=Path("data/tushare"))
-    parser.add_argument("--qmt-dir", type=Path, default=Path("data/qmt"))
+    parser.add_argument("--tushare-dir", type=Path, default=Path("dataset/tushare"))
+    parser.add_argument("--qmt-dir", type=Path, default=Path("dataset/qmt"))
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument(
         "--as-of",

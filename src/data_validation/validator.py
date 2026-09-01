@@ -13,7 +13,7 @@ from typing import Any
 
 import duckdb
 
-from data import DataCatalog
+from market_data import DataCatalog
 from qmt_protocol import DividendFactor, HistoryBar, HistoryQuote
 from qmt_receiver import QmtAgentClient, QmtDataStore
 from qmt_receiver.sync import SyncResult, sync_all

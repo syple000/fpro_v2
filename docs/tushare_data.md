@@ -2,7 +2,7 @@
 
 `tushare_data` 通过 quicksync/Tushare 按全市场粒度拉取证券主数据、行情、财务和公司行动，再写入
 `parquet_store`。存储层只保留 Tushare 接口字段；PIT 可见性由独立的
-[`data`](data.md) DuckDB 读取层处理。
+[`market_data`](market_data.md) DuckDB 读取层处理。
 
 本模块不落盘 `partition_date`、`visible_at`、`observed_at` 或行级采集时间。
 归一化只负责固定字段校验、空值清理和 Arrow 类型转换。
@@ -98,7 +98,7 @@ uv run --group tushare-data tushare-data-test \
   --mode sync_all \
   --start-date 20170101 \
   --end-date 20260822 \
-  --data-dir data/tushare
+  --data-dir dataset/tushare
 ```
 
 需要无视已有完成区间、完整重抓本次区间时增加 `--force`。`sync_inc` 的计划窗口本来就会
@@ -110,7 +110,7 @@ uv run --group tushare-data tushare-data-test \
 uv run --group tushare-data tushare-data-test \
   --mode sync_inc \
   --current-date 20260822 \
-  --data-dir data/tushare
+  --data-dir dataset/tushare
 ```
 
 `create_pro_client` 为 Tushare SDK 安装按工作线程复用连接的直连 HTTP 传输；它不读取

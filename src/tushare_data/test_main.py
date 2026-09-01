@@ -63,7 +63,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--token", default=os.environ.get("TUSHARE_TOKEN"))
     parser.add_argument("--api-url", default=DEFAULT_API_URL)
-    parser.add_argument("--data-dir", type=Path, default=Path("data/tushare"))
+    parser.add_argument("--data-dir", type=Path, default=Path("dataset/tushare"))
     parser.add_argument(
         "--mode",
         choices=("sync_all", "sync_inc"),

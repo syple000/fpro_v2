@@ -68,7 +68,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("mode", choices=("realtime", "sync"))
     parser.add_argument("--url", default="http://127.0.0.1:8765")
-    parser.add_argument("--data-dir", type=Path, default=Path("data/qmt"))
+    parser.add_argument("--data-dir", type=Path, default=Path("dataset/qmt"))
     parser.add_argument("--markets", nargs="+", default=["SH", "SZ"])
     parser.add_argument("--stocks", nargs="+", default=["000001.SZ"])
     parser.add_argument("--start-time")

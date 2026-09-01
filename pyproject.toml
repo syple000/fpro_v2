@@ -7,7 +7,7 @@ requires-python = ">=3.11"
 dependencies = []
 
 [dependency-groups]
-data = [
+market-data = [
     "duckdb>=1.4,<2.0",
     "httpx2>=2.0,<3.0",
     "pandas>=2.2,<3.0",
@@ -20,6 +20,11 @@ data-validation = [
     "duckdb>=1.4,<2.0",
     "httpx2>=2.0,<3.0",
     "pydantic>=2.10,<3.0",
+    "pyarrow>=18.0,<24.0",
+]
+backtest = [
+    "duckdb>=1.4,<2.0",
+    "pandas>=2.2,<3.0",
     "pyarrow>=18.0,<24.0",
 ]
 parquet-store = [
@@ -59,7 +64,8 @@ dev = [
 qmt-agent = { requires-python = ">=3.11,<3.12" }
 
 [project.scripts]
-data-test = "data.test_main:main"
+backtest-momentum = "backtest.__main__:main"
+market-data-test = "market_data.test_main:main"
 data-validation = "data_validation.__main__:main"
 qmt-agent = "qmt_agent.__main__:main"
 qmt-agent-start = "qmt_agent.windows_launcher:main"
@@ -73,8 +79,10 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = [
     "src/models",
+    "src/backtest",
+    "src/strategies",
     "src/fpro_common",
-    "src/data",
+    "src/market_data",
     "src/data_validation",
     "src/parquet_store",
     "src/qmt_agent",

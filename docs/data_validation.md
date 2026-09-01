@@ -39,8 +39,8 @@ miniQMT 登录并启动 qmt-agent 后运行：
 ```bash
 uv sync --group data-validation
 uv run --group data-validation data-validation \
-  --tushare-dir data/tushare \
-  --qmt-dir data/qmt \
+  --tushare-dir dataset/tushare \
+  --qmt-dir dataset/qmt \
   --start-date 2024-01-01 \
   --end-date 2024-12-31 \
   --sample-size 20 \

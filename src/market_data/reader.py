@@ -11,17 +11,17 @@ from zoneinfo import ZoneInfo
 import pyarrow as pa
 import pyarrow.compute as pc
 
-from data.adapters import QmtAdapter, TushareAdapter
-from data.catalog import DataCatalog
-from data.config import SourceConfig
-from data.errors import (
+from market_data.adapters import QmtAdapter, TushareAdapter
+from market_data.catalog import DataCatalog
+from market_data.config import SourceConfig
+from market_data.errors import (
     DataAdapterError,
     DataCapabilityNotSupportedError,
     DataResultTooLargeError,
     DataSourceNotConfiguredError,
     DataSourceUnavailableError,
 )
-from data.protocols import DataAdapter
+from market_data.protocols import DataAdapter
 from models import CAPABILITY_SCHEMAS, STATUS_SCHEMA, DataCapability, QueryResult
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")

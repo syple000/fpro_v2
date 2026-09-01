@@ -32,7 +32,7 @@ rows = [
     {"day": date(2026, 8, 16), "id": 1, "value": 3.5},
 ]
 
-with ParquetStore(Path("data")) as store:
+with ParquetStore(Path("dataset")) as store:
     store.register(
         TableConfig(
             name="events",
