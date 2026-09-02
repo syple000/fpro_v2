@@ -15,7 +15,8 @@ from uuid import uuid4
 
 FixMode = Literal["AUTO_FIX", "MANUAL"]
 DecisionAction = Literal["PATCH", "REFETCH", "ACCEPT"]
-CheckStatus = Literal["PASS", "FAIL"]
+IssueSeverity = Literal["ERROR", "WARNING"]
+CheckStatus = Literal["PASS", "WARN", "FAIL"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -25,6 +26,7 @@ class Issue:
     partition: str | None
     key: Mapping[str, object]
     rule_id: str
+    severity: IssueSeverity
     fix_mode: FixMode
     observed: Mapping[str, object]
     suggested: Mapping[str, object] | None
@@ -38,6 +40,7 @@ class Issue:
         partition: str | None,
         key: Mapping[str, object],
         rule_id: str,
+        severity: IssueSeverity = "ERROR",
         fix_mode: FixMode,
         observed: Mapping[str, object],
         suggested: Mapping[str, object] | None,
@@ -56,6 +59,7 @@ class Issue:
             partition=partition,
             key=dict(_json_value(key)),
             rule_id=rule_id,
+            severity=severity,
             fix_mode=fix_mode,
             observed=dict(_json_value(observed)),
             suggested=None if suggested is None else dict(_json_value(suggested)),
@@ -95,7 +99,9 @@ class DetectionReport:
 
     @property
     def passed(self) -> bool:
-        return not any(issue.fix_mode == "MANUAL" for issue in self.issues)
+        return not any(
+            issue.severity == "ERROR" and issue.fix_mode == "MANUAL" for issue in self.issues
+        )
 
 
 def write_report(report: DetectionReport, path: str | Path) -> None:
@@ -104,7 +110,7 @@ def write_report(report: DetectionReport, path: str | Path) -> None:
         _json_text(
             {
                 "kind": "report",
-                "version": 2,
+                "version": 3,
                 "input_fingerprint": report.input_fingerprint,
                 "through": report.through,
                 "start": report.start,
@@ -121,7 +127,11 @@ def write_report(report: DetectionReport, path: str | Path) -> None:
 def read_report(path: str | Path) -> DetectionReport:
     source = Path(path)
     records = [json.loads(line) for line in source.read_text(encoding="utf-8").splitlines() if line]
-    if not records or records[0].get("kind") != "report" or records[0].get("version") not in {1, 2}:
+    if (
+        not records
+        or records[0].get("kind") != "report"
+        or records[0].get("version") not in {1, 2, 3}
+    ):
         raise ValueError(f"问题报告格式无效: {source}")
     header = records[0]
     checks = tuple(_check_from_json(item) for item in records[1:] if item.get("kind") == "check")
@@ -179,6 +189,7 @@ def _issue_from_json(payload: Mapping[str, Any]) -> Issue:
         partition=payload.get("partition"),
         key=dict(payload["key"]),
         rule_id=str(payload["rule_id"]),
+        severity=payload.get("severity", "ERROR"),
         fix_mode=payload["fix_mode"],
         observed=dict(payload["observed"]),
         suggested=None if payload.get("suggested") is None else dict(payload["suggested"]),
@@ -189,7 +200,7 @@ def _issue_from_json(payload: Mapping[str, Any]) -> Issue:
 def _check_from_json(payload: Mapping[str, Any]) -> CheckResult:
     try:
         status = payload["status"]
-        if status not in {"PASS", "FAIL"}:
+        if status not in {"PASS", "WARN", "FAIL"}:
             raise ValueError("status 无效")
         return CheckResult(
             dataset=str(payload["dataset"]),

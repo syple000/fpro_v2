@@ -157,15 +157,15 @@ def test_detect_groups_partition_wide_stk_limit_gap(tmp_path: Path) -> None:
                 {
                     "ts_code": "000001.SZ",
                     "trade_date": date(2024, 7, 23),
-                    "pre_close": None,
-                    "up_limit": 11.0,
+                    "pre_close": 10.0,
+                    "up_limit": None,
                     "down_limit": 9.0,
                 },
                 {
                     "ts_code": "000002.SZ",
                     "trade_date": date(2024, 7, 23),
-                    "pre_close": None,
-                    "up_limit": 22.0,
+                    "pre_close": 20.0,
+                    "up_limit": None,
                     "down_limit": 18.0,
                 },
             ),
@@ -337,7 +337,7 @@ def test_publish_applies_patch_only_when_expected_value_matches(tmp_path: Path) 
                 "issue_id": issue.issue_id,
                 "action": "PATCH",
                 "expected": {"close": 12.0},
-                "values": {"close": 10.5},
+                "values": {"close": 10.5, "change": 0.5, "pct_chg": 5.0},
                 "reason": "交易所历史行情核对",
             },
             ensure_ascii=False,
@@ -359,3 +359,175 @@ def test_publish_applies_patch_only_when_expected_value_matches(tmp_path: Path) 
     assert state["datasets"]["daily"]["manual_patches"] == 1
     with DataCatalog(tushare_root=output / "current", qmt_root=tmp_path / "qmt") as catalog:
         assert catalog.connection.execute("SELECT close FROM tushare.daily").fetchone() == (10.5,)
+
+
+def test_adj_factor_decrease_is_warning_not_publish_error(tmp_path: Path) -> None:
+    first = _daily(close=10.0)
+    second = {
+        **_daily(close=21.0, high=21.5),
+        "trade_date": date(2024, 1, 3),
+        "open": 20.0,
+        "low": 19.5,
+        "pre_close": 20.0,
+        "change": 1.0,
+        "pct_chg": 5.0,
+    }
+    with TushareDataStore(tmp_path) as store:
+        store.write("daily", _table("daily", first, second))
+        store.write(
+            "adj_factor",
+            _table(
+                "adj_factor",
+                {
+                    "ts_code": "000001.SZ",
+                    "trade_date": date(2024, 1, 2),
+                    "adj_factor": 2.0,
+                },
+                {
+                    "ts_code": "000001.SZ",
+                    "trade_date": date(2024, 1, 3),
+                    "adj_factor": 1.0,
+                },
+            ),
+        )
+
+    report = detect(
+        tmp_path,
+        through=date(2024, 1, 3),
+        datasets=("daily", "adj_factor"),
+    )
+
+    issue = next(issue for issue in report.issues if issue.rule_id == "adj_factor_decrease_v1")
+    check = next(check for check in report.checks if check.check_id == issue.rule_id)
+    assert issue.severity == "WARNING"
+    assert check.status == "WARN"
+    assert report.passed
+    assert repair_instructions(report)[0].action == "MANUAL"
+    release = publish(
+        tmp_path,
+        tmp_path / "published",
+        report=report,
+        release_id="warning-release",
+    )
+    states = json.loads((release / "release.json").read_text(encoding="utf-8"))["datasets"]
+    assert states["daily"]["status"] == "AVAILABLE"
+    assert states["adj_factor"]["status"] == "AVAILABLE"
+
+
+def test_missing_adj_factor_is_refetchable_error(tmp_path: Path) -> None:
+    with TushareDataStore(tmp_path) as store:
+        store.write("daily", _table("daily", _daily()))
+        store.write(
+            "adj_factor",
+            _table(
+                "adj_factor",
+                {
+                    "ts_code": "000002.SZ",
+                    "trade_date": date(2024, 1, 2),
+                    "adj_factor": 1.0,
+                },
+            ),
+        )
+
+    report = detect(
+        tmp_path,
+        through=date(2024, 1, 2),
+        datasets=("daily", "adj_factor"),
+    )
+
+    issue = next(
+        issue for issue in report.issues if issue.rule_id == "adj_factor_daily_coverage_v1"
+    )
+    instruction = next(
+        item for item in repair_instructions(report) if item.rule_id == issue.rule_id
+    )
+    assert issue.severity == "ERROR"
+    assert instruction.action == "REFETCH"
+    assert instruction.dataset == "adj_factor"
+    assert not report.passed
+
+
+def test_daily_basic_cross_check_reports_warning(tmp_path: Path) -> None:
+    basic = {
+        "ts_code": "000001.SZ",
+        "trade_date": date(2024, 1, 2),
+        "close": 10.6,
+        "total_share": 100.0,
+        "float_share": 80.0,
+        "free_share": 60.0,
+        "total_mv": 1060.0,
+        "circ_mv": 848.0,
+    }
+    with TushareDataStore(tmp_path) as store:
+        store.write("daily", _table("daily", _daily()))
+        store.write("daily_basic", _table("daily_basic", basic))
+
+    report = detect(
+        tmp_path,
+        through=date(2024, 1, 2),
+        datasets=("daily", "daily_basic"),
+    )
+
+    issue = next(issue for issue in report.issues if issue.rule_id == "daily_basic_daily_match_v1")
+    assert issue.severity == "WARNING"
+    assert issue.observed["count"] == 1
+    assert report.passed
+
+
+def test_income_core_equation_is_a_warning(tmp_path: Path) -> None:
+    row = {
+        "ts_code": "000001.SZ",
+        "ann_date": date(2024, 4, 20),
+        "f_ann_date": date(2024, 4, 20),
+        "end_date": date(2024, 3, 31),
+        "report_type": "1",
+        "comp_type": "1",
+        "end_type": "1",
+        "operate_profit": 100.0,
+        "non_oper_income": 10.0,
+        "non_oper_exp": 5.0,
+        "total_profit": 120.0,
+        "update_flag": "1",
+    }
+    with TushareDataStore(tmp_path) as store:
+        store.write("income", _table("income", row))
+
+    report = detect(tmp_path, through=date(2024, 12, 31), datasets=("income",))
+
+    issue = next(issue for issue in report.issues if issue.rule_id == "income_equation_v1")
+    assert issue.severity == "WARNING"
+    assert report.passed
+
+
+def test_trade_calendar_detects_a_whole_missing_date(tmp_path: Path) -> None:
+    with TushareDataStore(tmp_path) as store:
+        for current, previous in (
+            (date(2024, 1, 1), None),
+            (date(2024, 1, 3), date(2024, 1, 1)),
+        ):
+            store.write(
+                "trade_cal",
+                _table(
+                    "trade_cal",
+                    *(
+                        {
+                            "exchange": exchange,
+                            "cal_date": current,
+                            "is_open": 1,
+                            "pretrade_date": previous,
+                        }
+                        for exchange in ("SSE", "SZSE")
+                    ),
+                ),
+            )
+
+    report = detect(
+        tmp_path,
+        start=date(2024, 1, 1),
+        through=date(2024, 1, 3),
+        datasets=("trade_cal",),
+    )
+
+    issue = next(issue for issue in report.issues if issue.rule_id == "calendar_date_coverage_v1")
+    assert issue.key == {"cal_date": "2024-01-02"}
+    assert issue.severity == "ERROR"

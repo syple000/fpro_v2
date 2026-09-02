@@ -207,6 +207,18 @@ def repair_trade_calendar_coverage(issue: Issue) -> RepairInstruction:
     return _refetch_or_manual(issue, "重拉 trade_cal 对应日期")
 
 
+def repair_business_value(issue: Issue) -> RepairInstruction:
+    """业务值或跨表关系异常时，优先按检测结果定位日期重拉。"""
+    if issue.severity == "WARNING":
+        return _manual(issue, f"{_BUSINESS_REPAIR_MESSAGES[issue.rule_id]}；告警不自动改值")
+    return _refetch_or_manual(issue, _BUSINESS_REPAIR_MESSAGES[issue.rule_id])
+
+
+def repair_review_warning(issue: Issue) -> RepairInstruction:
+    """没有唯一正确值和安全重拉区间的告警交给人工复核。"""
+    return _manual(issue, _BUSINESS_REPAIR_MESSAGES[issue.rule_id])
+
+
 def repair_unknown_issue(issue: Issue) -> RepairInstruction:
     """未登记规则不自动处理。"""
     return _manual(issue, f"规则 {issue.rule_id} 没有登记自动修复方式")
@@ -279,3 +291,54 @@ _REPAIRERS: dict[str, IssueRepairer] = {
     "trade_calendar_value_v1": repair_trade_calendar_value,
     "calendar_exchange_coverage_v1": repair_trade_calendar_coverage,
 }
+
+_BUSINESS_REPAIR_MESSAGES = {
+    "closed_market_partition_v1": "重拉该日期；若上游仍返回数据，人工核对交易日历",
+    "stock_basic_identity_v1": "重拉 stock_basic 对应上市日期",
+    "stock_basic_lifecycle_v1": "重拉 stock_basic 对应上市日期",
+    "daily_arithmetic_v1": "重拉 daily 对应交易日",
+    "daily_volume_amount_v1": "重拉 daily 对应交易日",
+    "daily_basic_range_v1": "重拉 daily_basic 对应交易日",
+    "daily_basic_share_order_v1": "重拉 daily_basic 对应交易日后复核股本口径",
+    "daily_basic_market_value_v1": "重拉 daily_basic 对应交易日后复核单位与舍入",
+    "daily_basic_daily_match_v1": "重拉 daily_basic 对应交易日后与 daily 复核",
+    "adj_factor_daily_coverage_v1": "重拉 adj_factor 对应交易日",
+    "adj_factor_continuity_v1": "重拉 adj_factor 对应交易日后复核公司行动",
+    "suspend_value_v1": "重拉 suspend_d 对应交易日",
+    "suspend_daily_conflict_v1": "重拉 suspend_d 对应交易日后与 daily 复核",
+    "stk_limit_daily_match_v1": "重拉 stk_limit 对应交易日后与 daily 复核",
+    "stock_st_value_v1": "重拉 stock_st 对应交易日",
+    "moneyflow_range_v1": "重拉 moneyflow 对应交易日",
+    "moneyflow_daily_coverage_v1": "重拉 moneyflow 对应交易日后与 daily 复核",
+    "dividend_value_v1": "重拉 dividend 对应公告日期",
+    "dividend_stock_ratio_v1": "重拉 dividend 对应公告日期",
+    "dividend_date_order_v1": "重拉 dividend 对应公告日期后复核实施公告",
+    "forecast_value_v1": "重拉 forecast 对应公告日期",
+    "forecast_range_v1": "重拉 forecast 对应公告日期",
+    "forecast_date_order_v1": "重拉 forecast 对应公告日期",
+    "express_value_v1": "重拉 express 对应公告日期",
+    "express_audit_flag_v1": "重拉 express 对应公告日期后复核审计标识口径",
+    "express_growth_v1": "重拉 express 对应公告日期后复核修订口径",
+    "fina_audit_value_v1": "重拉 fina_audit 对应公告日期后复核审计信息",
+    "income_value_v1": "重拉 income 对应公告日期",
+    "income_equation_v1": "重拉 income 对应公告日期后复核报表口径",
+    "balancesheet_value_v1": "重拉 balancesheet 对应公告日期",
+    "balancesheet_equation_v1": "重拉 balancesheet 对应公告日期后复核报表口径",
+    "cashflow_value_v1": "重拉 cashflow 对应公告日期",
+    "cashflow_equation_v1": "重拉 cashflow 对应公告日期后复核报表口径",
+    "fina_indicator_value_v1": "重拉 fina_indicator 对应公告日期",
+    "sw_industry_value_v1": "重拉 sw_industry 对应纳入日期后复核行业历史",
+    "calendar_date_coverage_v1": "重拉 trade_cal 缺失自然日",
+    "calendar_pretrade_v1": "重拉 trade_cal 对应日期后复核上一交易日",
+    "adj_factor_decrease_v1": "人工核对公司行动、历史代码或因子历史修订",
+    "adj_factor_without_daily_v1": "人工区分停牌、退市、历史代码和异常冗余",
+    "sw_industry_mapping_v1": "人工核对行业更名、换版和有效区间",
+}
+
+for _rule_id in _BUSINESS_REPAIR_MESSAGES:
+    _REPAIRERS[_rule_id] = (
+        repair_review_warning
+        if _rule_id
+        in {"adj_factor_decrease_v1", "adj_factor_without_daily_v1", "sw_industry_mapping_v1"}
+        else repair_business_value
+    )

@@ -141,7 +141,7 @@ def _print_report(report: DetectionReport, output: Path) -> None:
             suffix = ""
             if modes:
                 suffix = f"：{modes.count('AUTO_FIX')} 个自动，{modes.count('MANUAL')} 个人工"
-            label = "通过" if check.status == "PASS" else "失败"
+            label = {"PASS": "通过", "WARN": "告警", "FAIL": "失败"}[check.status]
             print(f"  [{label}] {check.check_id} - {check.description}{suffix}")
     print(
         json.dumps(

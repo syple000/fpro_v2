@@ -171,7 +171,7 @@ uv run --group backtest backtest-momentum \
 `jsonl` 文件每行是一个 JSON：
 
 - 第一行 `kind=report`：检测范围、数据集、行数和输入指纹；
-- 中间的 `kind=check`：每个检查项的 `PASS` / `FAIL` 和问题数；
+- 中间的 `kind=check`：每个检查项的 `PASS` / `WARN` / `FAIL` 和问题数；
 - 后面的 `kind=issue`：只记录失败问题的分区、主键、观测值和修复建议。
 
 查看报告：
@@ -198,6 +198,15 @@ sed -n '1,30p' quality/issues/20260822-repaired.jsonl
 | `required_value_v1` | Schema 必填字段不为空 | 可定位日期时自动重拉，否则待人工 |
 | `finite_float_v1` | 浮点数不包含 `NaN` 或无穷值 | 关键字段重拉；其他可空字段自动补为 `null` |
 
+### 检查结果的级别
+
+- `PASS`：没有发现问题；
+- `WARN`：发现需要重拉或人工复核的异常，但它可能是合法公司行动、历史修订或特殊市场规则，不阻止发布；
+- `FAIL`：确定性错误，自动重拉后仍存在时阻止对应数据集发布。
+
+检测问题还保留原有修复方式：`AUTO_FIX` 表示有唯一修正值，`MANUAL` 表示不能直接改值。
+`WARNING + MANUAL` 会列入待人工清单，但不会把数据集标记为不可用。
+
 ### 需要交易日连续性的数据集
 
 `daily`、`daily_basic`、`adj_factor`、`stk_limit`、`stock_st` 和 `moneyflow`
@@ -206,44 +215,89 @@ sed -n '1,30p' quality/issues/20260822-repaired.jsonl
 | 检查 ID | 检查内容 | 修复方式 |
 | --- | --- | --- |
 | `missing_market_partition_v1` | 不缺 `trade_cal` 中已知开市日的分区 | 自动重拉缺失日期 |
+| `closed_market_partition_v1` | 日级市场数据不能出现在休市日 | 自动重拉；仍存在则人工核对日历 |
 
-### 有专有业务检查的数据集
+检查范围会一直延伸到 `--through`，所以最新一段数据整体没拉到也能发现，不再只检查实际数据首尾之间的洞。
 
-| 数据集 | 检查 ID | 检查内容 | 修复方式 |
+### 每个数据集的专有检查
+
+| 数据集 | 检查 ID | 检查内容 | 级别与处理 |
 | --- | --- | --- | --- |
+| `stock_basic` | `stock_basic_identity_v1` | `ts_code`、`symbol`、交易所和代码后缀一致 | FAIL，重拉上市日期 |
+| `stock_basic` | `stock_basic_lifecycle_v1` | 上市状态合法，上市日不晚于退市日，退市状态有退市日 | FAIL，重拉上市日期 |
 | `daily` | `daily_missing_v1` | `open/high/low/close/pre_close/vol/amount` 完整 | 自动重拉该交易日 |
 | `daily` | `daily_range_v1` | 价格为正，成交量和成交额非负 | 自动重拉该交易日 |
 | `daily` | `daily_ohlc_v1` | `high ≥ open/low/close`，`low ≤ open/high/close` | 自动重拉该交易日 |
 | `daily` | `daily_close_consistency_v1` | `change` 和 `pct_chg` 独立推导的收盘价一致 | 唯一结果生成自动补丁 |
+| `daily` | `daily_arithmetic_v1` | `close≈pre_close+change`，`pct_chg≈change/pre_close×100` | FAIL，自动重拉 |
+| `daily` | `daily_volume_amount_v1` | 成交量和成交额不能只有一个为零 | FAIL，自动重拉 |
+| `daily_basic` | `daily_basic_range_v1` | 股本、市值、换手率等应为非负数 | FAIL，自动重拉 |
+| `daily_basic` | `daily_basic_share_order_v1` | `total_share ≥ float_share ≥ free_share` | WARN，复核股本口径 |
+| `daily_basic` | `daily_basic_market_value_v1` | `total_mv≈close×total_share`，`circ_mv≈close×float_share` | WARN，复核单位与舍入 |
+| `daily_basic` | `daily_basic_daily_match_v1` | 与 `daily` 同日覆盖且收盘价相同 | WARN，交叉复核 |
 | `adj_factor` | `adj_factor_positive_v1` | 复权因子大于 0 | 自动重拉该交易日 |
-| `stk_limit` | `stk_limit_partition_missing_v1` | 整个分区的昨收、涨停、跌停不能整列为空 | 自动重拉该交易日 |
-| `stk_limit` | `stk_limit_missing_v1` | 每行昨收、涨停、跌停完整 | 自动重拉该交易日 |
-| `stk_limit` | `stk_limit_order_v1` | `down_limit ≤ pre_close ≤ up_limit` | 自动重拉该交易日 |
-| `trade_cal` | `trade_calendar_value_v1` | 交易所是 SSE/SZSE/BSE，`is_open` 是 0/1 | 自动重拉该日期 |
-| `trade_cal` | `calendar_exchange_coverage_v1` | 每个日期都覆盖 SSE、SZSE 和 BSE | 自动重拉该日期 |
+| `adj_factor` | `adj_factor_daily_coverage_v1` | 每条日线都有同代码同日复权因子 | FAIL，自动重拉因子 |
+| `adj_factor` | `adj_factor_continuity_v1` | `round(昨日close×昨日factor÷今日factor, 2)≈今日pre_close` | WARN，重拉后复核公司行动 |
+| `adj_factor` | `adj_factor_decrease_v1` | 因子下降需检查公司行动、代码变更或历史修订 | WARN，不能按单调性直接判错 |
+| `adj_factor` | `adj_factor_without_daily_v1` | 因子没有同日日线 | WARN，区分停牌、退市和历史代码 |
+| `suspend_d` | `suspend_value_v1` | 类型只能为 S/R，复牌不能带日内停牌时间段 | FAIL，自动重拉 |
+| `suspend_d` | `suspend_daily_conflict_v1` | 全日停牌证券不能仍有同日日线 | FAIL，重拉后交叉复核 |
+| `stk_limit` | `stk_limit_partition_missing_v1` | 整个分区的涨停价或跌停价不能整列为空 | 自动重拉该交易日 |
+| `stk_limit` | `stk_limit_missing_v1` | 每行涨停价和跌停价完整；`pre_close` 对部分非股票标的允许为空 | 自动重拉该交易日 |
+| `stk_limit` | `stk_limit_order_v1` | `down_limit ≤ pre_close ≤ up_limit`；无涨跌幅限制允许 0/99999.99 哨兵值 | 自动重拉该交易日 |
+| `stk_limit` | `stk_limit_daily_match_v1` | 与日线昨收一致，OHLC 不越过限制价格 | WARN，交叉复核 |
+| `stock_st` | `stock_st_value_v1` | 证券名称、类型和类型名称完整 | FAIL，自动重拉 |
+| `moneyflow` | `moneyflow_range_v1` | 买卖各档量额非负；净流入允许为负 | FAIL，自动重拉 |
+| `moneyflow` | `moneyflow_daily_coverage_v1` | 资金流向有对应同日日线 | WARN，交叉复核；不强制净流入等于各档相减 |
+| `dividend` | `dividend_value_v1` | 实施进度合法，送转、派现和基准股本非负，税后不高于税前 | FAIL，自动重拉公告日 |
+| `dividend` | `dividend_stock_ratio_v1` | `stk_div≈stk_bo_rate+stk_co_rate` | FAIL，自动重拉公告日 |
+| `dividend` | `dividend_date_order_v1` | 实施记录具备实施公告、登记、除权日期且顺序合理 | WARN，复核实施公告 |
+| `forecast` | `forecast_value_v1` | 预告类型和更新标识合法 | FAIL，自动重拉公告日 |
+| `forecast` | `forecast_range_v1` | 比例、利润下限不高于上限 | FAIL，自动重拉公告日 |
+| `forecast` | `forecast_date_order_v1` | 报告期为季度末且首次公告不晚于本次公告 | WARN，复核供应商历史日期 |
+| `express` | `express_value_v1` | 报告期、公告日和更新标识合法 | FAIL，自动重拉公告日 |
+| `express` | `express_audit_flag_v1` | 审计标识不是官方文档中的 0/1 | WARN，兼容并复核供应商新口径 |
+| `express` | `express_growth_v1` | 收入、利润和 EPS 同比可由本期及同期值重算 | WARN，复核修订口径 |
+| `fina_audit` | `fina_audit_value_v1` | 日期、费用、年度审计意见和事务所合理 | WARN，复核审计记录 |
+| `income` | `income_value_v1` | 实际公告日、季度末、报表类型、公司类型和更新标识合法 | FAIL，自动重拉公告日 |
+| `income` | `income_equation_v1` | 利润总额、净利润、少数股东损益和综合收益勾稽 | WARN，按报表口径复核 |
+| `balancesheet` | `balancesheet_value_v1` | 实际公告日、季度末、报表类型、公司类型和更新标识合法 | FAIL，自动重拉公告日 |
+| `balancesheet` | `balancesheet_equation_v1` | 资产=负债及权益，负债与含少数股东权益勾稽 | WARN，按报表口径复核 |
+| `cashflow` | `cashflow_value_v1` | 实际公告日、季度末、报表类型、公司类型和更新标识合法 | FAIL，自动重拉公告日 |
+| `cashflow` | `cashflow_equation_v1` | 经营/投资/筹资净额、现金净增加额和期末余额勾稽 | WARN，按报表口径复核 |
+| `fina_indicator` | `fina_indicator_value_v1` | 公告日、季度末和更新标识合法 | FAIL，自动重拉公告日 |
+| `sw_industry` | `sw_industry_value_v1` | 三级层级字段、纳入剔除日期和最新标识合法 | WARN，复核行业历史 |
+| `sw_industry` | `sw_industry_mapping_v1` | 代码名称映射唯一，同股有效区间不重叠且最多一个当前行业 | WARN，复核更名和换版 |
+| `trade_cal` | `trade_calendar_value_v1` | 交易所是 SSE/SZSE，`is_open` 是 0/1 | 自动重拉该日期 |
+| `trade_cal` | `calendar_exchange_coverage_v1` | 每个日期都覆盖 SSE 和 SZSE；Tushare 不提供独立 BSE 日历行 | 自动重拉该日期 |
+| `trade_cal` | `calendar_date_coverage_v1` | 请求范围内每个自然日都有日历记录 | FAIL，自动重拉缺失日 |
+| `trade_cal` | `calendar_pretrade_v1` | `pretrade_date` 指向该市场此前最近开市日 | WARN，重拉后复核 |
 
 ### 每个数据集的明确检查入口
 
 | 数据集 | 检查入口 | 当前检查 |
 | --- | --- | --- |
-| `stock_basic` | `check_stock_basic` | 通用检查 |
-| `daily` | `check_daily` | 通用、交易日缺口、daily 四项业务检查 |
-| `daily_basic` | `check_daily_basic` | 通用、交易日缺口 |
-| `adj_factor` | `check_adj_factor` | 通用、交易日缺口、因子为正 |
-| `suspend_d` | `check_suspend_d` | 通用检查 |
-| `stk_limit` | `check_stk_limit` | 通用、交易日缺口、涨跌停三项业务检查 |
-| `stock_st` | `check_stock_st` | 通用、交易日缺口 |
-| `moneyflow` | `check_moneyflow` | 通用、交易日缺口 |
-| `dividend` | `check_dividend` | 通用检查 |
-| `forecast` | `check_forecast` | 通用检查 |
-| `express` | `check_express` | 通用检查 |
-| `fina_audit` | `check_fina_audit` | 通用检查 |
-| `income` | `check_income` | 通用检查 |
-| `balancesheet` | `check_balancesheet` | 通用检查 |
-| `cashflow` | `check_cashflow` | 通用检查 |
-| `fina_indicator` | `check_fina_indicator` | 通用检查 |
-| `sw_industry` | `check_sw_industry` | 通用检查 |
-| `trade_cal` | `check_trade_cal` | 通用、日历值和三市覆盖 |
+| `stock_basic` | `check_stock_basic` | 身份和上市生命周期 |
+| `daily` | `check_daily` | 完整性、范围、OHLC、算术和量额关系 |
+| `daily_basic` | `check_daily_basic` | 范围、股本顺序和市值恒等式 |
+| `adj_factor` | `check_adj_factor` | 正数；序列及跨表检查由 `check_cross_dataset_consistency` 执行 |
+| `suspend_d` | `check_suspend_d` | 类型和日内时间段 |
+| `stk_limit` | `check_stk_limit` | 完整性和价格顺序 |
+| `stock_st` | `check_stock_st` | 状态字段完整性 |
+| `moneyflow` | `check_moneyflow` | 分档量额范围 |
+| `dividend` | `check_dividend` | 数值、送转合计和实施日期 |
+| `forecast` | `check_forecast` | 类型、上下限和公告日期 |
+| `express` | `check_express` | 公告字段和同比指标 |
+| `fina_audit` | `check_fina_audit` | 日期、费用和审计信息 |
+| `income` | `check_income` | 公告字段和利润勾稽 |
+| `balancesheet` | `check_balancesheet` | 公告字段和资产负债权益勾稽 |
+| `cashflow` | `check_cashflow` | 公告字段和现金流勾稽 |
+| `fina_indicator` | `check_fina_indicator` | 公告、报告期和版本标识 |
+| `sw_industry` | `check_sw_industry` | 层级、区间和最新标识 |
+| `trade_cal` | `check_trade_cal` | 日历值和市场覆盖；序列检查由 `check_trade_calendar_series` 执行 |
+
+跨表检查只在相关数据集同时包含于一次 `detect` 时执行。因此正式发布前建议不传
+`--datasets`，一次检查全部数据集；局部修复时再用 `--datasets` 缩小范围。
 
 ## 四、人工干预怎么写
 

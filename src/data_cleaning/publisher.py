@@ -133,7 +133,9 @@ def _publish_dataset(
     unresolved = [
         issue.issue_id
         for issue in issues
-        if issue.fix_mode == "MANUAL" and not _manual_resolved(issue, decisions.get(issue.issue_id))
+        if issue.severity == "ERROR"
+        and issue.fix_mode == "MANUAL"
+        and not _manual_resolved(issue, decisions.get(issue.issue_id))
     ]
     if unresolved:
         return {
@@ -173,7 +175,9 @@ def _publish_dataset(
     open_post = sorted(
         issue.issue_id
         for issue in post.issues
-        if issue.fix_mode == "MANUAL" and issue.issue_id not in accepted
+        if issue.severity == "ERROR"
+        and issue.fix_mode == "MANUAL"
+        and issue.issue_id not in accepted
     )
     if open_post:
         shutil.rmtree(candidate / dataset, ignore_errors=True)
