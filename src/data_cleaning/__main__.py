@@ -8,7 +8,16 @@ import os
 from datetime import date
 from pathlib import Path
 
-from data_cleaning import detect, publish, read_report, repair, write_report
+from data_cleaning import (
+    DetectionReport,
+    detect,
+    publish,
+    read_report,
+    refetch_ranges,
+    repair,
+    repair_instructions,
+    write_report,
+)
 from tushare_data import (
     DEFAULT_API_URL,
     DEFAULT_MAX_CONCURRENCY,
@@ -40,36 +49,41 @@ def main() -> None:
         raise SystemExit(0 if report.passed else 1)
 
     if args.command == "repair":
-        if not args.token:
+        source_report = read_report(args.issues)
+        ranges = refetch_ranges(source_report)
+        if ranges and not args.token:
             parser.error("请通过环境变量 TUSHARE_TOKEN 或 --token 提供 Token")
-        pro = create_pro_client(
-            args.token,
-            args.api_url,
-            requests_per_minute=args.requests_per_minute,
-            max_concurrency=args.max_concurrency,
-        )
-        with TushareDataStore(args.input) as store:
-
-            def refetch(dataset: str, start: date, end: date) -> int:
-                return sync_datasets(
-                    pro,
-                    store,
-                    (dataset,),
-                    start,
-                    end,
-                    force=True,
-                )[dataset]
-
-            report = repair(
-                args.input,
-                through=args.through,
-                start=args.start,
-                datasets=args.datasets,
-                refetch=refetch,
-                max_rounds=args.max_rounds,
+        _print_repair_plan(source_report)
+        if ranges:
+            pro = create_pro_client(
+                args.token,
+                args.api_url,
+                requests_per_minute=args.requests_per_minute,
+                max_concurrency=args.max_concurrency,
             )
+            with TushareDataStore(args.input) as store:
+
+                def refetch(dataset: str, start: date, end: date) -> int:
+                    return sync_datasets(
+                        pro,
+                        store,
+                        (dataset,),
+                        start,
+                        end,
+                        force=True,
+                    )[dataset]
+
+                report = repair(
+                    args.input,
+                    report=source_report,
+                    refetch=refetch,
+                    max_rounds=args.max_rounds,
+                )
+        else:
+            report = repair(args.input, report=source_report, max_rounds=args.max_rounds)
         write_report(report, args.output)
         _print_report(report, args.output)
+        _print_manual_work(report)
         raise SystemExit(0 if report.passed else 1)
 
     report = read_report(args.issues)
@@ -80,7 +94,7 @@ def main() -> None:
         decisions_path=args.decisions,
         release_id=args.release,
     )
-    print(json.dumps({"release": str(release_path)}, ensure_ascii=False))
+    _print_release(release_path)
 
 
 def _detect_parser(subparsers: argparse._SubParsersAction) -> None:
@@ -90,8 +104,9 @@ def _detect_parser(subparsers: argparse._SubParsersAction) -> None:
 
 
 def _repair_parser(subparsers: argparse._SubParsersAction) -> None:
-    parser = subparsers.add_parser("repair", help="对可定位问题定向重拉并复检")
-    _scope_arguments(parser)
+    parser = subparsers.add_parser("repair", help="读取检测报告并逐项修复")
+    parser.add_argument("--input", type=Path, default=Path("dataset/tushare"))
+    parser.add_argument("--issues", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--max-rounds", type=int, default=2)
     parser.add_argument("--token", default=os.environ.get("TUSHARE_TOKEN"))
@@ -116,7 +131,18 @@ def _scope_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--datasets", nargs="+", choices=tuple(TABLE_SCHEMAS))
 
 
-def _print_report(report, output: Path) -> None:
+def _print_report(report: DetectionReport, output: Path) -> None:
+    print("检测结果：")
+    for dataset in report.datasets:
+        print(f"{dataset} ({report.row_counts.get(dataset, 0)} 行)")
+        dataset_issues = [issue for issue in report.issues if issue.dataset == dataset]
+        for check in (item for item in report.checks if item.dataset == dataset):
+            modes = [issue.fix_mode for issue in dataset_issues if issue.rule_id == check.check_id]
+            suffix = ""
+            if modes:
+                suffix = f"：{modes.count('AUTO_FIX')} 个自动，{modes.count('MANUAL')} 个人工"
+            label = "通过" if check.status == "PASS" else "失败"
+            print(f"  [{label}] {check.check_id} - {check.description}{suffix}")
     print(
         json.dumps(
             {
@@ -129,6 +155,51 @@ def _print_report(report, output: Path) -> None:
             ensure_ascii=False,
         )
     )
+
+
+def _print_repair_plan(report: DetectionReport) -> None:
+    print("修复计划：")
+    instructions = repair_instructions(report)
+    if not instructions:
+        print("  没有需要修复的问题")
+        return
+    labels = {"PATCH": "自动补丁", "REFETCH": "自动重拉", "MANUAL": "待人工"}
+    for instruction in instructions:
+        print(
+            f"  [{labels[instruction.action]}] {instruction.dataset} "
+            f"{instruction.rule_id} - {instruction.message}"
+        )
+
+
+def _print_manual_work(report: DetectionReport) -> None:
+    remaining = [
+        instruction for instruction in repair_instructions(report) if instruction.action != "PATCH"
+    ]
+    patches = [
+        instruction for instruction in repair_instructions(report) if instruction.action == "PATCH"
+    ]
+    if patches:
+        print(f"已生成 {len(patches)} 个确定性补丁，publish 时按数据集合并。")
+    if not remaining:
+        print("待人工干预：0")
+        return
+    print(f"待人工干预：{len(remaining)}")
+    for instruction in remaining:
+        print(
+            f"  {instruction.issue_id} | {instruction.dataset} | "
+            f"{instruction.rule_id} | {instruction.message}"
+        )
+
+
+def _print_release(release_path: Path) -> None:
+    payload = json.loads((release_path / "release.json").read_text(encoding="utf-8"))
+    print("发布结果：")
+    for dataset, state in payload["datasets"].items():
+        print(
+            f"  [{state['status']}] {dataset}: {state['row_count']} 行，"
+            f"未解决 {len(state['open_issue_ids'])} 个"
+        )
+    print(json.dumps({"release": str(release_path)}, ensure_ascii=False))
 
 
 if __name__ == "__main__":

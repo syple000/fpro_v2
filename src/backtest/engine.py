@@ -3,15 +3,16 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import date, datetime, time
 
 from backtest.config import BacktestConfig
 from backtest.corporate_actions import CorporateActionProcessor
-from backtest.data import MarketData, SessionData, event_time
+from backtest.data import MarketData, event_time
 from backtest.execution import LOT_SIZE, ExecutionEngine
 from backtest.portfolio import Portfolio
+from backtest.strategy import Strategy
 from backtest.types import EquitySnapshot, Fill, OrderReason, OrderResult, OrderSide
 from strategies import validate_target_weights
 
@@ -32,7 +33,7 @@ class BacktestEngine:
         *,
         config: BacktestConfig,
         data: MarketData,
-        strategy: Callable[[SessionData], Mapping[str, float] | None],
+        strategy: Strategy,
     ) -> None:
         self.config = config
         self.data = data
@@ -91,7 +92,7 @@ class BacktestEngine:
             self.actions.capture_record_date(close_at, self.portfolio)
             self._equity.append(self.portfolio.snapshot(session))
 
-            targets = self.strategy(self.data.session_data(session, session_index))
+            targets = self.strategy.on_close(self.data.session_data(session, session_index))
             next_session = self.data.next_session(session)
             if targets is not None and next_session is not None:
                 self._submit_rebalance(

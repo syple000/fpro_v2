@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -12,7 +11,7 @@ from backtest.data import MarketData
 from backtest.engine import BacktestEngine, BacktestResult
 from backtest.metrics import calculate_metrics
 from backtest.output import write_results
-from backtest.strategy import monthly_momentum_targets
+from backtest.strategy import MonthlyMomentumStrategy
 from market_data import DataCatalog, DataReader, SourceConfig
 from strategies import MomentumConfig
 
@@ -48,8 +47,7 @@ def run_monthly_momentum(
     options: RunOptions | None = None,
 ) -> CompletedRun:
     run_options = options or RunOptions()
-    momentum_config = strategy_config or MomentumConfig()
-    strategy = partial(monthly_momentum_targets, config=momentum_config)
+    strategy = MonthlyMomentumStrategy(strategy_config)
     with DataCatalog(
         tushare_root=run_options.tushare_root,
         qmt_root=run_options.qmt_root,
@@ -62,7 +60,7 @@ def run_monthly_momentum(
         data = MarketData(
             reader,
             config,
-            history_window=max(momentum_config.lookback_sessions + 5, 300),
+            history_window=strategy.history_window,
         )
         result = BacktestEngine(
             config=config,

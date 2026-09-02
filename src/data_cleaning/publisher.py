@@ -70,7 +70,7 @@ def publish(
         payload = {
             "release_id": release_id,
             "validated_through": report.through.isoformat(),
-            "ruleset_version": 1,
+            "ruleset_version": 2,
             "input_fingerprint": report.input_fingerprint,
             "datasets": states,
         }
@@ -96,72 +96,104 @@ def _build_release(
     states: dict[str, object] = {}
 
     for dataset in TABLE_SCHEMAS:
-        if dataset not in selected:
-            states[dataset] = {
-                "status": "UNAVAILABLE",
-                "row_count": 0,
-                "open_issue_ids": [f"{dataset}:not_validated"],
-            }
-            continue
-        issues = issues_by_dataset[dataset]
-        unresolved = [
-            issue.issue_id
-            for issue in issues
-            if issue.fix_mode == "MANUAL"
-            and not _manual_resolved(issue, decisions.get(issue.issue_id))
-        ]
-        if unresolved:
-            states[dataset] = {
-                "status": "UNAVAILABLE",
-                "row_count": report.row_counts.get(dataset, 0),
-                "open_issue_ids": sorted(unresolved),
-            }
-            continue
-
-        try:
-            _materialize_dataset(
-                source,
-                candidate,
-                dataset,
-                through=report.through,
-                issues=issues,
-                decisions=decisions,
-            )
-        except PatchMismatchError as exc:
-            shutil.rmtree(candidate / dataset, ignore_errors=True)
-            states[dataset] = {
-                "status": "UNAVAILABLE",
-                "row_count": report.row_counts.get(dataset, 0),
-                "open_issue_ids": [f"{dataset}:patch_mismatch:{exc}"],
-            }
-            continue
-
-        post = detect(candidate, through=report.through, datasets=(dataset,))
-        accepted = {
-            issue_id for issue_id, decision in decisions.items() if decision.action == "ACCEPT"
-        }
-        open_post = sorted(
-            issue.issue_id
-            for issue in post.issues
-            if issue.fix_mode == "MANUAL" and issue.issue_id not in accepted
+        states[dataset] = _publish_dataset(
+            source,
+            candidate,
+            dataset,
+            selected=dataset in selected,
+            through=report.through,
+            row_count=report.row_counts.get(dataset, 0),
+            issues=issues_by_dataset[dataset],
+            decisions=decisions,
         )
-        if open_post:
-            shutil.rmtree(candidate / dataset, ignore_errors=True)
-            states[dataset] = {
-                "status": "UNAVAILABLE",
-                "row_count": post.row_counts.get(dataset, 0),
-                "open_issue_ids": open_post,
-            }
-            continue
-        states[dataset] = {
-            "status": "AVAILABLE",
-            "row_count": post.row_counts.get(dataset, 0),
-            "open_issue_ids": [],
-        }
     return states
 
 
-def _materialize_dataset(
+def _publish_dataset(
+    source: Path,
+    candidate: Path,
+    dataset: str,
+    *,
+    selected: bool,
+    through: date,
+    row_count: int,
+    issues: list[Issue],
+    decisions: Mapping[str, Decision],
+) -> dict[str, object]:
+    """合并一个数据集的修复，复检后返回该数据集的发布状态。"""
+    if not selected:
+        return {
+            "status": "UNAVAILABLE",
+            "row_count": 0,
+            "auto_fixes": 0,
+            "manual_patches": 0,
+            "open_issue_ids": [f"{dataset}:not_validated"],
+        }
+
+    unresolved = [
+        issue.issue_id
+        for issue in issues
+        if issue.fix_mode == "MANUAL" and not _manual_resolved(issue, decisions.get(issue.issue_id))
+    ]
+    if unresolved:
+        return {
+            "status": "UNAVAILABLE",
+            "row_count": row_count,
+            "auto_fixes": 0,
+            "manual_patches": 0,
+            "open_issue_ids": sorted(unresolved),
+        }
+
+    auto_fixes = sum(issue.fix_mode == "AUTO_FIX" for issue in issues)
+    manual_patches = sum(
+        decisions.get(issue.issue_id) is not None and decisions[issue.issue_id].action == "PATCH"
+        for issue in issues
+    )
+    try:
+        _merge_dataset_fixes(
+            source,
+            candidate,
+            dataset,
+            through=through,
+            issues=issues,
+            decisions=decisions,
+        )
+    except PatchMismatchError as exc:
+        shutil.rmtree(candidate / dataset, ignore_errors=True)
+        return {
+            "status": "UNAVAILABLE",
+            "row_count": row_count,
+            "auto_fixes": 0,
+            "manual_patches": 0,
+            "open_issue_ids": [f"{dataset}:patch_mismatch:{exc}"],
+        }
+
+    post = detect(candidate, through=through, datasets=(dataset,))
+    accepted = {issue_id for issue_id, decision in decisions.items() if decision.action == "ACCEPT"}
+    open_post = sorted(
+        issue.issue_id
+        for issue in post.issues
+        if issue.fix_mode == "MANUAL" and issue.issue_id not in accepted
+    )
+    if open_post:
+        shutil.rmtree(candidate / dataset, ignore_errors=True)
+        return {
+            "status": "UNAVAILABLE",
+            "row_count": post.row_counts.get(dataset, 0),
+            "auto_fixes": 0,
+            "manual_patches": 0,
+            "open_issue_ids": open_post,
+        }
+    return {
+        "status": "AVAILABLE",
+        "row_count": post.row_counts.get(dataset, 0),
+        "auto_fixes": auto_fixes,
+        "manual_patches": manual_patches,
+        "open_issue_ids": [],
+    }
+
+
+def _merge_dataset_fixes(
     source: Path,
     candidate: Path,
     dataset: str,
@@ -170,6 +202,7 @@ def _materialize_dataset(
     issues: Iterable[Issue],
     decisions: Mapping[str, Decision],
 ) -> None:
+    """把一个数据集的自动补丁和人工 PATCH 合并到候选发布目录。"""
     modifications: dict[str, list[tuple[Issue, Decision | None]]] = {}
     for issue in issues:
         decision = decisions.get(issue.issue_id)

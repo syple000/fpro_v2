@@ -1,254 +1,148 @@
-# `data_cleaning`：离线数据检测、修复和发布
+# `data_cleaning`：检测、修复、发布
 
-`data_cleaning` 把 Tushare 采集数据变成 Reader 可以直接信任的版本化数据。
-它不在查询时跳过异常行，而是在回测前完成下面的闭环：
+`data_cleaning` 把 Tushare 采集数据发布成 Reader 可以直接使用的版本。
+整个流程只有三步，三步之间通过报告文件衔接：
 
 ```text
 dataset/tushare
-      ↓ detect
-稳定的问题报告
-      ↓ repair（可选：按数据集和日期定向重拉）
-      ↓ publish（自动修正 + 人工决策 + 完整复检）
+      ↓ detect：逐数据集、逐项检查
+quality/issues/detected.jsonl
+      ↓ repair：读取检测报告，自动补丁或定向重拉
+quality/issues/repaired.jsonl
+      ↓ publish：逐数据集合并修复、复检、发布
 dataset/tushare_published/current
-      ↓
-DataCatalog → DataReader
 ```
 
-## 第一次使用：照着做即可
+不会在回测时跳过异常行。有未解决问题的数据集整体标记为
+`UNAVAILABLE`，回测读取它时立即报错。
 
-下面的命令都在项目根目录执行。先安装本模块的依赖：
+## 一、具体怎么用
+
+所有命令都在项目根目录执行。首次使用先安装依赖：
 
 ```bash
 uv sync --group data-cleaning
 ```
 
-先记住两件事：
+### 1. 检测指定数据集和区间
 
-- `repair` 只是向 Tushare 定向重拉原数据；
-- 可以确定正确值的自动修正，在 `publish` 时才写入发布目录。
-
-### 第 1 步：先用一天的数据练习检测
-
-`detect` 只读，不会修改原数据。下面只检查 `daily` 的一天：
+例如，只检查 `daily` 在 2024-07-01 到 2024-07-31 的数据：
 
 ```bash
 uv run --group data-cleaning data-cleaning detect \
   --input dataset/tushare \
   --datasets daily \
-  --start 2024-07-23 \
-  --through 2024-07-23 \
-  --output quality/issues/practice.jsonl
-```
-
-这些参数的意思是：
-
-- `--input`：待检查的采集层目录；
-- `--datasets`：只检查指定数据集，可以空格分隔多个名称；
-- `--start`：检查区间的开始日；
-- `--through`：检查到哪一天，包含该日；
-- `--output`：问题报告保存位置，父目录会自动创建。
-
-命令最后会输出一行摘要，例如：
-
-```json
-{"datasets":["daily"],"issues":2,"manual":1,"auto_fix":1,"output":"quality/issues/practice.jsonl"}
-```
-
-- `issues`：共发现多少个问题；
-- `manual`：还需重拉或人工决策的问题数；
-- `auto_fix`：已经能算出唯一正确值，发布时会自动修正的问题数。
-
-当 `manual` 大于 0 时，命令退出码是 `1`。这表示“成功检出需处理的问题”，
-不是命令崩溃，报告已经正常生成。
-
-查看报告前 10 行：
-
-```bash
-sed -n '1,10p' quality/issues/practice.jsonl
-```
-
-第一行是本次检测的范围和数据指纹，后续每行是一个问题。问题中最常用的
-字段是 `issue_id`、`dataset`、`partition`、`key`、`fix_mode` 和 `suggested`。
-
-### 第 2 步：让程序尝试自动恢复原数据
-
-如果有 `manual` 问题，先运行 `repair`。它会将问题合并成尽可能少的
-“数据集 + 日期区间”请求，重拉后自动复检：
-
-```bash
-export TUSHARE_TOKEN='你的 token'
-
-uv run --group data-cleaning data-cleaning repair \
-  --input dataset/tushare \
-  --datasets daily \
-  --start 2024-07-23 \
-  --through 2024-07-23 \
-  --output quality/issues/practice-after-repair.jsonl
-```
-
-`repair` 会更新 `dataset/tushare` 中当前生效的采集版本，但不会更新已发布版本。
-如果重拉后 `manual` 变成 0，就不需要写人工决策。
-
-### 第 3 步：生成可发布的全量报告
-
-前两步带有 `--start`，只用于定位和修复局部问题，不能直接发布。正式发布前，
-要从数据起点检查到指定日期：
-
-```bash
-uv run --group data-cleaning data-cleaning detect \
-  --input dataset/tushare \
-  --through 2026-08-22 \
-  --output quality/issues/20260822-full.jsonl
-```
-
-这里故意不写 `--start` 和 `--datasets`，表示检查所有已登记数据集的全部有效历史。
-如果这次仍有 `manual`，最省事的做法是让 `repair` 处理整份报告范围：
-
-```bash
-export TUSHARE_TOKEN='你的 token'
-
-uv run --group data-cleaning data-cleaning repair \
-  --input dataset/tushare \
-  --through 2026-08-22 \
-  --output quality/issues/20260822-full.jsonl
-```
-
-它不会把所有历史数据重拉一遍，只会重拉问题建议中的数据集和日期区间。
-这份新报告没有 `--start` 限制，可以直接交给 `publish`。如果重拉后仍有
-`manual`，按本文的“人工决策”一节处理；不想人工判断时也可以直接发布，
-有问题的数据集会是 `UNAVAILABLE`，不会混入回测。
-
-### 第 4 步：发布清洗版本
-
-如果全量报告的 `manual` 是 0，直接发布，不需要决策文件：
-
-```bash
-uv run --group data-cleaning data-cleaning publish \
-  --input dataset/tushare \
-  --issues quality/issues/20260822-full.jsonl \
-  --output-root dataset/tushare_published \
-  --release 20260822-v1
-```
-
-`publish` 会应用 `auto_fix`、完整复检、写入不可变版本，最后将 `current`
-原子切换到新版本。发布成功后检查：
-
-```bash
-readlink dataset/tushare_published/current
-python -m json.tool dataset/tushare_published/current/release.json | sed -n '1,120p'
-```
-
-每个数据集应该是 `AVAILABLE`。如果某个数据集是 `UNAVAILABLE`，
-`open_issue_ids` 会列出它仍然没有解决的问题。该数据集会被隔离，其他已通过的
-数据集仍然可用。
-
-### 第 5 步：回测只读发布版本
-
-```bash
-uv run --group backtest backtest-momentum \
-  --start 2017-01-01 \
-  --end 2026-08-22 \
-  --tushare-dir dataset/tushare_published/current \
-  --qmt-dir dataset/qmt
-```
-
-不要在正式回测中把 `--tushare-dir` 指向 `dataset/tushare`：那是还没有经过发布门禁的
-采集层。如果回测依赖的数据集被隔离，Reader 会立即报
-`DataSourceUnavailableError`，不会跳过坏行后继续计算。
-
-### 日常最短流程
-
-已经熟悉后，只需记住：
-
-```text
-局部 repair → 不带 --start 的全量 detect → publish → 回测读 current
-```
-
-## 原则
-
-- `dataset/tushare` 是采集层；清洗不直接修改其 Parquet；
-- 只有正确值唯一且可复检时才自动修正；
-- 能用原供应商恢复的问题优先定向重拉；
-- 不插值价格、不前向填充行情和复权因子、不为财务报表强行“平账”；
-- 未解决问题只阻断对应数据集，不阻断无关数据集；
-- Reader 不读取问题清单，只读取已复检的 Parquet 和 `release.json`。
-
-## 三个命令（参数参考）
-
-### 1. 检测
-
-检测全部数据集：
-
-```bash
-uv run --group data-cleaning data-cleaning detect \
-  --input dataset/tushare \
-  --through 2026-08-22 \
-  --output quality/issues/20260822.jsonl
-```
-
-只检查特定数据集和日期区间：
-
-```bash
-uv run --group data-cleaning data-cleaning detect \
-  --input dataset/tushare \
-  --datasets daily stk_limit adj_factor \
   --start 2024-07-01 \
   --through 2024-07-31 \
-  --output quality/issues/202407.jsonl
+  --output quality/issues/daily-202407-detected.jsonl
 ```
 
-`detect` 为只读操作。未发现阻断问题时退出码为 0，存在 `MANUAL` 问题时为 1。
+- `detect` 只读，不修改任何数据；
+- `--datasets` 可以写多个，例如 `daily adj_factor stk_limit`；
+- `--start` 和 `--through` 都包含当天；
+- 局部报告用于排查问题，因为带 `--start`，不能直接发布。
 
-### 2. 自动修复
+终端会输出每一个检查项，包括通过项：
 
-`repair` 先检测，再从问题中提取可定位的 `REFETCH` 建议，按数据集合并连续
-日期，强制重拉后重新检测。默认最多两轮，问题不再变化时提前停止。
+```text
+检测结果：
+daily (52000 行)
+  [通过] manifest_v1 - Manifest 格式正确
+  [通过] schema_v1 - Parquet Schema 与登记 Schema 一致
+  [失败] daily_ohlc_v1 - 开高低收关系正确：0 个自动，1 个人工
+{"datasets":["daily"],"issues":1,"manual":1,"auto_fix":0,"output":"..."}
+```
+
+`manual` 大于 0 时退出码为 1，表示“成功检出待处理问题”，不是程序崩溃。
+
+### 2. 修复必须读取这份检测报告
 
 ```bash
 export TUSHARE_TOKEN='你的 token'
 
 uv run --group data-cleaning data-cleaning repair \
   --input dataset/tushare \
-  --datasets stk_limit adj_factor \
-  --start 2024-07-23 \
-  --through 2024-07-23 \
-  --output quality/issues/repair-20240723.jsonl
+  --issues quality/issues/daily-202407-detected.jsonl \
+  --output quality/issues/daily-202407-repaired.jsonl
 ```
 
-也可以直接使用采集层的定向同步能力：
+`repair` 不再接受 `--datasets`、`--start` 或 `--through`，因为它必须严格使用
+检测报告中已经记录的范围。
+
+对每个问题，只有三种明确结果：
+
+- `自动补丁`：正确值唯一，记录补丁，由 `publish` 合并到发布数据；
+- `自动重拉`：问题能定位到数据集和日期，从 Tushare 强制重拉后复检；
+- `待人工`：无法确定唯一修法，不自动猜测。
+
+只有存在“自动重拉”时才需要 `TUSHARE_TOKEN`。如果报告中只有自动补丁或人工问题，
+可以不设 token。
+
+输出示例：
+
+```text
+修复计划：
+  [自动重拉] daily daily_ohlc_v1 - 重拉 daily 对应交易日
+...
+待人工干预：0
+```
+
+如果重拉两轮后问题仍在，或者问题本身无法自动处理，终端会逐条输出：
+
+```text
+待人工干预：1
+  <issue_id> | daily | daily_ohlc_v1 | <原因>
+```
+
+### 3. 正式发布前做全量检测和修复
+
+发布报告不能带 `--start`。推荐不写 `--datasets`，一次检查所有数据集：
 
 ```bash
-uv run --group tushare-data tushare-data-test \
-  --mode sync_all \
-  --datasets daily adj_factor \
-  --start-date 20200318 \
-  --end-date 20200318 \
-  --data-dir dataset/tushare \
-  --force
+uv run --group data-cleaning data-cleaning detect \
+  --input dataset/tushare \
+  --through 2026-08-22 \
+  --output quality/issues/20260822-detected.jsonl
 ```
 
-`force` 不会先清空旧数据。新数据完整写入后，存储层按业务主键保留新版本。
+再让修复命令读取这份报告：
 
-### 3. 发布
+```bash
+export TUSHARE_TOKEN='你的 token'
 
-`publish` 必须使用不带 `--start` 的全量报告。发布前会校验报告中的 Manifest
-指纹，防止将旧问题清单应用到已更新数据。
+uv run --group data-cleaning data-cleaning repair \
+  --input dataset/tushare \
+  --issues quality/issues/20260822-detected.jsonl \
+  --output quality/issues/20260822-repaired.jsonl
+```
+
+### 4. 按数据集合并修复并发布
 
 ```bash
 uv run --group data-cleaning data-cleaning publish \
   --input dataset/tushare \
-  --issues quality/issues/20260822.jsonl \
+  --issues quality/issues/20260822-repaired.jsonl \
   --output-root dataset/tushare_published \
   --release 20260822-v1
 ```
 
-只有确实写了人工决策文件时，才加上：
+`publish` 对每个数据集分别执行：
+
+1. 检查该数据集是否还有未解决人工问题；
+2. 合并该数据集的确定性自动补丁和人工 `PATCH`；
+3. 未修改分区使用硬链接，修改分区重写 Parquet；
+4. 只复检该数据集；
+5. 复检通过标记 `AVAILABLE`，否则标记 `UNAVAILABLE`。
+
+终端会逐数据集输出发布结果：
 
 ```text
---decisions quality/decisions.jsonl
+发布结果：
+  [AVAILABLE] daily: 3200000 行，未解决 0 个
+  [UNAVAILABLE] adj_factor: 2100000 行，未解决 1 个
 ```
 
-发布成功后：
+它同时生成：
 
 ```text
 dataset/tushare_published/
@@ -260,109 +154,149 @@ dataset/tushare_published/
         └── release.json
 ```
 
-未修改分区用硬链复用活跃 Parquet；有自动修正或 `PATCH` 的分区重写。
-只有复检通过的数据集会对 Reader 开放。
-
-## 已实现检查
-
-所有数据集执行：
-
-- Manifest 格式和引用文件存在性；
-- Parquet Schema 与 Tushare 登记 Schema 一致；
-- 分区路径与记录分区日期一致；
-- 分区内业务主键不重复；
-- 非空 Schema 字段不为空；
-- 浮点数不包含 `NaN` 或无穷值；
-- 稠密交易数据集不缺已知交易日分区。
-
-交易关键数据额外执行：
-
-- `daily`：关键字段完整、价格为正、成交量额非负、OHLC 关系正确；
-- `daily`：`pre_close + change` 与 `pct_chg` 独立指向同一收盘价时，
-  可自动修正不一致的 `close`；
-- `adj_factor`：因子为正数；
-- `stk_limit`：关键价格完整且 `down_limit <= pre_close <= up_limit`；
-- `trade_cal`：交易所和开市标记合法，每日覆盖 SSE、SZSE 和 BSE。
-
-关键行情、复权和涨跌停字段中的非有限数会建议重拉；其他可空数值字段
-中的非有限数在发布时确定性归一为 `null`。
-
-## 人工决策
-
-只有定向重拉之后仍然有 `MANUAL` 问题，才需要这一步。先从最新的全量报告
-中找到问题行：
+### 5. 回测只读发布版本
 
 ```bash
-rg '"kind":"issue"' quality/issues/20260822-full.jsonl
+uv run --group backtest backtest-momentum \
+  --start 2017-01-01 \
+  --end 2026-08-22 \
+  --tushare-dir dataset/tushare_published/current \
+  --qmt-dir dataset/qmt
 ```
 
-每个问题有三种处理方式。
+正式回测不要直接读 `dataset/tushare`，因为它是未经发布门禁的采集层。
 
-### 方式 1：已从可信来源确认正确值
+## 二、检测报告里有什么
 
-用编辑器打开 `quality/decisions.jsonl`，每个决策写成单独一行 JSON：
+`jsonl` 文件每行是一个 JSON：
+
+- 第一行 `kind=report`：检测范围、数据集、行数和输入指纹；
+- 中间的 `kind=check`：每个检查项的 `PASS` / `FAIL` 和问题数；
+- 后面的 `kind=issue`：只记录失败问题的分区、主键、观测值和修复建议。
+
+查看报告：
+
+```bash
+sed -n '1,30p' quality/issues/20260822-repaired.jsonl
+```
+
+这样既能看到“检查了什么”，也能看到“哪些检查没通过”。
+
+## 三、所有数据集都检查什么
+
+### 每个数据集都执行的通用检查
+
+| 检查 ID | 检查内容 | 检出后的修复方式 |
+| --- | --- | --- |
+| `dataset_empty_v1` | 全量发布时数据集不能为空 | 待人工确认应采集范围 |
+| `manifest_v1` | Manifest 是合法 JSON，`files` 列表格式正确 | 待人工恢复或重建分区 |
+| `manifest_file_missing_v1` | Manifest 引用的 Parquet 都存在 | 待人工恢复或重建分区 |
+| `parquet_read_v1` | Parquet 文件可读 | 待人工从原数据恢复 |
+| `schema_v1` | Parquet Schema 与该数据集的登记 Schema 一致 | 待人工核对版本并重建 |
+| `partition_value_v1` | 分区路径日期与记录分区字段一致 | 待人工核对后重建 |
+| `duplicate_key_v1` | 分区内业务主键不重复 | 可定位日期时自动重拉，否则待人工 |
+| `required_value_v1` | Schema 必填字段不为空 | 可定位日期时自动重拉，否则待人工 |
+| `finite_float_v1` | 浮点数不包含 `NaN` 或无穷值 | 关键字段重拉；其他可空字段自动补为 `null` |
+
+### 需要交易日连续性的数据集
+
+`daily`、`daily_basic`、`adj_factor`、`stk_limit`、`stock_st` 和 `moneyflow`
+额外执行：
+
+| 检查 ID | 检查内容 | 修复方式 |
+| --- | --- | --- |
+| `missing_market_partition_v1` | 不缺 `trade_cal` 中已知开市日的分区 | 自动重拉缺失日期 |
+
+### 有专有业务检查的数据集
+
+| 数据集 | 检查 ID | 检查内容 | 修复方式 |
+| --- | --- | --- | --- |
+| `daily` | `daily_missing_v1` | `open/high/low/close/pre_close/vol/amount` 完整 | 自动重拉该交易日 |
+| `daily` | `daily_range_v1` | 价格为正，成交量和成交额非负 | 自动重拉该交易日 |
+| `daily` | `daily_ohlc_v1` | `high ≥ open/low/close`，`low ≤ open/high/close` | 自动重拉该交易日 |
+| `daily` | `daily_close_consistency_v1` | `change` 和 `pct_chg` 独立推导的收盘价一致 | 唯一结果生成自动补丁 |
+| `adj_factor` | `adj_factor_positive_v1` | 复权因子大于 0 | 自动重拉该交易日 |
+| `stk_limit` | `stk_limit_partition_missing_v1` | 整个分区的昨收、涨停、跌停不能整列为空 | 自动重拉该交易日 |
+| `stk_limit` | `stk_limit_missing_v1` | 每行昨收、涨停、跌停完整 | 自动重拉该交易日 |
+| `stk_limit` | `stk_limit_order_v1` | `down_limit ≤ pre_close ≤ up_limit` | 自动重拉该交易日 |
+| `trade_cal` | `trade_calendar_value_v1` | 交易所是 SSE/SZSE/BSE，`is_open` 是 0/1 | 自动重拉该日期 |
+| `trade_cal` | `calendar_exchange_coverage_v1` | 每个日期都覆盖 SSE、SZSE 和 BSE | 自动重拉该日期 |
+
+### 每个数据集的明确检查入口
+
+| 数据集 | 检查入口 | 当前检查 |
+| --- | --- | --- |
+| `stock_basic` | `check_stock_basic` | 通用检查 |
+| `daily` | `check_daily` | 通用、交易日缺口、daily 四项业务检查 |
+| `daily_basic` | `check_daily_basic` | 通用、交易日缺口 |
+| `adj_factor` | `check_adj_factor` | 通用、交易日缺口、因子为正 |
+| `suspend_d` | `check_suspend_d` | 通用检查 |
+| `stk_limit` | `check_stk_limit` | 通用、交易日缺口、涨跌停三项业务检查 |
+| `stock_st` | `check_stock_st` | 通用、交易日缺口 |
+| `moneyflow` | `check_moneyflow` | 通用、交易日缺口 |
+| `dividend` | `check_dividend` | 通用检查 |
+| `forecast` | `check_forecast` | 通用检查 |
+| `express` | `check_express` | 通用检查 |
+| `fina_audit` | `check_fina_audit` | 通用检查 |
+| `income` | `check_income` | 通用检查 |
+| `balancesheet` | `check_balancesheet` | 通用检查 |
+| `cashflow` | `check_cashflow` | 通用检查 |
+| `fina_indicator` | `check_fina_indicator` | 通用检查 |
+| `sw_industry` | `check_sw_industry` | 通用检查 |
+| `trade_cal` | `check_trade_cal` | 通用、日历值和三市覆盖 |
+
+## 四、人工干预怎么写
+
+只有 `repair` 仍然输出待人工问题时，才需要写决策文件。先查看问题：
+
+```bash
+rg '"kind":"issue"' quality/issues/20260822-repaired.jsonl
+```
+
+`quality/decisions.jsonl` 每行写一个 JSON 决策。
+
+### 已知正确值：`PATCH`
 
 ```json
 {"issue_id":"daily:daily_ohlc_v1:...","action":"PATCH","expected":{"close":12.0},"values":{"close":10.5},"reason":"交易所历史行情核对"}
 ```
 
-- `issue_id`：从问题行原样复制；
-- `expected`：当前错误值，从问题的 `observed` 中复制；
-- `values`：经人工核对后要写入的正确值；
-- `reason`：记录正确值的核对来源。
+- `issue_id`：从报告原样复制；
+- `expected`：当前错误值，从 `observed` 复制，用作安全锁；
+- `values`：要写入的正确值；
+- `reason`：核对依据。
 
-`expected` 是安全锁。如果采集层已经发生变化，它与当前值不同，补丁就会拒绝应用，
-避免把旧决策误用到新数据上。
-
-### 方式 2：确认这是规则误报，原值正确
+### 确认规则误报：`ACCEPT`
 
 ```json
-{"issue_id":"daily:daily_ohlc_v1:...","action":"ACCEPT","reason":"交易所数据与第二数据源一致，确认为特殊行情"}
+{"issue_id":"daily:daily_ohlc_v1:...","action":"ACCEPT","reason":"交易所与第二数据源一致，确认为特殊行情"}
 ```
 
-`ACCEPT` 只适用于可以解释的业务规则。Manifest、Schema、重复主键、必填值、
-非有限数、空数据集和分区缺口等硬性问题不能用 `ACCEPT` 绕过。
+Manifest、Schema、主键、必填值、非有限数、空数据集和分区缺口等硬性问题
+不能用 `ACCEPT` 绕过。
 
-### 方式 3：暂时无法确认
-
-不写决策即可，发布时该数据集会保持 `UNAVAILABLE`。如果需要显式留下“待重拉”
-的审计记录，可以写：
-
-```json
-{"issue_id":"daily:daily_ohlc_v1:...","action":"REFETCH","reason":"暂无可信数据源，不发布该数据集"}
-```
-
-写完决策后，在发布命令中增加：
+写了决策文件时，在发布命令加上：
 
 ```text
 --decisions quality/decisions.jsonl
 ```
 
-## 常见问题
+无法确认时不写决策即可。该数据集会发布为 `UNAVAILABLE`，不会混入回测。
 
-- `detect` 或 `repair` 退出码是 1：查看摘要中的 `manual`。大于 0 时是正常的检测结果。
-- `repair` 提示没有 token：先执行 `export TUSHARE_TOKEN='你的 token'`。
-- `publish` 提示报告带有 `start`：重新执行不带 `--start` 的全量 `detect` 或 `repair`。
-- `publish` 提示 Manifest 指纹不匹配：原数据在报告生成后被更新了，重新生成全量报告。
-- `publish` 提示版本已存在：发布版本不可覆盖，将 `--release` 改为新名称，例如 `20260822-v2`。
-- 回测提示 `DataSourceUnavailableError`：查看 `release.json` 中该数据集的 `open_issue_ids`，
-  修复后以新的 `--release` 重新发布。
+## 五、常见问题
 
-## 发布门禁
+- `detect` 或 `repair` 退出码是 1：检出了 `MANUAL` 问题，报告已正常生成。
+- `repair` 提示缺少 token：报告包含自动重拉项，设置 `TUSHARE_TOKEN` 后重试。
+- `repair` 或 `publish` 提示 Manifest 指纹不匹配：检测后原数据变了，重新执行 `detect`。
+- `publish` 提示报告带 `start`：使用不带 `--start` 的全量报告。
+- `publish` 提示版本已存在：发布版本不可覆盖，改用新名称，例如 `20260822-v2`。
+- 回测提示 `DataSourceUnavailableError`：查看
+  `dataset/tushare_published/current/release.json` 中该数据集的 `open_issue_ids`。
 
-`release.json` 对每个数据集记录 `AVAILABLE` / `UNAVAILABLE`、行数和未解决
-`issue_id`。`DataCatalog` 初始化时只读取一次该状态：
+## 六、与 `data_crosscheck` 的边界
 
-- 请求依赖的数据集可用：正常扫描 Parquet；
-- 任一实际依赖不可用：立即抛出 `DataSourceUnavailableError`；
-- `adj_factor` 不可用不影响未复权 `daily`，但会阻断前复权查询。
+`data_crosscheck` 抽样比较 Tushare 和 QMT，用于发现两个来源的观测差异；
+`data_cleaning detect` 是对待发布数据的全量、确定性检查。
 
-当前隔离粒度是数据集级，没有静默删行或部分结果。
-
-## 与 `data_crosscheck` 的边界
-
-`data_crosscheck` 抽样比较 Tushare 和 QMT，只证明两个来源的观测是否一致。
-交叉检查差异经语义核对并确认为源数据问题后，再转换为本模块的人工 Issue。
-
-`data_cleaning detect` 是全量、确定性的发布门禁；`data_crosscheck` 是抽样、跨源的
-补充证据，二者不相互替代。
+交叉检查的差异不能直接自动修数据。只有经过语义核对、确认为源数据问题后，
+才转成 `data_cleaning` 的人工 Issue。

@@ -22,6 +22,17 @@
 `config.py` 只是这些部分共用的少量参数；`runner.py` 负责把它们连接起来；`output.py` 可以把结果
 保存下来，但输出不是回测计算的一部分。
 
+### 配置分成三组
+
+| 配置 | 控制什么 | 常用例子 |
+| --- | --- | --- |
+| `BacktestConfig` | 日期、资金、滑点、成交量限制、佣金和基础股票池 | `slippage_bps=5` 表示 0.05% 单边滑点 |
+| `MomentumConfig` | 动量区间、排名比例、持仓数量和目标仓位 | `gross_exposure=0.98` 表示使用 98% 仓位 |
+| `RunOptions` | 数据从哪里读取、结果是否写入文件 | `output_dir=None` 表示不写文件 |
+
+百分比参数都使用小数，`0.10` 表示 10%；只有 `slippage_bps` 使用基点，`1 bps` 表示 0.01%。
+初次阅读可以全部使用默认值，只修改开始日期、结束日期和初始资金。
+
 ## 2. 最小数据流
 
 ```text
@@ -36,18 +47,28 @@
 下一交易日重复
 ```
 
-引擎只接收一个普通函数：
+引擎只接收实现固定接口的策略对象：
 
 ```python
-def strategy(data: SessionData) -> Mapping[str, float] | None:
-    ...
+class Strategy(ABC):
+    @property
+    def history_window(self) -> int:
+        return 1
+
+    @abstractmethod
+    def on_close(self, data: SessionData) -> Mapping[str, float] | None:
+        ...
 ```
 
 - 返回 `None`：今天不调仓；
 - 返回权重字典：这是完整目标组合，未出现的旧持仓目标为零。
 
-没有 Strategy 基类、账户快照、初始化回调、盘前回调、事件总线或命令 Context。当前策略不读取
-账户，因此不为未来可能出现的账户型策略提前建立结构。
+`history_window` 告诉数据层需要保留多少个交易日，`on_close` 是引擎调用策略的唯一入口。具体
+策略如何取历史端点、计算分数和选择股票都封装在策略类中；引擎不依赖这些细节。
+
+接口只固定当前真正需要的两个约定，不增加账户快照、初始化回调、盘前回调、事件总线或命令
+Context。以后增加策略时继承 `Strategy` 并实现 `on_close`；需要多日历史时再覆盖
+`history_window`。
 
 ## 3. 正确性是否足够
 
@@ -119,7 +140,7 @@ def strategy(data: SessionData) -> Mapping[str, float] | None:
 - 下一交易日开盘调仓。
 
 动量收益计算、排序和目标权重位于 `strategies/momentum.py`，不依赖回测，可以原样用于实盘。
-`backtest/strategy.py` 只从已经释放的历史中取出所需端点。
+`backtest/strategy.py` 的 `MonthlyMomentumStrategy` 封装回测数据适配，对引擎只暴露固定接口。
 
 ## 6. 如何运行
 

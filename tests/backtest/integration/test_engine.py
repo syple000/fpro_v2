@@ -8,6 +8,7 @@ import pyarrow as pa
 from backtest.config import BacktestConfig
 from backtest.data import MarketData, SessionData
 from backtest.engine import BacktestEngine
+from backtest.strategy import Strategy
 from market_data import DataCatalog, DataReader, SourceConfig
 from tushare_data import TABLE_SCHEMAS, TushareDataStore
 
@@ -16,12 +17,12 @@ def _table(dataset: str, *rows: dict[str, object]) -> pa.Table:
     return pa.Table.from_pylist(list(rows), schema=TABLE_SCHEMAS[dataset])
 
 
-class OneShotStrategy:
+class OneShotStrategy(Strategy):
     def __init__(self) -> None:
         self.ordered = False
         self.visible_history: list[tuple[int, ...]] = []
 
-    def __call__(self, data: SessionData) -> dict[str, float] | None:
+    def on_close(self, data: SessionData) -> dict[str, float] | None:
         self.visible_history.append(
             tuple(point.session_index for point in data.history("000001.SZ"))
         )

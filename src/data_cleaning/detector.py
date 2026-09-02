@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import math
 from collections import Counter
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import date
 from hashlib import sha256
@@ -15,7 +15,7 @@ from urllib.parse import unquote
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from data_cleaning.models import DetectionReport, Issue
+from data_cleaning.models import CheckResult, DetectionReport, Issue
 from tushare_data.schemas import TABLE_PARTITION_BY, TABLE_PRIMARY_KEY, TABLE_SCHEMAS
 
 _DENSE_MARKET_DATASETS = frozenset(
@@ -33,6 +33,39 @@ _CRITICAL_FLOAT_FIELDS = {
     "stk_limit": frozenset({"pre_close", "up_limit", "down_limit"}),
 }
 
+_COMMON_CHECKS = {
+    "dataset_empty_v1": "数据集不为空",
+    "manifest_v1": "Manifest 格式正确",
+    "manifest_file_missing_v1": "Manifest 引用的文件都存在",
+    "parquet_read_v1": "Parquet 文件可读",
+    "schema_v1": "Parquet Schema 与登记 Schema 一致",
+    "partition_value_v1": "分区路径与记录分区值一致",
+    "duplicate_key_v1": "业务主键不重复",
+    "required_value_v1": "Schema 必填字段不为空",
+    "finite_float_v1": "浮点数不含 NaN 或无穷值",
+}
+
+_MISSING_PARTITION_CHECK = {"missing_market_partition_v1": "不缺已知交易日分区"}
+
+_DATASET_CHECKS = {
+    "daily": {
+        "daily_missing_v1": "行情价格、成交量和成交额完整",
+        "daily_range_v1": "价格为正且成交量额非负",
+        "daily_ohlc_v1": "开高低收关系正确",
+        "daily_close_consistency_v1": "收盘价与涨跌额、涨跌幅一致",
+    },
+    "adj_factor": {"adj_factor_positive_v1": "复权因子为正数"},
+    "stk_limit": {
+        "stk_limit_partition_missing_v1": "整个分区的关键价格不全为空",
+        "stk_limit_missing_v1": "昨收、涨停价和跌停价完整",
+        "stk_limit_order_v1": "跌停价 ≤ 昨收价 ≤ 涨停价",
+    },
+    "trade_cal": {
+        "trade_calendar_value_v1": "交易所代码和开市标记合法",
+        "calendar_exchange_coverage_v1": "每日覆盖 SSE、SZSE 和 BSE",
+    },
+}
+
 
 @dataclass(frozen=True, slots=True)
 class _Partition:
@@ -40,6 +73,9 @@ class _Partition:
     label: str
     value: date | None
     files: tuple[Path, ...]
+
+
+DatasetChecker = Callable[[str, date | None, pa.Table], list[Issue]]
 
 
 def detect(
@@ -116,6 +152,7 @@ def detect(
         start=start,
         datasets=selected,
         row_counts=dict(sorted(row_counts.items())),
+        checks=_check_results(selected, issues, full_history=start is None),
         issues=tuple(issues),
     )
 
@@ -190,74 +227,17 @@ def _detect_dataset(
             partition_date > through or (start is not None and partition_date < start)
         ):
             continue
-        try:
-            partition = _load_partition(manifest, table_root)
-        except (OSError, ValueError, json.JSONDecodeError) as exc:
-            issues.append(
-                Issue.create(
-                    dataset=dataset,
-                    partition=label,
-                    key={"partition": label},
-                    rule_id="manifest_v1",
-                    fix_mode="MANUAL",
-                    observed={"error": str(exc)},
-                    suggested=None,
-                    message=f"{dataset} 分区 Manifest 无法读取",
-                )
-            )
+        partition, manifest_issues = _check_manifest(dataset, manifest, table_root)
+        issues.extend(manifest_issues)
+        if partition is None:
             continue
-        missing_files = [path for path in partition.files if not path.is_file()]
-        if missing_files:
-            issues.append(
-                Issue.create(
-                    dataset=dataset,
-                    partition=label,
-                    key={"partition": label},
-                    rule_id="manifest_file_missing_v1",
-                    fix_mode="MANUAL",
-                    observed={"files": [path.name for path in missing_files]},
-                    suggested=None,
-                    message=f"{dataset} 分区 Manifest 引用的文件不存在",
-                )
-            )
+        missing_file_issues = _check_manifest_files_exist(dataset, partition)
+        issues.extend(missing_file_issues)
+        if missing_file_issues:
             continue
-        tables: list[pa.Table] = []
-        schema_invalid = False
-        for path in partition.files:
-            try:
-                file_schema = pq.ParquetFile(path).schema_arrow
-            except (OSError, pa.ArrowException) as exc:
-                issues.append(
-                    Issue.create(
-                        dataset=dataset,
-                        partition=label,
-                        key={"partition": label, "file": path.name},
-                        rule_id="parquet_read_v1",
-                        fix_mode="MANUAL",
-                        observed={"error": str(exc)},
-                        suggested=None,
-                        message=f"{dataset} Parquet 文件无法读取",
-                    )
-                )
-                schema_invalid = True
-                continue
-            if not file_schema.equals(schema, check_metadata=True):
-                issues.append(
-                    Issue.create(
-                        dataset=dataset,
-                        partition=label,
-                        key={"partition": label, "file": path.name},
-                        rule_id="schema_v1",
-                        fix_mode="MANUAL",
-                        observed={"schema": str(file_schema)},
-                        suggested=None,
-                        message=f"{dataset} Parquet Schema 与登记 Schema 不一致",
-                    )
-                )
-                schema_invalid = True
-                continue
-            tables.append(pq.ParquetFile(path).read())
-        if schema_invalid or not tables:
+        tables, parquet_issues = _check_parquet_files(dataset, partition, schema)
+        issues.extend(parquet_issues)
+        if parquet_issues or not tables:
             continue
         table = pa.concat_tables(tables) if len(tables) > 1 else tables[0]
         row_count += table.num_rows
@@ -265,6 +245,105 @@ def _detect_dataset(
             observed_dates.add(partition.value)
         issues.extend(_check_table(dataset, label, partition.value, table))
     return issues, row_count, observed_dates
+
+
+def _check_manifest(
+    dataset: str,
+    manifest: Path,
+    table_root: Path,
+) -> tuple[_Partition | None, list[Issue]]:
+    """检查并解析一个 Manifest。"""
+    label = _partition_label(table_root, manifest)
+    try:
+        return _load_partition(manifest, table_root), []
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        return None, [
+            Issue.create(
+                dataset=dataset,
+                partition=label,
+                key={"partition": label},
+                rule_id="manifest_v1",
+                fix_mode="MANUAL",
+                observed={"error": str(exc)},
+                suggested=None,
+                message=f"{dataset} 分区 Manifest 无法读取",
+            )
+        ]
+
+
+def _check_manifest_files_exist(dataset: str, partition: _Partition) -> list[Issue]:
+    """检查 Manifest 引用的文件是否全部存在。"""
+    missing_files = [path for path in partition.files if not path.is_file()]
+    if not missing_files:
+        return []
+    return [
+        Issue.create(
+            dataset=dataset,
+            partition=partition.label,
+            key={"partition": partition.label},
+            rule_id="manifest_file_missing_v1",
+            fix_mode="MANUAL",
+            observed={"files": [path.name for path in missing_files]},
+            suggested=None,
+            message=f"{dataset} 分区 Manifest 引用的文件不存在",
+        )
+    ]
+
+
+def _check_parquet_files(
+    dataset: str,
+    partition: _Partition,
+    expected_schema: pa.Schema,
+) -> tuple[list[pa.Table], list[Issue]]:
+    """逐文件检查 Parquet 可读性和 Schema。"""
+    tables: list[pa.Table] = []
+    issues: list[Issue] = []
+    for path in partition.files:
+        try:
+            parquet = pq.ParquetFile(path)
+            table = parquet.read()
+        except (OSError, pa.ArrowException) as exc:
+            issues.append(
+                Issue.create(
+                    dataset=dataset,
+                    partition=partition.label,
+                    key={"partition": partition.label, "file": path.name},
+                    rule_id="parquet_read_v1",
+                    fix_mode="MANUAL",
+                    observed={"error": str(exc)},
+                    suggested=None,
+                    message=f"{dataset} Parquet 文件无法读取",
+                )
+            )
+            continue
+        schema_issue = _check_parquet_schema(dataset, partition, path, parquet, expected_schema)
+        if schema_issue is not None:
+            issues.append(schema_issue)
+            continue
+        tables.append(table)
+    return tables, issues
+
+
+def _check_parquet_schema(
+    dataset: str,
+    partition: _Partition,
+    path: Path,
+    parquet: pq.ParquetFile,
+    expected_schema: pa.Schema,
+) -> Issue | None:
+    """检查一个 Parquet 文件的 Schema。"""
+    if parquet.schema_arrow.equals(expected_schema, check_metadata=True):
+        return None
+    return Issue.create(
+        dataset=dataset,
+        partition=partition.label,
+        key={"partition": partition.label, "file": path.name},
+        rule_id="schema_v1",
+        fix_mode="MANUAL",
+        observed={"schema": str(parquet.schema_arrow)},
+        suggested=None,
+        message=f"{dataset} Parquet Schema 与登记 Schema 不一致",
+    )
 
 
 def _load_partition(manifest: Path, table_root: Path) -> _Partition:
@@ -295,18 +374,28 @@ def _check_table(
     partition_date: date | None,
     table: pa.Table,
 ) -> list[Issue]:
-    schema = TABLE_SCHEMAS[dataset]
-    partition_field = TABLE_PARTITION_BY[dataset]
-    primary_key = (partition_field, *TABLE_PRIMARY_KEY[dataset])
-    rows = table.to_pylist()
-    issues: list[Issue] = []
-    skip_stk_limit_rows = False
+    """按固定顺序执行通用检查，再执行该数据集的专有检查。"""
+    issues = _check_partition_values(dataset, partition, partition_date, table)
+    issues.extend(_check_duplicate_primary_keys(dataset, partition, partition_date, table))
+    issues.extend(_check_required_values(dataset, partition, partition_date, table))
+    issues.extend(_check_finite_floats(dataset, partition, partition_date, table))
+    issues.extend(_DATASET_CHECKERS[dataset](partition, partition_date, table))
+    return issues
 
-    partition_values = {row[partition_field] for row in rows}
+
+def _check_partition_values(
+    dataset: str,
+    partition: str,
+    partition_date: date | None,
+    table: pa.Table,
+) -> list[Issue]:
+    """检查分区路径与每行的分区字段是否一致。"""
+    partition_field = TABLE_PARTITION_BY[dataset]
+    partition_values = {row[partition_field] for row in table.to_pylist()}
     if None in partition_values or (
         partition_date is not None and partition_values != {partition_date}
     ):
-        issues.append(
+        return [
             Issue.create(
                 dataset=dataset,
                 partition=partition,
@@ -317,9 +406,21 @@ def _check_table(
                 suggested=None,
                 message=f"{dataset} 分区路径与记录 {partition_field} 不一致",
             )
-        )
+        ]
+    return []
 
+
+def _check_duplicate_primary_keys(
+    dataset: str,
+    partition: str,
+    partition_date: date | None,
+    table: pa.Table,
+) -> list[Issue]:
+    """检查分区内的业务主键是否重复。"""
+    primary_key = (TABLE_PARTITION_BY[dataset], *TABLE_PRIMARY_KEY[dataset])
+    rows = table.to_pylist()
     counts = Counter(tuple(row[name] for name in primary_key) for row in rows)
+    issues: list[Issue] = []
     for values, count in sorted(counts.items(), key=lambda item: str(item[0])):
         if count <= 1:
             continue
@@ -336,30 +437,20 @@ def _check_table(
                 message=f"{dataset} 业务主键重复",
             )
         )
+    return issues
 
-    if dataset == "stk_limit" and table.num_rows:
-        all_null = [
-            name
-            for name in ("pre_close", "up_limit", "down_limit")
-            if table.column(name).null_count == table.num_rows
-        ]
-        if all_null:
-            skip_stk_limit_rows = True
-            issues.append(
-                Issue.create(
-                    dataset=dataset,
-                    partition=partition,
-                    key={partition_field: partition_date},
-                    rule_id="stk_limit_partition_missing_v1",
-                    fix_mode="MANUAL",
-                    observed={"all_null_fields": all_null, "row_count": table.num_rows},
-                    suggested=_refetch(partition_date) if partition_date else None,
-                    message=f"stk_limit 整个分区的关键字段为空: {all_null}",
-                )
-            )
 
+def _check_required_values(
+    dataset: str,
+    partition: str,
+    partition_date: date | None,
+    table: pa.Table,
+) -> list[Issue]:
+    """检查 Schema 中标记为必填的字段。"""
+    schema = TABLE_SCHEMAS[dataset]
     required = [field.name for field in schema if not field.nullable]
-    for row in rows:
+    issues: list[Issue] = []
+    for row in table.to_pylist():
         key = _row_key(dataset, row)
         missing = [name for name in required if row[name] is None]
         if missing:
@@ -375,6 +466,20 @@ def _check_table(
                     message=f"{dataset} 必填字段为空: {missing}",
                 )
             )
+    return issues
+
+
+def _check_finite_floats(
+    dataset: str,
+    partition: str,
+    partition_date: date | None,
+    table: pa.Table,
+) -> list[Issue]:
+    """检查所有浮点字段是否包含 NaN 或无穷值。"""
+    schema = TABLE_SCHEMAS[dataset]
+    issues: list[Issue] = []
+    for row in table.to_pylist():
+        key = _row_key(dataset, row)
         for field in schema:
             value = row[field.name]
             if (
@@ -399,16 +504,164 @@ def _check_table(
                         message=f"{dataset}.{field.name} 包含非有限浮点数",
                     )
                 )
-        if not (dataset == "stk_limit" and skip_stk_limit_rows):
-            issues.extend(_business_rules(dataset, partition, partition_date, row, key))
+    return issues
 
-    if dataset == "trade_cal" and partition_date is not None:
-        exchanges = {row["exchange"] for row in rows}
-        missing = sorted(_EXCHANGES - exchanges)
+
+def check_daily(
+    partition: str,
+    partition_date: date | None,
+    table: pa.Table,
+) -> list[Issue]:
+    """检查 daily：完整性、数值范围、OHLC 关系和收盘价一致性。"""
+    issues: list[Issue] = []
+    for row in table.to_pylist():
+        key = _row_key("daily", row)
+        refetch = _suggested_refetch("daily", row, partition_date)
+        required = ("open", "high", "low", "close", "pre_close", "vol", "amount")
+        missing = [name for name in required if row[name] is None]
+        if missing:
+            issues.append(
+                _manual("daily", partition, key, "daily_missing_v1", row, missing, refetch)
+            )
+            continue
+        if not all(_finite_number(row[name]) for name in required):
+            continue
+        open_, high, low, close, pre_close, volume, amount = (
+            _number(row[name]) for name in required
+        )
+        range_invalid = min(open_, high, low, close, pre_close) <= 0 or volume < 0 or amount < 0
+        if range_invalid:
+            issues.append(
+                _manual("daily", partition, key, "daily_range_v1", row, required, refetch)
+            )
+        elif high < max(open_, low, close) or low > min(open_, high, close):
+            issues.append(
+                _manual("daily", partition, key, "daily_ohlc_v1", row, required[:4], refetch)
+            )
+        change = row["change"]
+        pct_chg = row["pct_chg"]
+        if not (_finite_number(change) and _finite_number(pct_chg)):
+            continue
+        from_change = round(pre_close + _number(change), 2)
+        from_pct = pre_close * (1 + _number(pct_chg) / 100)
+        if (
+            math.isclose(from_change, from_pct, abs_tol=0.0051)
+            and not math.isclose(close, from_change, abs_tol=0.0051)
+            and low <= from_change <= high
+        ):
+            issues.append(
+                Issue.create(
+                    dataset="daily",
+                    partition=partition,
+                    key=key,
+                    rule_id="daily_close_consistency_v1",
+                    fix_mode="AUTO_FIX",
+                    observed={
+                        "close": close,
+                        "pre_close": pre_close,
+                        "change": change,
+                        "pct_chg": pct_chg,
+                    },
+                    suggested={"values": {"close": from_change}},
+                    message="close 与 change/pct_chg 不一致，两个独立字段指向同一修正值",
+                )
+            )
+    return issues
+
+
+def check_adj_factor(
+    partition: str,
+    partition_date: date | None,
+    table: pa.Table,
+) -> list[Issue]:
+    """检查 adj_factor：复权因子必须为正数。"""
+    issues: list[Issue] = []
+    for row in table.to_pylist():
+        value = row["adj_factor"]
+        if value is None or (_finite_number(value) and _number(value) <= 0):
+            issues.append(
+                _manual(
+                    "adj_factor",
+                    partition,
+                    _row_key("adj_factor", row),
+                    "adj_factor_positive_v1",
+                    row,
+                    ("adj_factor",),
+                    _suggested_refetch("adj_factor", row, partition_date),
+                )
+            )
+    return issues
+
+
+def check_stk_limit(
+    partition: str,
+    partition_date: date | None,
+    table: pa.Table,
+) -> list[Issue]:
+    """检查 stk_limit：关键价格完整且涨跌停顺序正确。"""
+    fields = ("pre_close", "up_limit", "down_limit")
+    all_null = [
+        name
+        for name in fields
+        if table.num_rows and table.column(name).null_count == table.num_rows
+    ]
+    if all_null:
+        return [
+            Issue.create(
+                dataset="stk_limit",
+                partition=partition,
+                key={"trade_date": partition_date},
+                rule_id="stk_limit_partition_missing_v1",
+                fix_mode="MANUAL",
+                observed={"all_null_fields": all_null, "row_count": table.num_rows},
+                suggested=_refetch(partition_date) if partition_date else None,
+                message=f"stk_limit 整个分区的关键字段为空: {all_null}",
+            )
+        ]
+    issues: list[Issue] = []
+    for row in table.to_pylist():
+        key = _row_key("stk_limit", row)
+        refetch = _suggested_refetch("stk_limit", row, partition_date)
+        if any(row[name] is None for name in fields):
+            issues.append(
+                _manual("stk_limit", partition, key, "stk_limit_missing_v1", row, fields, refetch)
+            )
+        elif all(_finite_number(row[name]) for name in fields):
+            pre_close, up_limit, down_limit = (_number(row[name]) for name in fields)
+            if down_limit <= 0 or not down_limit <= pre_close <= up_limit:
+                issues.append(
+                    _manual("stk_limit", partition, key, "stk_limit_order_v1", row, fields, refetch)
+                )
+    return issues
+
+
+def check_trade_cal(
+    partition: str,
+    partition_date: date | None,
+    table: pa.Table,
+) -> list[Issue]:
+    """检查 trade_cal：交易所、开市标记和三市覆盖完整。"""
+    issues: list[Issue] = []
+    rows = table.to_pylist()
+    for row in rows:
+        if row["exchange"] not in _EXCHANGES or row["is_open"] not in {0, 1}:
+            issues.append(
+                _manual(
+                    "trade_cal",
+                    partition,
+                    _row_key("trade_cal", row),
+                    "trade_calendar_value_v1",
+                    row,
+                    ("exchange", "is_open"),
+                    _suggested_refetch("trade_cal", row, partition_date),
+                )
+            )
+    if partition_date is not None:
+        missing = sorted(_EXCHANGES - {row["exchange"] for row in rows})
         if missing:
             issues.append(
                 Issue.create(
-                    dataset=dataset,
+                    dataset="trade_cal",
                     partition=partition,
                     key={"cal_date": partition_date},
                     rule_id="calendar_exchange_coverage_v1",
@@ -421,95 +674,98 @@ def _check_table(
     return issues
 
 
-def _business_rules(
-    dataset: str,
-    partition: str,
-    partition_date: date | None,
-    row: Mapping[str, object],
-    key: Mapping[str, object],
+def check_stock_basic(partition: str, partition_date: date | None, table: pa.Table) -> list[Issue]:
+    """检查 stock_basic：当前只执行通用检查。"""
+    return []
+
+
+def check_daily_basic(partition: str, partition_date: date | None, table: pa.Table) -> list[Issue]:
+    """检查 daily_basic：当前只执行通用检查。"""
+    return []
+
+
+def check_suspend_d(partition: str, partition_date: date | None, table: pa.Table) -> list[Issue]:
+    """检查 suspend_d：当前只执行通用检查。"""
+    return []
+
+
+def check_stock_st(partition: str, partition_date: date | None, table: pa.Table) -> list[Issue]:
+    """检查 stock_st：当前只执行通用检查。"""
+    return []
+
+
+def check_moneyflow(partition: str, partition_date: date | None, table: pa.Table) -> list[Issue]:
+    """检查 moneyflow：当前只执行通用检查。"""
+    return []
+
+
+def check_dividend(partition: str, partition_date: date | None, table: pa.Table) -> list[Issue]:
+    """检查 dividend：当前只执行通用检查。"""
+    return []
+
+
+def check_forecast(partition: str, partition_date: date | None, table: pa.Table) -> list[Issue]:
+    """检查 forecast：当前只执行通用检查。"""
+    return []
+
+
+def check_express(partition: str, partition_date: date | None, table: pa.Table) -> list[Issue]:
+    """检查 express：当前只执行通用检查。"""
+    return []
+
+
+def check_fina_audit(partition: str, partition_date: date | None, table: pa.Table) -> list[Issue]:
+    """检查 fina_audit：当前只执行通用检查。"""
+    return []
+
+
+def check_income(partition: str, partition_date: date | None, table: pa.Table) -> list[Issue]:
+    """检查 income：当前只执行通用检查。"""
+    return []
+
+
+def check_balancesheet(partition: str, partition_date: date | None, table: pa.Table) -> list[Issue]:
+    """检查 balancesheet：当前只执行通用检查。"""
+    return []
+
+
+def check_cashflow(partition: str, partition_date: date | None, table: pa.Table) -> list[Issue]:
+    """检查 cashflow：当前只执行通用检查。"""
+    return []
+
+
+def check_fina_indicator(
+    partition: str, partition_date: date | None, table: pa.Table
 ) -> list[Issue]:
-    issues: list[Issue] = []
-    refetch = _suggested_refetch(dataset, row, partition_date)
-    if dataset == "daily":
-        required = ("open", "high", "low", "close", "pre_close", "vol", "amount")
-        missing = [name for name in required if row[name] is None]
-        if missing:
-            issues.append(
-                _manual(dataset, partition, key, "daily_missing_v1", row, missing, refetch)
-            )
-        elif all(_finite_number(row[name]) for name in required):
-            open_, high, low, close, pre_close, volume, amount = (
-                _number(row[name]) for name in required
-            )
-            if min(open_, high, low, close, pre_close) <= 0 or volume < 0 or amount < 0:
-                issues.append(
-                    _manual(dataset, partition, key, "daily_range_v1", row, required, refetch)
-                )
-            elif high < max(open_, low, close) or low > min(open_, high, close):
-                issues.append(
-                    _manual(dataset, partition, key, "daily_ohlc_v1", row, required[:4], refetch)
-                )
-            change = row["change"]
-            pct_chg = row["pct_chg"]
-            if _finite_number(change) and _finite_number(pct_chg):
-                from_change = round(pre_close + _number(change), 2)
-                from_pct = pre_close * (1 + _number(pct_chg) / 100)
-                if (
-                    math.isclose(from_change, from_pct, abs_tol=0.0051)
-                    and not math.isclose(close, from_change, abs_tol=0.0051)
-                    and low <= from_change <= high
-                ):
-                    issues.append(
-                        Issue.create(
-                            dataset=dataset,
-                            partition=partition,
-                            key=key,
-                            rule_id="daily_close_consistency_v1",
-                            fix_mode="AUTO_FIX",
-                            observed={
-                                "close": close,
-                                "pre_close": pre_close,
-                                "change": change,
-                                "pct_chg": pct_chg,
-                            },
-                            suggested={"values": {"close": from_change}},
-                            message="close 与 change/pct_chg 不一致，两个独立字段指向同一修正值",
-                        )
-                    )
-    elif dataset == "adj_factor":
-        value = row["adj_factor"]
-        if value is None or (_finite_number(value) and _number(value) <= 0):
-            issues.append(
-                _manual(
-                    dataset, partition, key, "adj_factor_positive_v1", row, ("adj_factor",), refetch
-                )
-            )
-    elif dataset == "stk_limit":
-        fields = ("pre_close", "up_limit", "down_limit")
-        if any(row[name] is None for name in fields):
-            issues.append(
-                _manual(dataset, partition, key, "stk_limit_missing_v1", row, fields, refetch)
-            )
-        elif all(_finite_number(row[name]) for name in fields):
-            pre_close, up_limit, down_limit = (_number(row[name]) for name in fields)
-            if down_limit <= 0 or not down_limit <= pre_close <= up_limit:
-                issues.append(
-                    _manual(dataset, partition, key, "stk_limit_order_v1", row, fields, refetch)
-                )
-    elif dataset == "trade_cal":
-        if row["exchange"] not in _EXCHANGES or row["is_open"] not in {0, 1}:
-            issues.append(
-                _manual(
-                    dataset,
-                    partition,
-                    key,
-                    "trade_calendar_value_v1",
-                    row,
-                    ("exchange", "is_open"),
-                    refetch,
-                )
-            )
-    return issues
+    """检查 fina_indicator：当前只执行通用检查。"""
+    return []
+
+
+def check_sw_industry(partition: str, partition_date: date | None, table: pa.Table) -> list[Issue]:
+    """检查 sw_industry：当前只执行通用检查。"""
+    return []
+
+
+_DATASET_CHECKERS: dict[str, DatasetChecker] = {
+    "stock_basic": check_stock_basic,
+    "daily": check_daily,
+    "daily_basic": check_daily_basic,
+    "adj_factor": check_adj_factor,
+    "suspend_d": check_suspend_d,
+    "stk_limit": check_stk_limit,
+    "stock_st": check_stock_st,
+    "moneyflow": check_moneyflow,
+    "dividend": check_dividend,
+    "forecast": check_forecast,
+    "express": check_express,
+    "fina_audit": check_fina_audit,
+    "income": check_income,
+    "balancesheet": check_balancesheet,
+    "cashflow": check_cashflow,
+    "fina_indicator": check_fina_indicator,
+    "sw_industry": check_sw_industry,
+    "trade_cal": check_trade_cal,
+}
 
 
 def _manual(
@@ -638,3 +894,33 @@ def _issue_sort_key(issue: Issue) -> tuple[str, str, str, str]:
         json.dumps(issue.key, sort_keys=True),
         issue.rule_id,
     )
+
+
+def _check_results(
+    datasets: Iterable[str],
+    issues: Iterable[Issue],
+    *,
+    full_history: bool,
+) -> tuple[CheckResult, ...]:
+    """为每个数据集的每个检查项生成 PASS/FAIL 结果。"""
+    counts = Counter((issue.dataset, issue.rule_id) for issue in issues)
+    results: list[CheckResult] = []
+    for dataset in datasets:
+        definitions = dict(_COMMON_CHECKS)
+        if not full_history:
+            definitions.pop("dataset_empty_v1")
+        if dataset in _DENSE_MARKET_DATASETS:
+            definitions.update(_MISSING_PARTITION_CHECK)
+        definitions.update(_DATASET_CHECKS.get(dataset, {}))
+        for check_id, description in definitions.items():
+            issue_count = counts[(dataset, check_id)]
+            results.append(
+                CheckResult(
+                    dataset=dataset,
+                    check_id=check_id,
+                    description=description,
+                    status="FAIL" if issue_count else "PASS",
+                    issue_count=issue_count,
+                )
+            )
+    return tuple(results)

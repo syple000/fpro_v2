@@ -15,6 +15,7 @@ from uuid import uuid4
 
 FixMode = Literal["AUTO_FIX", "MANUAL"]
 DecisionAction = Literal["PATCH", "REFETCH", "ACCEPT"]
+CheckStatus = Literal["PASS", "FAIL"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -72,12 +73,24 @@ class Decision:
 
 
 @dataclass(frozen=True, slots=True)
+class CheckResult:
+    """一个明确检查项在一个数据集上的执行结果。"""
+
+    dataset: str
+    check_id: str
+    description: str
+    status: CheckStatus
+    issue_count: int
+
+
+@dataclass(frozen=True, slots=True)
 class DetectionReport:
     input_fingerprint: str
     through: date
     start: date | None
     datasets: tuple[str, ...]
     row_counts: Mapping[str, int]
+    checks: tuple[CheckResult, ...]
     issues: tuple[Issue, ...]
 
     @property
@@ -91,7 +104,7 @@ def write_report(report: DetectionReport, path: str | Path) -> None:
         _json_text(
             {
                 "kind": "report",
-                "version": 1,
+                "version": 2,
                 "input_fingerprint": report.input_fingerprint,
                 "through": report.through,
                 "start": report.start,
@@ -100,6 +113,7 @@ def write_report(report: DetectionReport, path: str | Path) -> None:
             }
         )
     ]
+    lines.extend(_json_text({"kind": "check", **asdict(check)}) for check in report.checks)
     lines.extend(_json_text({"kind": "issue", **asdict(issue)}) for issue in report.issues)
     _atomic_write(destination, "\n".join(lines) + "\n")
 
@@ -107,10 +121,11 @@ def write_report(report: DetectionReport, path: str | Path) -> None:
 def read_report(path: str | Path) -> DetectionReport:
     source = Path(path)
     records = [json.loads(line) for line in source.read_text(encoding="utf-8").splitlines() if line]
-    if not records or records[0].get("kind") != "report" or records[0].get("version") != 1:
+    if not records or records[0].get("kind") != "report" or records[0].get("version") not in {1, 2}:
         raise ValueError(f"问题报告格式无效: {source}")
     header = records[0]
-    issues = tuple(_issue_from_json(item) for item in records[1:])
+    checks = tuple(_check_from_json(item) for item in records[1:] if item.get("kind") == "check")
+    issues = tuple(_issue_from_json(item) for item in records[1:] if item.get("kind") == "issue")
     try:
         return DetectionReport(
             input_fingerprint=str(header["input_fingerprint"]),
@@ -118,6 +133,7 @@ def read_report(path: str | Path) -> DetectionReport:
             start=(date.fromisoformat(header["start"]) if header.get("start") else None),
             datasets=tuple(header["datasets"]),
             row_counts={str(key): int(value) for key, value in header["row_counts"].items()},
+            checks=checks,
             issues=issues,
         )
     except (KeyError, TypeError, ValueError) as exc:
@@ -168,6 +184,22 @@ def _issue_from_json(payload: Mapping[str, Any]) -> Issue:
         suggested=None if payload.get("suggested") is None else dict(payload["suggested"]),
         message=str(payload["message"]),
     )
+
+
+def _check_from_json(payload: Mapping[str, Any]) -> CheckResult:
+    try:
+        status = payload["status"]
+        if status not in {"PASS", "FAIL"}:
+            raise ValueError("status 无效")
+        return CheckResult(
+            dataset=str(payload["dataset"]),
+            check_id=str(payload["check_id"]),
+            description=str(payload["description"]),
+            status=status,
+            issue_count=int(payload["issue_count"]),
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("问题报告包含无效检查结果") from exc
 
 
 def _json_text(value: object) -> str:
