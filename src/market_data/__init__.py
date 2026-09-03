@@ -12,13 +12,12 @@ from market_data.errors import (
 )
 from market_data.protocols import DataAdapter
 from market_data.reader import ALL_SYMBOLS, DataReader, DataView
-from models import DataCapability, QueryResult
+from models import QueryResult
 
 __all__ = [
     "ALL_SYMBOLS",
     "DataAdapterError",
     "DataAdapter",
-    "DataCapability",
     "DataCapabilityNotSupportedError",
     "DataCatalog",
     "DataReader",

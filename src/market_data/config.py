@@ -6,9 +6,9 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
 
-from models import DataCapability
+from models import ROUTE_SCHEMAS
 
-KNOWN_ROUTES = frozenset(item.value for item in DataCapability)
+KNOWN_ROUTES = frozenset(ROUTE_SCHEMAS)
 
 
 @dataclass(frozen=True, slots=True)

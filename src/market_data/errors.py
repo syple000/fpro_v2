@@ -14,7 +14,7 @@ class DataCapabilityNotSupportedError(DataReaderError):
 
 
 class DataSourceUnavailableError(DataReaderError):
-    """已发布的数据当前不可访问。"""
+    """数据未通过质量门禁或当前不可访问。"""
 
 
 class DataResultTooLargeError(DataReaderError):

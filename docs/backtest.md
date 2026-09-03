@@ -56,8 +56,7 @@ class Strategy(ABC):
         return 1
 
     @abstractmethod
-    def on_close(self, data: SessionData) -> Mapping[str, float] | None:
-        ...
+    def on_close(self, data: SessionData) -> Mapping[str, float] | None: ...
 ```
 
 - 返回 `None`：今天不调仓；
@@ -150,13 +149,12 @@ Context。以后增加策略时继承 `Strategy` 并实现 `on_close`；需要�
 uv run --group backtest backtest-momentum \
   --start 2017-01-01 \
   --end 2026-08-22 \
-  --tushare-dir dataset/tushare_published/current \
+  --tushare-dir dataset/tushare \
   --qmt-dir dataset/qmt
 ```
 
-`dataset/tushare_published/current` 是通过数据清洗和发布门禁的当前版本。
-正式回测不应直接读取采集层 `dataset/tushare`，完整用法见
-[`data_cleaning`](data_cleaning.md)。
+`dataset/tushare` 是检测和可回滚修复后的唯一数据目录；不再需要发布版本切换。
+完整用法见 [`data_cleaning`](data_cleaning.md)。
 
 需要保存结果时，显式指定一个尚不存在的目录：
 
@@ -164,7 +162,7 @@ uv run --group backtest backtest-momentum \
 uv run --group backtest backtest-momentum \
   --start 2017-01-01 \
   --end 2026-08-22 \
-  --tushare-dir dataset/tushare_published/current \
+  --tushare-dir dataset/tushare \
   --qmt-dir dataset/qmt \
   --output-dir runs/my-first-backtest
 ```

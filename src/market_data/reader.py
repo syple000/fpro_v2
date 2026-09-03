@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from datetime import date, datetime, time, timedelta
 from typing import Literal, cast
 from zoneinfo import ZoneInfo
@@ -16,13 +16,11 @@ from market_data.catalog import DataCatalog
 from market_data.config import SourceConfig
 from market_data.errors import (
     DataAdapterError,
-    DataCapabilityNotSupportedError,
     DataResultTooLargeError,
     DataSourceNotConfiguredError,
-    DataSourceUnavailableError,
 )
 from market_data.protocols import DataAdapter
-from models import CAPABILITY_SCHEMAS, STATUS_SCHEMA, DataCapability, QueryResult
+from models import ROUTE_SCHEMAS, STATUS_SCHEMA, QueryResult
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 SUPPORTED_FREQUENCIES = frozenset({"1m", "5m", "15m", "30m", "60m", "1d"})
@@ -40,37 +38,6 @@ ALL_SYMBOLS = _AllSymbols()
 Symbols = Sequence[str] | _AllSymbols
 SortDirection = Literal["ascending", "descending"]
 CompanyType = Literal["industrial", "bank", "insurance", "securities"]
-AdapterQuery = Callable[..., pa.Table]
-
-_CAPABILITY_METHODS: Mapping[DataCapability, tuple[str, ...]] = {
-    DataCapability.DAILY_BARS: ("daily_bars",),
-    DataCapability.INTRADAY_BARS: ("intraday_bars",),
-    DataCapability.REALTIME_QUOTES: ("current",),
-    DataCapability.DAILY_METRICS: ("daily_metrics",),
-    DataCapability.MONEYFLOW: ("moneyflow",),
-    DataCapability.SUSPENSIONS: ("suspensions",),
-    DataCapability.PRICE_LIMITS: ("price_limits",),
-    DataCapability.ST_STATUS: ("st_status",),
-    DataCapability.INCOME: ("statements",),
-    DataCapability.BALANCE_SHEET: ("statements",),
-    DataCapability.CASHFLOW: ("statements",),
-    DataCapability.INDICATORS: ("financial_indicators",),
-    DataCapability.FORECAST: ("disclosures",),
-    DataCapability.EXPRESS: ("disclosures",),
-    DataCapability.AUDIT: ("disclosures",),
-    DataCapability.DIVIDENDS: ("dividends",),
-    DataCapability.ADJUSTMENT_FACTORS: ("adjustment_factors",),
-    DataCapability.INDUSTRY: ("industry",),
-    DataCapability.STOCKS: ("stocks",),
-    DataCapability.SESSIONS: ("sessions", "previous_session"),
-}
-
-
-def _adapter_method(adapter: DataAdapter, route: str, name: str) -> AdapterQuery:
-    method = getattr(adapter, name, None)
-    if not callable(method):
-        raise DataCapabilityNotSupportedError(f"路由 {route!r} 的来源没有实现适配器方法 {name!r}")
-    return cast(AdapterQuery, method)
 
 
 class DataReader:
@@ -90,10 +57,7 @@ class DataReader:
             or max_result_rows < 1
         ):
             raise ValueError("max_result_rows 必须是正整数")
-        registered_adapters: dict[str, DataAdapter] = {
-            "tushare": TushareAdapter(catalog),
-            "qmt": QmtAdapter(catalog),
-        }
+        custom_adapters: dict[str, DataAdapter] = {}
         if adapters is not None:
             if not isinstance(adapters, Mapping):
                 raise TypeError("adapters 必须是 source_id 到 DataAdapter 的映射")
@@ -101,42 +65,29 @@ class DataReader:
                 if not isinstance(source_id, str) or not source_id.strip():
                     raise ValueError("adapters 的 source_id 必须是非空字符串")
                 normalized_source_id = source_id.strip()
-                if normalized_source_id in registered_adapters:
+                if normalized_source_id in {"tushare", "qmt"}:
                     raise ValueError(f"数据来源 {normalized_source_id!r} 已注册")
-                registered_adapters[normalized_source_id] = adapter
+                if not isinstance(adapter, DataAdapter):
+                    raise TypeError("自定义 adapter 必须继承 DataAdapter")
+                custom_adapters[normalized_source_id] = adapter
 
         for route, source_id in sources.routes.items():
-            adapter = registered_adapters.get(source_id)
-            if adapter is None:
+            if source_id not in {"tushare", "qmt"} and source_id not in custom_adapters:
                 raise DataSourceNotConfiguredError(f"路由 {route!r} 配置了未注册来源 {source_id!r}")
-            capability = DataCapability(route)
-            try:
-                capabilities = adapter.capabilities
-            except AttributeError:
-                raise DataCapabilityNotSupportedError(
-                    f"来源 {source_id!r} 未声明 capabilities"
-                ) from None
-            if capability not in capabilities:
-                raise DataCapabilityNotSupportedError(f"来源 {source_id!r} 不支持路由 {route!r}")
-            missing_methods = [
-                name
-                for name in _CAPABILITY_METHODS[capability]
-                if not callable(getattr(adapter, name, None))
-            ]
-            if missing_methods:
-                raise DataCapabilityNotSupportedError(
-                    f"来源 {source_id!r} 声明支持路由 {route!r}，但缺少适配器方法 {missing_methods}"
-                )
 
         self._sources = sources
-        self._adapters = registered_adapters
+        self._tushare_adapter = TushareAdapter(catalog)
+        self._qmt_adapter = QmtAdapter(catalog)
+        self._custom_adapters = custom_adapters
         self._max_result_rows = max_result_rows
 
     def at(self, as_of: datetime) -> DataView:
         """创建绑定带时区具体时间的数据视图。"""
         return DataView(
             as_of=_aware_datetime(as_of, "as_of"),
-            adapters=self._adapters,
+            tushare_adapter=self._tushare_adapter,
+            qmt_adapter=self._qmt_adapter,
+            custom_adapters=self._custom_adapters,
             source_config=self._sources,
             max_result_rows=self._max_result_rows,
         )
@@ -153,7 +104,9 @@ class DataView:
         "classification",
         "reference",
         "calendar",
-        "_adapters",
+        "_tushare_adapter",
+        "_qmt_adapter",
+        "_custom_adapters",
         "_source_config",
         "_max_result_rows",
     )
@@ -162,12 +115,16 @@ class DataView:
         self,
         *,
         as_of: datetime,
-        adapters: Mapping[str, DataAdapter],
+        tushare_adapter: TushareAdapter,
+        qmt_adapter: QmtAdapter,
+        custom_adapters: Mapping[str, DataAdapter],
         source_config: SourceConfig,
         max_result_rows: int,
     ) -> None:
         self._as_of = as_of
-        self._adapters = adapters
+        self._tushare_adapter = tushare_adapter
+        self._qmt_adapter = qmt_adapter
+        self._custom_adapters = custom_adapters
         self._source_config = source_config
         self._max_result_rows = max_result_rows
         self.market = MarketReader(self)
@@ -181,37 +138,26 @@ class DataView:
     def as_of(self) -> datetime:
         return self._as_of
 
-    def _read(
-        self,
-        route: str,
-        *,
-        query: Callable[[DataAdapter], pa.Table],
-        columns: tuple[str, ...] | None = None,
-    ) -> tuple[pa.Table, str]:
+    def _source(self, route: str) -> str:
         source_id = self._source_config.routes.get(route)
         if source_id is None:
             raise DataSourceNotConfiguredError(f"逻辑数据集 {route!r} 未配置来源") from None
-        adapter = self._adapters[source_id]
-        try:
-            require_available = getattr(adapter, "require_available", None)
-            if callable(require_available):
-                require_available(DataCapability(route))
-            table = query(adapter)
-        except (
-            DataCapabilityNotSupportedError,
-            DataSourceUnavailableError,
-            DataAdapterError,
-        ):
-            raise
-        except Exception as exc:
-            raise DataAdapterError(f"来源 {source_id!r} 读取 {route!r} 失败") from exc
+        return source_id
+
+    def _validate_table(
+        self,
+        route: str,
+        source_id: str,
+        table: pa.Table,
+        columns: tuple[str, ...] | None = None,
+    ) -> pa.Table:
         if not isinstance(table, pa.Table):
             raise DataAdapterError(f"来源 {source_id!r} 未返回 pyarrow.Table")
-        expected_schema = CAPABILITY_SCHEMAS[DataCapability(route)]
+        expected_schema = ROUTE_SCHEMAS[route]
         if columns is not None:
             expected_schema = pa.schema(expected_schema.field(name) for name in columns)
         _exact_schema(table, expected_schema, route)
-        return table, source_id
+        return table
 
     def _result(
         self,
@@ -292,10 +238,10 @@ class MarketReader:
         identity = ("symbol", "interval_start", "interval_end")
         selected, columns = _projection(route, identity, fields)
         fetch_limit = self._data._max_result_rows + 1
+        source = self._data._source(route)
         if frequency == "1d":
-            table, source = self._data._read(
-                route,
-                query=lambda adapter: _adapter_method(adapter, route, "daily_bars")(
+            if source == "tushare":
+                table = self._data._tushare_adapter.daily_bars(
                     as_of=self._data.as_of,
                     symbols=normalized_symbols,
                     start=normalized_start,
@@ -305,13 +251,34 @@ class MarketReader:
                     order=order,
                     fetch_limit=fetch_limit,
                     columns=columns,
-                ),
-                columns=columns,
-            )
+                )
+            elif source == "qmt":
+                table = self._data._qmt_adapter.daily_bars(
+                    as_of=self._data.as_of,
+                    symbols=normalized_symbols,
+                    start=normalized_start,
+                    end=normalized_end,
+                    count=count,
+                    adjustment=adjustment,
+                    order=order,
+                    fetch_limit=fetch_limit,
+                    columns=columns,
+                )
+            else:
+                table = self._data._custom_adapters[source].daily_bars(
+                    as_of=self._data.as_of,
+                    symbols=normalized_symbols,
+                    start=normalized_start,
+                    end=normalized_end,
+                    count=count,
+                    adjustment=adjustment,
+                    order=order,
+                    fetch_limit=fetch_limit,
+                    columns=columns,
+                )
         else:
-            table, source = self._data._read(
-                route,
-                query=lambda adapter: _adapter_method(adapter, route, "intraday_bars")(
+            if source == "tushare":
+                table = self._data._tushare_adapter.intraday_bars(
                     as_of=self._data.as_of,
                     symbols=normalized_symbols,
                     frequency=frequency,
@@ -322,9 +289,34 @@ class MarketReader:
                     order=order,
                     fetch_limit=fetch_limit,
                     columns=columns,
-                ),
-                columns=columns,
-            )
+                )
+            elif source == "qmt":
+                table = self._data._qmt_adapter.intraday_bars(
+                    as_of=self._data.as_of,
+                    symbols=normalized_symbols,
+                    frequency=frequency,
+                    start=normalized_start,
+                    end=normalized_end,
+                    count=count,
+                    adjustment=adjustment,
+                    order=order,
+                    fetch_limit=fetch_limit,
+                    columns=columns,
+                )
+            else:
+                table = self._data._custom_adapters[source].intraday_bars(
+                    as_of=self._data.as_of,
+                    symbols=normalized_symbols,
+                    frequency=frequency,
+                    start=normalized_start,
+                    end=normalized_end,
+                    count=count,
+                    adjustment=adjustment,
+                    order=order,
+                    fetch_limit=fetch_limit,
+                    columns=columns,
+                )
+        table = self._data._validate_table(route, source, table, columns)
         direction: SortDirection = "ascending" if order == "asc" else "descending"
         sort: tuple[tuple[str, SortDirection], ...] = (
             ("interval_end", direction),
@@ -347,17 +339,31 @@ class MarketReader:
     ) -> QueryResult:
         normalized_symbols = _symbols(symbols)
         identity = ("symbol",)
-        selected, columns = _projection("market.realtime_quotes", identity, fields)
-        table, source = self._data._read(
-            "market.realtime_quotes",
-            query=lambda adapter: _adapter_method(adapter, "market.realtime_quotes", "current")(
+        route = "market.realtime_quotes"
+        selected, columns = _projection(route, identity, fields)
+        source = self._data._source(route)
+        if source == "tushare":
+            table = self._data._tushare_adapter.current(
                 as_of=self._data.as_of,
                 symbols=normalized_symbols,
                 fetch_limit=self._data._max_result_rows + 1,
                 columns=columns,
-            ),
-            columns=columns,
-        )
+            )
+        elif source == "qmt":
+            table = self._data._qmt_adapter.current(
+                as_of=self._data.as_of,
+                symbols=normalized_symbols,
+                fetch_limit=self._data._max_result_rows + 1,
+                columns=columns,
+            )
+        else:
+            table = self._data._custom_adapters[source].current(
+                as_of=self._data.as_of,
+                symbols=normalized_symbols,
+                fetch_limit=self._data._max_result_rows + 1,
+                columns=columns,
+            )
+        table = self._data._validate_table(route, source, table, columns)
         return self._data._result(
             table,
             identity=identity,
@@ -380,69 +386,109 @@ class MarketReader:
         selected = list(allowed) if fields is None else list(fields)
         _fields(selected, allowed, ("symbol",))
         normalized_symbols = _symbols(symbols)
-        routes: list[tuple[str, tuple[str, ...]]] = []
-        if "suspended" in selected:
-            routes.append(("market.suspensions", ("suspended",)))
-        limit_fields = tuple(name for name in ("up_limit", "down_limit") if name in selected)
-        if limit_fields:
-            routes.append(("market.price_limits", limit_fields))
-        if "st_type" in selected:
-            routes.append(("market.st_status", ("st_type",)))
-
         rows: dict[str, dict[str, object]] = {}
         if normalized_symbols is not None:
             rows = {symbol: {"symbol": symbol} for symbol in normalized_symbols}
         sources: list[str] = []
-        for route, route_fields in routes:
-            fetch_limit = self._data._max_result_rows + 1
-            columns = ("symbol", *route_fields)
-            if route == "market.suspensions":
-                part, source = self._data._read(
-                    route,
-                    query=lambda adapter, route=route, fetch_limit=fetch_limit, columns=columns: (
-                        _adapter_method(adapter, route, "suspensions")(
-                            as_of=self._data.as_of,
-                            symbols=normalized_symbols,
-                            fetch_limit=fetch_limit,
-                            columns=columns,
-                        )
-                    ),
+        fetch_limit = self._data._max_result_rows + 1
+
+        if "suspended" in selected:
+            route = "market.suspensions"
+            columns = ("symbol", "suspended")
+            source = self._data._source(route)
+            if source == "tushare":
+                part = self._data._tushare_adapter.suspensions(
+                    as_of=self._data.as_of,
+                    symbols=normalized_symbols,
+                    fetch_limit=fetch_limit,
                     columns=columns,
                 )
-            elif route == "market.price_limits":
-                part, source = self._data._read(
-                    route,
-                    query=lambda adapter, route=route, fetch_limit=fetch_limit, columns=columns: (
-                        _adapter_method(adapter, route, "price_limits")(
-                            as_of=self._data.as_of,
-                            symbols=normalized_symbols,
-                            fetch_limit=fetch_limit,
-                            columns=columns,
-                        )
-                    ),
+            elif source == "qmt":
+                part = self._data._qmt_adapter.suspensions(
+                    as_of=self._data.as_of,
+                    symbols=normalized_symbols,
+                    fetch_limit=fetch_limit,
                     columns=columns,
                 )
             else:
-                part, source = self._data._read(
-                    route,
-                    query=lambda adapter, route=route, fetch_limit=fetch_limit, columns=columns: (
-                        _adapter_method(adapter, route, "st_status")(
-                            as_of=self._data.as_of,
-                            symbols=normalized_symbols,
-                            fetch_limit=fetch_limit,
-                            columns=columns,
-                        )
-                    ),
+                part = self._data._custom_adapters[source].suspensions(
+                    as_of=self._data.as_of,
+                    symbols=normalized_symbols,
+                    fetch_limit=fetch_limit,
                     columns=columns,
                 )
+            part = self._data._validate_table(route, source, part, columns)
             sources.append(source)
             for item in part.to_pylist():
                 symbol = item["symbol"]
                 row = rows.setdefault(symbol, {"symbol": symbol})
-                for name in route_fields:
-                    if name not in item:
-                        raise DataAdapterError(f"{route} 缺少字段 {name!r}")
+                row["suspended"] = item["suspended"]
+
+        limit_fields = tuple(name for name in ("up_limit", "down_limit") if name in selected)
+        if limit_fields:
+            route = "market.price_limits"
+            columns = ("symbol", *limit_fields)
+            source = self._data._source(route)
+            if source == "tushare":
+                part = self._data._tushare_adapter.price_limits(
+                    as_of=self._data.as_of,
+                    symbols=normalized_symbols,
+                    fetch_limit=fetch_limit,
+                    columns=columns,
+                )
+            elif source == "qmt":
+                part = self._data._qmt_adapter.price_limits(
+                    as_of=self._data.as_of,
+                    symbols=normalized_symbols,
+                    fetch_limit=fetch_limit,
+                    columns=columns,
+                )
+            else:
+                part = self._data._custom_adapters[source].price_limits(
+                    as_of=self._data.as_of,
+                    symbols=normalized_symbols,
+                    fetch_limit=fetch_limit,
+                    columns=columns,
+                )
+            part = self._data._validate_table(route, source, part, columns)
+            sources.append(source)
+            for item in part.to_pylist():
+                symbol = item["symbol"]
+                row = rows.setdefault(symbol, {"symbol": symbol})
+                for name in limit_fields:
                     row[name] = item[name]
+
+        if "st_type" in selected:
+            route = "market.st_status"
+            columns = ("symbol", "st_type")
+            source = self._data._source(route)
+            if source == "tushare":
+                part = self._data._tushare_adapter.st_status(
+                    as_of=self._data.as_of,
+                    symbols=normalized_symbols,
+                    fetch_limit=fetch_limit,
+                    columns=columns,
+                )
+            elif source == "qmt":
+                part = self._data._qmt_adapter.st_status(
+                    as_of=self._data.as_of,
+                    symbols=normalized_symbols,
+                    fetch_limit=fetch_limit,
+                    columns=columns,
+                )
+            else:
+                part = self._data._custom_adapters[source].st_status(
+                    as_of=self._data.as_of,
+                    symbols=normalized_symbols,
+                    fetch_limit=fetch_limit,
+                    columns=columns,
+                )
+            part = self._data._validate_table(route, source, part, columns)
+            sources.append(source)
+            for item in part.to_pylist():
+                symbol = item["symbol"]
+                row = rows.setdefault(symbol, {"symbol": symbol})
+                row["st_type"] = item["st_type"]
         output_rows = []
         for row in rows.values():
             output_rows.append(
@@ -470,13 +516,59 @@ class MarketReader:
         fields: Sequence[str] | None = None,
         order: Literal["asc", "desc"] = "asc",
     ) -> QueryResult:
-        return self._dated_table(
-            route="market.daily_metrics",
-            symbols=symbols,
-            start=start,
-            end=end,
-            fields=fields,
-            order=order,
+        start = _plain_date(start, "start")
+        end = (
+            _plain_date(end, "end")
+            if end is not None
+            else self._data.as_of.date() + timedelta(days=1)
+        )
+        _range(start, end, "start", "end")
+        order = _order(order)
+        normalized_symbols = _symbols(symbols)
+        route = "market.daily_metrics"
+        identity = ("symbol", "trade_date")
+        selected, columns = _projection(route, identity, fields)
+        source = self._data._source(route)
+        if source == "tushare":
+            table = self._data._tushare_adapter.daily_metrics(
+                as_of=self._data.as_of,
+                symbols=normalized_symbols,
+                start=start,
+                end=end,
+                order=order,
+                fetch_limit=self._data._max_result_rows + 1,
+                columns=columns,
+            )
+        elif source == "qmt":
+            table = self._data._qmt_adapter.daily_metrics(
+                as_of=self._data.as_of,
+                symbols=normalized_symbols,
+                start=start,
+                end=end,
+                order=order,
+                fetch_limit=self._data._max_result_rows + 1,
+                columns=columns,
+            )
+        else:
+            table = self._data._custom_adapters[source].daily_metrics(
+                as_of=self._data.as_of,
+                symbols=normalized_symbols,
+                start=start,
+                end=end,
+                order=order,
+                fetch_limit=self._data._max_result_rows + 1,
+                columns=columns,
+            )
+        table = self._data._validate_table(route, source, table, columns)
+        return self._data._result(
+            table,
+            identity=identity,
+            fields=selected,
+            sort=(
+                ("trade_date", "ascending" if order == "asc" else "descending"),
+                ("symbol", "ascending"),
+            ),
+            sources=(source,),
         )
 
     def moneyflow(
@@ -488,25 +580,6 @@ class MarketReader:
         fields: Sequence[str] | None = None,
         order: Literal["asc", "desc"] = "asc",
     ) -> QueryResult:
-        return self._dated_table(
-            route="market.moneyflow",
-            symbols=symbols,
-            start=start,
-            end=end,
-            fields=fields,
-            order=order,
-        )
-
-    def _dated_table(
-        self,
-        *,
-        route: str,
-        symbols: Symbols,
-        start: date,
-        end: date | None,
-        fields: Sequence[str] | None,
-        order: str,
-    ) -> QueryResult:
         start = _plain_date(start, "start")
         end = (
             _plain_date(end, "end")
@@ -516,37 +589,41 @@ class MarketReader:
         _range(start, end, "start", "end")
         order = _order(order)
         normalized_symbols = _symbols(symbols)
+        route = "market.moneyflow"
         identity = ("symbol", "trade_date")
         selected, columns = _projection(route, identity, fields)
-        fetch_limit = self._data._max_result_rows + 1
-        if route == "market.daily_metrics":
-            table, source = self._data._read(
-                route,
-                query=lambda adapter: _adapter_method(adapter, route, "daily_metrics")(
-                    as_of=self._data.as_of,
-                    symbols=normalized_symbols,
-                    start=start,
-                    end=end,
-                    order=order,
-                    fetch_limit=fetch_limit,
-                    columns=columns,
-                ),
+        source = self._data._source(route)
+        if source == "tushare":
+            table = self._data._tushare_adapter.moneyflow(
+                as_of=self._data.as_of,
+                symbols=normalized_symbols,
+                start=start,
+                end=end,
+                order=order,
+                fetch_limit=self._data._max_result_rows + 1,
+                columns=columns,
+            )
+        elif source == "qmt":
+            table = self._data._qmt_adapter.moneyflow(
+                as_of=self._data.as_of,
+                symbols=normalized_symbols,
+                start=start,
+                end=end,
+                order=order,
+                fetch_limit=self._data._max_result_rows + 1,
                 columns=columns,
             )
         else:
-            table, source = self._data._read(
-                route,
-                query=lambda adapter: _adapter_method(adapter, route, "moneyflow")(
-                    as_of=self._data.as_of,
-                    symbols=normalized_symbols,
-                    start=start,
-                    end=end,
-                    order=order,
-                    fetch_limit=fetch_limit,
-                    columns=columns,
-                ),
+            table = self._data._custom_adapters[source].moneyflow(
+                as_of=self._data.as_of,
+                symbols=normalized_symbols,
+                start=start,
+                end=end,
+                order=order,
+                fetch_limit=self._data._max_result_rows + 1,
                 columns=columns,
             )
+        table = self._data._validate_table(route, source, table, columns)
         return self._data._result(
             table,
             identity=identity,
@@ -561,17 +638,6 @@ class MarketReader:
 
 class FundamentalsReader:
     __slots__ = ("_data",)
-
-    _STATEMENTS = {
-        "income": "fundamentals.income",
-        "balance_sheet": "fundamentals.balance_sheet",
-        "cash_flow": "fundamentals.cashflow",
-    }
-    _DISCLOSURES = {
-        "forecast": "fundamentals.forecast",
-        "express": "fundamentals.express",
-        "audit": "fundamentals.audit",
-    }
 
     def __init__(self, data: DataView) -> None:
         self._data = data
@@ -588,10 +654,14 @@ class FundamentalsReader:
         fields: Sequence[str] | None = None,
         order: Literal["asc", "desc"] = "desc",
     ) -> QueryResult:
-        try:
-            route = self._STATEMENTS[kind]
-        except KeyError:
-            raise ValueError(f"不支持的财报 kind: {kind!r}") from None
+        if kind == "income":
+            route = "fundamentals.income"
+        elif kind == "balance_sheet":
+            route = "fundamentals.balance_sheet"
+        elif kind == "cash_flow":
+            route = "fundamentals.cashflow"
+        else:
+            raise ValueError(f"不支持的财报 kind: {kind!r}")
         report_start, report_end, periods = _report_range(report_start, report_end, periods)
         order = _order(order)
         normalized_symbols = _symbols(symbols)
@@ -606,9 +676,9 @@ class FundamentalsReader:
         selected, columns = _projection(route, identity, fields)
         normalized_company_type = _company_type(company_type)
         fetch_limit = self._data._max_result_rows + 1
-        table, source = self._data._read(
-            route,
-            query=lambda adapter: _adapter_method(adapter, route, "statements")(
+        source = self._data._source(route)
+        if source == "tushare":
+            table = self._data._tushare_adapter.statements(
                 kind=kind,
                 as_of=self._data.as_of,
                 symbols=normalized_symbols,
@@ -619,9 +689,34 @@ class FundamentalsReader:
                 order=order,
                 fetch_limit=fetch_limit,
                 columns=columns,
-            ),
-            columns=columns,
-        )
+            )
+        elif source == "qmt":
+            table = self._data._qmt_adapter.statements(
+                kind=kind,
+                as_of=self._data.as_of,
+                symbols=normalized_symbols,
+                report_start=report_start,
+                report_end=report_end,
+                company_type=normalized_company_type,
+                periods=periods,
+                order=order,
+                fetch_limit=fetch_limit,
+                columns=columns,
+            )
+        else:
+            table = self._data._custom_adapters[source].statements(
+                kind=kind,
+                as_of=self._data.as_of,
+                symbols=normalized_symbols,
+                report_start=report_start,
+                report_end=report_end,
+                company_type=normalized_company_type,
+                periods=periods,
+                order=order,
+                fetch_limit=fetch_limit,
+                columns=columns,
+            )
+        table = self._data._validate_table(route, source, table, columns)
         return self._data._result(
             table,
             identity=identity,
@@ -648,12 +743,11 @@ class FundamentalsReader:
         order = _order(order)
         normalized_symbols = _symbols(symbols)
         identity = ("symbol", "period_end", "visible_at", "announcement_date")
-        selected, columns = _projection("fundamentals.indicators", identity, fields)
-        table, source = self._data._read(
-            "fundamentals.indicators",
-            query=lambda adapter: _adapter_method(
-                adapter, "fundamentals.indicators", "financial_indicators"
-            )(
+        route = "fundamentals.indicators"
+        selected, columns = _projection(route, identity, fields)
+        source = self._data._source(route)
+        if source == "tushare":
+            table = self._data._tushare_adapter.financial_indicators(
                 as_of=self._data.as_of,
                 symbols=normalized_symbols,
                 report_start=report_start,
@@ -662,9 +756,30 @@ class FundamentalsReader:
                 order=order,
                 fetch_limit=self._data._max_result_rows + 1,
                 columns=columns,
-            ),
-            columns=columns,
-        )
+            )
+        elif source == "qmt":
+            table = self._data._qmt_adapter.financial_indicators(
+                as_of=self._data.as_of,
+                symbols=normalized_symbols,
+                report_start=report_start,
+                report_end=report_end,
+                periods=periods,
+                order=order,
+                fetch_limit=self._data._max_result_rows + 1,
+                columns=columns,
+            )
+        else:
+            table = self._data._custom_adapters[source].financial_indicators(
+                as_of=self._data.as_of,
+                symbols=normalized_symbols,
+                report_start=report_start,
+                report_end=report_end,
+                periods=periods,
+                order=order,
+                fetch_limit=self._data._max_result_rows + 1,
+                columns=columns,
+            )
+        table = self._data._validate_table(route, source, table, columns)
         return self._data._result(
             table,
             identity=identity,
@@ -686,19 +801,23 @@ class FundamentalsReader:
         fields: Sequence[str] | None = None,
         order: Literal["asc", "desc"] = "asc",
     ) -> QueryResult:
-        try:
-            route = self._DISCLOSURES[kind]
-        except KeyError:
-            raise ValueError(f"不支持的披露 kind: {kind!r}") from None
+        if kind == "forecast":
+            route = "fundamentals.forecast"
+        elif kind == "express":
+            route = "fundamentals.express"
+        elif kind == "audit":
+            route = "fundamentals.audit"
+        else:
+            raise ValueError(f"不支持的披露 kind: {kind!r}")
         start, end = _visible_range(visible_start, visible_end, self._data.as_of)
         order = _order(order)
         normalized_symbols = _symbols(symbols)
         identity = ("symbol", "visible_at", "period_end", "announcement_date")
         selected, columns = _projection(route, identity, fields)
         fetch_limit = self._data._max_result_rows + 1
-        table, source = self._data._read(
-            route,
-            query=lambda adapter: _adapter_method(adapter, route, "disclosures")(
+        source = self._data._source(route)
+        if source == "tushare":
+            table = self._data._tushare_adapter.disclosures(
                 kind=kind,
                 as_of=self._data.as_of,
                 symbols=normalized_symbols,
@@ -707,9 +826,30 @@ class FundamentalsReader:
                 order=order,
                 fetch_limit=fetch_limit,
                 columns=columns,
-            ),
-            columns=columns,
-        )
+            )
+        elif source == "qmt":
+            table = self._data._qmt_adapter.disclosures(
+                kind=kind,
+                as_of=self._data.as_of,
+                symbols=normalized_symbols,
+                visible_start=start,
+                visible_end=end,
+                order=order,
+                fetch_limit=fetch_limit,
+                columns=columns,
+            )
+        else:
+            table = self._data._custom_adapters[source].disclosures(
+                kind=kind,
+                as_of=self._data.as_of,
+                symbols=normalized_symbols,
+                visible_start=start,
+                visible_end=end,
+                order=order,
+                fetch_limit=fetch_limit,
+                columns=columns,
+            )
+        table = self._data._validate_table(route, source, table, columns)
         direction = "ascending" if order == "asc" else "descending"
         return self._data._result(
             table,
@@ -752,12 +892,11 @@ class CorporateActionsReader:
             "div_proc",
             "implementation_ann_date",
         )
-        selected, columns = _projection("corporate_actions.dividends", identity, fields)
-        table, source = self._data._read(
-            "corporate_actions.dividends",
-            query=lambda adapter: _adapter_method(
-                adapter, "corporate_actions.dividends", "dividends"
-            )(
+        route = "corporate_actions.dividends"
+        selected, columns = _projection(route, identity, fields)
+        source = self._data._source(route)
+        if source == "tushare":
+            table = self._data._tushare_adapter.dividends(
                 as_of=self._data.as_of,
                 symbols=normalized_symbols,
                 visible_start=start,
@@ -765,9 +904,28 @@ class CorporateActionsReader:
                 order=order,
                 fetch_limit=self._data._max_result_rows + 1,
                 columns=columns,
-            ),
-            columns=columns,
-        )
+            )
+        elif source == "qmt":
+            table = self._data._qmt_adapter.dividends(
+                as_of=self._data.as_of,
+                symbols=normalized_symbols,
+                visible_start=start,
+                visible_end=end,
+                order=order,
+                fetch_limit=self._data._max_result_rows + 1,
+                columns=columns,
+            )
+        else:
+            table = self._data._custom_adapters[source].dividends(
+                as_of=self._data.as_of,
+                symbols=normalized_symbols,
+                visible_start=start,
+                visible_end=end,
+                order=order,
+                fetch_limit=self._data._max_result_rows + 1,
+                columns=columns,
+            )
+        table = self._data._validate_table(route, source, table, columns)
         direction = "ascending" if order == "asc" else "descending"
         return self._data._result(
             table,
@@ -801,21 +959,36 @@ class CorporateActionsReader:
             _range(start, end, "start", "end")
         order = _order(order)
         normalized_symbols = _symbols(symbols)
-        table, source = self._data._read(
-            "corporate_actions.adjustment_factors",
-            query=lambda adapter: _adapter_method(
-                adapter,
-                "corporate_actions.adjustment_factors",
-                "adjustment_factors",
-            )(
+        route = "corporate_actions.adjustment_factors"
+        source = self._data._source(route)
+        if source == "tushare":
+            table = self._data._tushare_adapter.adjustment_factors(
                 as_of=self._data.as_of,
                 symbols=normalized_symbols,
                 start=start,
                 end=end,
                 order=order,
                 fetch_limit=self._data._max_result_rows + 1,
-            ),
-        )
+            )
+        elif source == "qmt":
+            table = self._data._qmt_adapter.adjustment_factors(
+                as_of=self._data.as_of,
+                symbols=normalized_symbols,
+                start=start,
+                end=end,
+                order=order,
+                fetch_limit=self._data._max_result_rows + 1,
+            )
+        else:
+            table = self._data._custom_adapters[source].adjustment_factors(
+                as_of=self._data.as_of,
+                symbols=normalized_symbols,
+                start=start,
+                end=end,
+                order=order,
+                fetch_limit=self._data._max_result_rows + 1,
+            )
+        table = self._data._validate_table(route, source, table)
         return self._data._result(
             table,
             identity=("symbol", "trade_date"),
@@ -843,15 +1016,30 @@ class ClassificationReader:
         if isinstance(level, bool) or level not in {1, 2, 3}:
             raise ValueError("level 只允许 1、2、3")
         normalized_symbols = _symbols(symbols)
-        table, source = self._data._read(
-            "classification.industry",
-            query=lambda adapter: _adapter_method(adapter, "classification.industry", "industry")(
+        route = "classification.industry"
+        source = self._data._source(route)
+        if source == "tushare":
+            table = self._data._tushare_adapter.industry(
                 as_of=self._data.as_of,
                 symbols=normalized_symbols,
                 level=level,
                 fetch_limit=self._data._max_result_rows + 1,
-            ),
-        )
+            )
+        elif source == "qmt":
+            table = self._data._qmt_adapter.industry(
+                as_of=self._data.as_of,
+                symbols=normalized_symbols,
+                level=level,
+                fetch_limit=self._data._max_result_rows + 1,
+            )
+        else:
+            table = self._data._custom_adapters[source].industry(
+                as_of=self._data.as_of,
+                symbols=normalized_symbols,
+                level=level,
+                fetch_limit=self._data._max_result_rows + 1,
+            )
+        table = self._data._validate_table(route, source, table)
         return self._data._result(
             table,
             identity=("symbol",),
@@ -878,18 +1066,35 @@ class ReferenceReader:
         route = "reference.stocks"
         identity = ("symbol",)
         selected, columns = _projection(route, identity, fields)
-        table, source = self._data._read(
-            route,
-            query=lambda adapter: _adapter_method(adapter, route, "stocks")(
+        source = self._data._source(route)
+        if source == "tushare":
+            table = self._data._tushare_adapter.stocks(
                 as_of=self._data.as_of,
                 exchange=_optional_code(exchange, "exchange"),
                 market=_optional_code(market, "market"),
                 currency=_optional_code(currency, "currency"),
                 fetch_limit=self._data._max_result_rows + 1,
                 columns=columns,
-            ),
-            columns=columns,
-        )
+            )
+        elif source == "qmt":
+            table = self._data._qmt_adapter.stocks(
+                as_of=self._data.as_of,
+                exchange=_optional_code(exchange, "exchange"),
+                market=_optional_code(market, "market"),
+                currency=_optional_code(currency, "currency"),
+                fetch_limit=self._data._max_result_rows + 1,
+                columns=columns,
+            )
+        else:
+            table = self._data._custom_adapters[source].stocks(
+                as_of=self._data.as_of,
+                exchange=_optional_code(exchange, "exchange"),
+                market=_optional_code(market, "market"),
+                currency=_optional_code(currency, "currency"),
+                fetch_limit=self._data._max_result_rows + 1,
+                columns=columns,
+            )
+        table = self._data._validate_table(route, source, table, columns)
         return self._data._result(
             table,
             identity=identity,
@@ -923,10 +1128,11 @@ class CalendarReader:
         _range(start, end, "start", "end")
         order = _order(order)
         identity = ("cal_date", "exchange")
-        selected, columns = _projection("calendar.sessions", identity, fields)
-        table, source = self._data._read(
-            "calendar.sessions",
-            query=lambda adapter: _adapter_method(adapter, "calendar.sessions", "sessions")(
+        route = "calendar.sessions"
+        selected, columns = _projection(route, identity, fields)
+        source = self._data._source(route)
+        if source == "tushare":
+            table = self._data._tushare_adapter.sessions(
                 as_of=self._data.as_of,
                 start=start,
                 end=end,
@@ -934,9 +1140,28 @@ class CalendarReader:
                 order=order,
                 fetch_limit=self._data._max_result_rows + 1,
                 columns=columns,
-            ),
-            columns=columns,
-        )
+            )
+        elif source == "qmt":
+            table = self._data._qmt_adapter.sessions(
+                as_of=self._data.as_of,
+                start=start,
+                end=end,
+                exchange=_optional_code(exchange, "exchange"),
+                order=order,
+                fetch_limit=self._data._max_result_rows + 1,
+                columns=columns,
+            )
+        else:
+            table = self._data._custom_adapters[source].sessions(
+                as_of=self._data.as_of,
+                start=start,
+                end=end,
+                exchange=_optional_code(exchange, "exchange"),
+                order=order,
+                fetch_limit=self._data._max_result_rows + 1,
+                columns=columns,
+            )
+        table = self._data._validate_table(route, source, table, columns)
         return self._data._result(
             table,
             identity=identity,
@@ -951,14 +1176,25 @@ class CalendarReader:
     def previous_session(self, *, exchange: str) -> date | None:
         normalized_exchange = _optional_code(exchange, "exchange")
         assert normalized_exchange is not None
-        table, _ = self._data._read(
-            "calendar.sessions",
-            query=lambda adapter: _adapter_method(adapter, "calendar.sessions", "previous_session")(
+        route = "calendar.sessions"
+        columns = ("cal_date", "exchange")
+        source = self._data._source(route)
+        if source == "tushare":
+            table = self._data._tushare_adapter.previous_session(
                 end=self._data.as_of.date(),
                 exchange=normalized_exchange,
-            ),
-            columns=("cal_date", "exchange"),
-        )
+            )
+        elif source == "qmt":
+            table = self._data._qmt_adapter.previous_session(
+                end=self._data.as_of.date(),
+                exchange=normalized_exchange,
+            )
+        else:
+            table = self._data._custom_adapters[source].previous_session(
+                end=self._data.as_of.date(),
+                exchange=normalized_exchange,
+            )
+        table = self._data._validate_table(route, source, table, columns)
         if table.num_rows == 0:
             return None
         return cast(date, table.column("cal_date")[0].as_py())
@@ -1009,7 +1245,7 @@ def _projection(
     identity: tuple[str, ...],
     fields: Sequence[str] | None,
 ) -> tuple[list[str], tuple[str, ...]]:
-    schema = CAPABILITY_SCHEMAS[DataCapability(route)]
+    schema = ROUTE_SCHEMAS[route]
     payload = [name for name in schema.names if name not in identity]
     selected = _fields(fields, payload, identity)
     return selected, (*identity, *selected)

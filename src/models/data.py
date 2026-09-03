@@ -8,7 +8,6 @@ from __future__ import annotations
 from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import datetime
-from enum import StrEnum
 
 import pandas as pd
 import pyarrow as pa
@@ -159,58 +158,6 @@ SESSION_SCHEMA = pa.schema(
         pa.field("previous_session", pa.date32()),
     ]
 )
-
-
-class DataCapability(StrEnum):
-    """稳定的逻辑数据集能力键。"""
-
-    # 市场行情与交易状态。
-    # 日线行情：每日开、高、低、收、成交量和成交额。
-    DAILY_BARS = "market.daily_bars"
-    # 日内 K 线：1 分钟、5 分钟等交易日内周期行情。
-    INTRADAY_BARS = "market.intraday_bars"
-    # 实时行情：最新价、买卖盘及实时成交信息。
-    REALTIME_QUOTES = "market.realtime_quotes"
-    # 每日估值指标：PE、PB、换手率和市值等。
-    DAILY_METRICS = "market.daily_metrics"
-    # 个股资金流向：不同大小订单的买卖金额及净流入。
-    MONEYFLOW = "market.moneyflow"
-    # 停复牌状态。
-    SUSPENSIONS = "market.suspensions"
-    # 每日涨停价和跌停价。
-    PRICE_LIMITS = "market.price_limits"
-    # ST、*ST 等风险警示状态。
-    ST_STATUS = "market.st_status"
-
-    # 公司基本面与财务数据。
-    # 利润表。
-    INCOME = "fundamentals.income"
-    # 资产负债表。
-    BALANCE_SHEET = "fundamentals.balance_sheet"
-    # 现金流量表。
-    CASHFLOW = "fundamentals.cashflow"
-    # ROE、毛利率、每股收益等财务指标。
-    INDICATORS = "fundamentals.indicators"
-    # 公司在正式财报前发布的业绩预告区间。
-    FORECAST = "fundamentals.forecast"
-    # 公司初步核算后发布的业绩快报。
-    EXPRESS = "fundamentals.express"
-    # 会计师事务所出具的财务审计意见。
-    AUDIT = "fundamentals.audit"
-
-    # 公司行为。
-    # 现金分红、送股、转增及其实施日期。
-    DIVIDENDS = "corporate_actions.dividends"
-    # 用于计算前复权、后复权价格的复权因子。
-    ADJUSTMENT_FACTORS = "corporate_actions.adjustment_factors"
-
-    # 股票所属的行业分类及层级。
-    INDUSTRY = "classification.industry"
-
-    # 证券主数据和指定时点仍处于上市区间内的股票集合。
-    STOCKS = "reference.stocks"
-    # 交易日历：是否开市及上一交易日；不是登录会话。
-    SESSIONS = "calendar.sessions"
 
 
 @dataclass(frozen=True, slots=True)

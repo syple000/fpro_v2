@@ -65,12 +65,12 @@ class DataCatalog:
         _refresh_qmt_sync_ranges(self._connection, self._sources["qmt"][0])
 
     def require_available(self, source: str, datasets: str | tuple[str, ...]) -> None:
-        """要求已发布来源的底层数据集可用。"""
+        """要求最近一次全量检测确认底层数据集可用。"""
         required = (datasets,) if isinstance(datasets, str) else datasets
         unavailable = sorted(set(required) & self._unavailable.get(source, frozenset()))
         if unavailable:
             raise DataSourceUnavailableError(
-                f"数据源 {source!r} 的已发布数据集不可用: {unavailable}"
+                f"数据源 {source!r} 的数据集未通过当前质量检查: {unavailable}"
             )
 
     def close(self) -> None:
@@ -200,21 +200,34 @@ def _load_unavailable_datasets(
     root: Path,
     schemas: Mapping[str, pa.Schema],
 ) -> frozenset[str]:
-    release_path = root / "release.json"
-    if not release_path.exists():
+    status_path = root / "_quality" / "status.json"
+    if not status_path.exists():
         return frozenset()
     try:
-        payload = json.loads(release_path.read_text(encoding="utf-8"))
+        payload = json.loads(status_path.read_text(encoding="utf-8"))
         datasets = payload["datasets"]
     except (OSError, json.JSONDecodeError, KeyError) as exc:
-        raise ValueError(f"发布状态无法读取: {release_path}") from exc
-    if not isinstance(datasets, dict):
-        raise ValueError(f"发布状态格式无效: {release_path}")
+        raise ValueError(f"质量状态无法读取: {status_path}") from exc
+    if payload.get("version") != 1 or not isinstance(datasets, dict):
+        raise ValueError(f"质量状态格式无效: {status_path}")
+    from data_cleaning.detector import source_fingerprint
+
+    expected_fingerprint = payload.get("input_fingerprint")
+    if (
+        not isinstance(expected_fingerprint, str)
+        or source_fingerprint(root, schemas) != expected_fingerprint
+    ):
+        # 数据在检测后有变化时，宁可要求重检，也不沿用过期的“通过”结论。
+        return frozenset(schemas)
     unavailable: set[str] = set()
     for dataset in schemas:
         state = datasets.get(dataset)
-        if not isinstance(state, dict) or state.get("status") not in {"AVAILABLE", "UNAVAILABLE"}:
-            raise ValueError(f"发布状态缺少有效数据集 {dataset!r}: {release_path}")
-        if state["status"] == "UNAVAILABLE":
+        if (
+            not isinstance(state, dict)
+            or not isinstance(state.get("errors"), int)
+            or not isinstance(state.get("warnings"), int)
+        ):
+            raise ValueError(f"质量状态缺少有效数据集 {dataset!r}: {status_path}")
+        if state["errors"]:
             unavailable.add(dataset)
     return frozenset(unavailable)

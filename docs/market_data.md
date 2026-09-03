@@ -19,9 +19,7 @@ PIT 语义统一由 adapter 和 `DataReader` 实现。
 data = reader.at(as_of)
 
 bars = data.market.bars(symbols=("000001.SZ",), frequency="1d", count=20)
-income = data.fundamentals.statements(
-    kind="income", symbols=("000001.SZ",), periods=8
-)
+income = data.fundamentals.statements(kind="income", symbols=("000001.SZ",), periods=8)
 status = data.market.status(symbols=("000001.SZ",))
 ```
 
@@ -64,7 +62,7 @@ DAILY_BASIC_READY 17:05
 各自在适配器中实现明确的可见时间规则。
 
 `next_session(D)` 表示严格晚于 D 的第一个交易日。周五公告的数据通常从下周一 09:25 可见。
-该计算必须命中已发布交易日历；空日历或日历覆盖止于 D 时不回退为“下一个工作日”，而是抛出
+该计算必须命中已检测交易日历；空日历或日历覆盖止于 D 时不回退为“下一个工作日”，而是抛出
 `DataSourceUnavailableError`，避免把节假日误当成交易日。
 
 ## 内置数据源的可见约束
@@ -197,22 +195,22 @@ alpha 数据逐日解锁。策略只读取当前和历史 session；若要精确
 日历公告时间和版本。凡是查询需要计算 `next_session`，日历必须至少覆盖到相关日期之后的第一
 个开市日；覆盖不足属于来源不可用，不使用工作日近似。
 
-## 已发布数据使用前提
+## 已检测数据使用前提
 
-进入任一已注册来源后，数据视为已经由上游完成采集、清洗、校验和定版，是系统
+进入任一已注册来源后，数据视为已经由上游完成采集、清洗和校验，是系统
 可以直接使用的自有数据。`DataReader` 不在查询时重新评估或质疑数据质量，不做跨源复核，不因
 首次采集时间或供应商身份降级结果，也不向策略返回 `exact/source_declared/approximate` 等质量
 标签或相关警告。
 
 每个数据源适配器登记的公告日、生效日、交易日、接收时间和版本字段，是本系统构造 PIT 视图
 的权威输入。Reader 按登记规则计算 `visible_at`、选择当时可见版本并直接返回结果，不猜测字段
-是否可靠，也不因为存在其他数据源而拒绝使用。数据异常和跨源核验属于数据发布前的上游流程；
-数据发布后，研究、回测、实盘和策略统一信任并使用它。
+是否可靠，也不因为存在其他数据源而拒绝使用。数据异常和跨源核验属于读取前的数据检测流程；
+数据检测后，研究、回测、实盘和策略统一信任并使用它。
 
 这里仍需保证的是查询语义和运行一致性，而不是再次审查数据质量：
 
-- Tushare 根目录包含 `release.json` 时，`DataCatalog` 初始化和 `refresh()` 会加载
-  数据集发布状态；请求依赖 `UNAVAILABLE` 数据集时立即抛出
+- Tushare 根目录包含 `_quality/status.json` 时，`DataCatalog` 初始化和 `refresh()` 会
+  加载最近一次全量检测状态；请求依赖有 ERROR 的数据集，或检测后 Manifest 又有变化时立即抛出
   `DataSourceUnavailableError`；
 - 未复权日线只要求 `daily`，前复权日线还要求 `adj_factor`；一个数据集
   不可用不会阻断无关能力；
@@ -240,7 +238,7 @@ alpha 数据逐日解锁。策略只读取当前和历史 session；若要精确
   把 `history_bars`、`current_snapshot` 和基本面读取分开。
 
 本项目采用相同思路：公开接口按业务拆分，`DataReader` 出口统一为平台数据模型，底层由 PIT
-规则和按 capability 注册的来源适配器完成读取。
+规则和按逻辑数据集配置的来源适配器完成读取。
 
 ```text
 策略 / 研究 / 回测 / 实盘
@@ -279,7 +277,7 @@ Schema；供应商原生结构不能穿透这个边界。例如 Tushare 的 `ts_
 - PE、PB、周转率等倍数直接保留倍数值，`15.0` 表示 15 倍；
 - 复权因子是无量纲相对值，只有同一序列内的相对关系有意义。
 
-Reader 在统一入口根据 `CAPABILITY_SCHEMAS` 校验字段名称、顺序、类型和可空性；单位正确性由
+Reader 根据 `ROUTE_SCHEMAS` 校验字段名称、顺序、类型和可空性；单位正确性由
 适配器换算和对应数值测试保证。
 
 公共 Schema 由 platform 集中定义和版本化，适配器只能提供字段映射，不能自行增加、删除或改变
@@ -294,8 +292,8 @@ Reader 在统一入口根据 `CAPABILITY_SCHEMAS` 校验字段名称、顺序、
 ### 数据源适配器
 
 内置来源是 `TushareAdapter` 和 `QmtAdapter`，也可以在创建 Reader 时通过
-`adapters={"source_id": adapter}` 注册额外来源。适配器遵守公开的 `DataAdapter` 最小协议，声明
-能够实现的逻辑能力，例如不复权日线、前复权日线、分钟线、实时行情或财务报表。适配器负责：
+`adapters={"source_id": adapter}` 注册额外来源。自定义适配器继承公开的 `DataAdapter` 基类，
+覆盖自己支持的具名方法；没有覆盖的方法会直接报告不支持。适配器负责：
 
 - 将原生表、文件或实时消息转换为平台内部标准记录；
 - 提供该来源的 `visible_at` 规则；
@@ -303,11 +301,12 @@ Reader 在统一入口根据 `CAPABILITY_SCHEMAS` 校验字段名称、顺序、
 - 在能力不支持时明确失败，不向 Reader 返回半成品或供应商专属字段。
 
 适配器直接返回符合平台 Schema 的 `pyarrow.Table`，最终 `QueryResult` 由 `DataReader` 构造。
-返回表包含该能力 Schema 规定的 PIT 字段和版本键；Reader 会严格校验字段、类型、顺序与
-可空性。Reader 不再按 `TushareAdapter/QmtAdapter` 具体类型分派，而是在构造时检查每条已配置
-路由声明的 capability 和对应显式方法。主要方法约定为：
+返回表包含该路由 Schema 规定的 PIT 字段和版本键；Reader 会严格校验字段、类型、顺序与
+可空性。Reader 在每个公共方法中按 `source_id` 使用明确的 `if/elif` 选择 Tushare、QMT 或自定义
+适配器，然后直接调用具名方法；不维护 capability 到方法名的映射，也不使用运行期反射。主要
+方法约定为：
 
-| capability | 适配器方法 |
+| 路由 | 适配器方法 |
 | --- | --- |
 | `market.daily_bars/intraday_bars/realtime_quotes` | `daily_bars()` / `intraday_bars()` / `current()` |
 | `market.daily_metrics/moneyflow` | `daily_metrics()` / `moneyflow()` |
@@ -319,9 +318,9 @@ Reader 在统一入口根据 `CAPABILITY_SCHEMAS` 校验字段名称、顺序、
 | 历史股票集合 | `stocks()` |
 | 交易日历 | `sessions()` 和 `previous_session()` |
 
-来源声明 capability 却缺少对应方法时，Reader 在构造阶段抛出
-`DataCapabilityNotSupportedError`，不会等到查询后才以属性错误失败。内置 `source_id` 不能被额外
-适配器覆盖，避免配置意外替换生产来源。
+自定义适配器未覆盖请求方法时，由 `DataAdapter` 基类抛出
+`DataCapabilityNotSupportedError`，不会产生属性错误。内置 `source_id` 不能被额外适配器覆盖，
+避免配置意外替换生产来源。
 
 ### 按逻辑数据集配置来源
 
@@ -349,8 +348,8 @@ Reader 在统一入口根据 `CAPABILITY_SCHEMAS` 校验字段名称、顺序、
 | `reference.stocks` | 指定时点仍在上市区间内的股票主数据 |
 | `calendar.sessions` | 交易日历 |
 
-Reader 创建时校验所有已配置的 `source_id` 是否注册并支持对应基础数据集；每次查询再校验频率、
-复权方式和字段组合等具体能力。配置允许只包含当前运行需要的数据集，以便构造轻量 Reader；
+Reader 创建时校验所有已配置的 `source_id` 是否已经注册；调用时由所选适配器明确处理是否支持
+该方法、频率、复权方式和字段组合。配置允许只包含当前运行需要的数据集，以便构造轻量 Reader；
 但是没有配置的路由没有默认来源，也不会从相邻类别推断来源或自动回退。每个路由只能绑定一个
 `source_id`，不接受候选列表；未知路由键、重复路由或空 `source_id` 在构造配置时直接报错。
 
@@ -359,11 +358,11 @@ Reader 创建时校验所有已配置的 `source_id` 是否注册并支持对应
 - 请求依赖的路由未配置：抛出 `DataSourceNotConfiguredError`；
 - 路由已配置，但适配器不支持请求能力且平台也无法用已配置依赖完成派生：抛出
   `DataCapabilityNotSupportedError`；
-- 已发布数据的存储当前不可访问，或计算可见时间所需的交易日历覆盖不足：抛出
+- 已检测数据的存储当前不可访问，或计算可见时间所需的交易日历覆盖不足：抛出
   `DataSourceUnavailableError`；
 - 查询结果超过 Reader 内部安全上限：抛出 `DataResultTooLargeError`，要求调用方缩小证券或
   时间范围，不返回截断结果；
-- 已发布数据正常可读，只是指定证券或时间范围内没有记录：返回符合平台 Schema 的空
+- 已检测数据正常可读，只是指定证券或时间范围内没有记录：返回符合平台 Schema 的空
   `QueryResult`。
 
 数据源在 Reader 创建时绑定，策略不能逐次选源。一个公共请求依赖多个逻辑数据集时，Reader
@@ -409,9 +408,7 @@ with DataCatalog(
             },
         ),
     )
-    data = reader.at(
-        datetime(2024, 4, 30, 9, 25, tzinfo=SHANGHAI)
-    )
+    data = reader.at(datetime(2024, 4, 30, 9, 25, tzinfo=SHANGHAI))
 ```
 
 `DataReader.at()` 拒绝无时区 `datetime`，并把其他时区的 aware datetime 归一到
@@ -805,12 +802,14 @@ def on_event(context, data):
 
 ## 内部查询模型
 
-Reader 不把不同查询强行压进统一的 `AdapterRequest` 或无类型的 `parameters` 字典。
-它在完成公共参数校验后，直接调用来源适配器的具名能力方法：
+Reader 不把不同查询强行压进统一的 `AdapterRequest`、callback 或无类型的 `parameters` 字典。
+它在完成公共参数校验后，用可见的 `if/elif` 选择来源并直接调用适配器的具名方法：
 
 ```text
 market.bars(frequency="1d")
--> selected_adapter.daily_bars(
+-> if source_id == "tushare": TushareAdapter.daily_bars(...)
+-> elif source_id == "qmt": QmtAdapter.daily_bars(...)
+-> else: custom_adapter.daily_bars(
        as_of=...,
        symbols=...,
        start=...,
@@ -821,7 +820,7 @@ market.bars(frequency="1d")
    )
 
 fundamentals.statements(kind="cash_flow")
--> selected_adapter.statements(
+-> if source_id == "tushare": TushareAdapter.statements(
        kind="cash_flow",
        as_of=...,
        symbols=...,
@@ -833,7 +832,7 @@ fundamentals.statements(kind="cash_flow")
    )
 ```
 
-不同能力只声明自己真正需要的参数。例如日线适配器没有 `frequency` 参数，
+不同方法只声明自己真正需要的参数。例如日线适配器没有 `frequency` 参数，
 `previous_session()` 也不会通过 `sessions(open_only=True)` 复用入口。统一保留在有实际价值的
 边界：Adapter 返回 Arrow 表，Reader 按逻辑数据集校验平台 Schema 并包装为 `QueryResult`。
 
@@ -842,7 +841,7 @@ fundamentals.statements(kind="cash_flow")
 ```text
 根据请求解析主逻辑数据集
 -> 从 SourceConfig 解析主 source_id
--> 校验 capability 并调用对应来源的显式适配器方法
+-> 用 if/elif 选择来源并直接调用显式适配器方法
 -> 适配器按 symbols/业务范围读取候选数据
 -> 过滤 visible_at <= as_of
 -> 在业务键内选择最新可见版本

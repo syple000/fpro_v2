@@ -32,9 +32,7 @@ class MomentumConfig:
 
     def __post_init__(self) -> None:
         if self.lookback_sessions <= self.skip_sessions or self.skip_sessions < 0:
-            raise ValueError(
-                "lookback_sessions 必须大于 skip_sessions，且 skip_sessions 不能为负"
-            )
+            raise ValueError("lookback_sessions 必须大于 skip_sessions，且 skip_sessions 不能为负")
         if not 0 < self.top_fraction <= 1:
             raise ValueError("top_fraction 必须位于 (0, 1]")
         if self.max_positions < 1:

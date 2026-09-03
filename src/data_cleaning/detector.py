@@ -10,24 +10,24 @@ from dataclasses import dataclass
 from datetime import date, timedelta
 from hashlib import sha256
 from pathlib import Path
-from typing import Literal
+from typing import Literal, cast
 from urllib.parse import unquote
 
 import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
 from data_cleaning.models import CheckResult, DetectionReport, Issue
 from tushare_data.schemas import TABLE_PARTITION_BY, TABLE_PRIMARY_KEY, TABLE_SCHEMAS
 
-_DENSE_MARKET_DATASETS = frozenset(
-    {"daily", "daily_basic", "adj_factor", "stk_limit", "stock_st", "moneyflow"}
-)
+_DENSE_MARKET_DATASETS = frozenset({"daily", "daily_basic", "adj_factor", "stk_limit", "moneyflow"})
 _MARKET_DATE_DATASETS = _DENSE_MARKET_DATASETS | {"suspend_d", "trade_cal"}
 _ANNOUNCEMENT_DATASETS = frozenset(
     {"forecast", "express", "fina_audit", "fina_indicator", "income", "balancesheet", "cashflow"}
 )
 _SNAPSHOT_DATASETS = frozenset({"stock_basic", "sw_industry"})
-_EXCHANGES = frozenset({"SSE", "SZSE"})
+_VALID_EXCHANGES = frozenset({"SSE", "SZSE", "BSE"})
+_REQUIRED_CALENDAR_EXCHANGES = frozenset({"SSE", "SZSE"})
 _CRITICAL_FLOAT_FIELDS = {
     "daily": frozenset({"open", "high", "low", "close", "pre_close", "vol", "amount"}),
     "adj_factor": frozenset({"adj_factor"}),
@@ -58,83 +58,187 @@ _DATASET_CHECKS = {
         "daily_missing_v1": "行情价格、成交量和成交额完整",
         "daily_range_v1": "价格为正且成交量额非负",
         "daily_ohlc_v1": "开高低收关系正确",
-        "daily_close_consistency_v1": "收盘价与涨跌额、涨跌幅一致",
         "daily_arithmetic_v1": "涨跌额和涨跌幅计算正确",
         "daily_volume_amount_v1": "成交量和成交额的零值关系正确",
     },
     "daily_basic": {
         "daily_basic_range_v1": "股本、市值和非负指标不小于零",
-        "daily_basic_share_order_v1": "总股本、流通股本和自由流通股本顺序合理",
-        "daily_basic_market_value_v1": "市值等于收盘价乘以对应股本",
-        "daily_basic_daily_match_v1": "每日指标与日线收盘价及覆盖一致",
     },
     "adj_factor": {
         "adj_factor_positive_v1": "复权因子为正数",
         "adj_factor_daily_coverage_v1": "每条日线都有同日复权因子",
-        "adj_factor_continuity_v1": "复权后昨日收盘与今日昨收连续",
-        "adj_factor_decrease_v1": "复权因子下降需要复核",
-        "adj_factor_without_daily_v1": "无对应日线的复权因子需要复核",
     },
     "suspend_d": {
         "suspend_value_v1": "停复牌类型和日内时间段合法",
-        "suspend_daily_conflict_v1": "全日停牌记录与日线不冲突",
     },
     "stk_limit": {
         "stk_limit_partition_missing_v1": "整个分区的关键价格不全为空",
-        "stk_limit_missing_v1": "昨收、涨停价和跌停价完整",
-        "stk_limit_order_v1": "跌停价 ≤ 昨收价 ≤ 涨停价",
-        "stk_limit_daily_match_v1": "涨跌停昨收与日线一致且行情不越界",
+        "stk_limit_missing_v1": "涨停价和跌停价完整",
+        "stk_limit_order_v1": "涨跌停价格顺序合理",
     },
     "stock_st": {
         "stock_st_value_v1": "ST 类型、类型名称和证券名称完整",
     },
     "moneyflow": {
         "moneyflow_range_v1": "买卖分档成交量和成交额非负",
-        "moneyflow_daily_coverage_v1": "资金流向存在对应日线",
     },
     "dividend": {
         "dividend_value_v1": "分红送转数值和实施进度合法",
         "dividend_stock_ratio_v1": "每股送转等于送股与转增之和",
-        "dividend_date_order_v1": "实施阶段的登记、除权和派发日期合理",
     },
     "forecast": {
         "forecast_value_v1": "业绩预告类型和版本标识合法",
         "forecast_range_v1": "预告比例和利润上下限顺序正确",
-        "forecast_date_order_v1": "首次公告、公告日和报告期顺序合理",
     },
     "express": {
         "express_value_v1": "业绩快报日期和版本标识合法",
-        "express_audit_flag_v1": "业绩快报审计标识异常需要复核",
-        "express_growth_v1": "业绩快报同比指标与同期值一致",
     },
     "fina_audit": {
         "fina_audit_value_v1": "审计公告日期、费用和审计信息合理",
     },
     "income": {
         "income_value_v1": "利润表公告日期、报告类型和版本合法",
-        "income_equation_v1": "利润表核心科目勾稽一致",
     },
     "balancesheet": {
         "balancesheet_value_v1": "资产负债表公告日期、报告类型和版本合法",
-        "balancesheet_equation_v1": "资产、负债和权益核心科目勾稽一致",
     },
     "cashflow": {
         "cashflow_value_v1": "现金流量表公告日期、报告类型和版本合法",
-        "cashflow_equation_v1": "现金流入、流出、净额和余额勾稽一致",
     },
     "fina_indicator": {
         "fina_indicator_value_v1": "财务指标公告日期、报告期和版本合法",
     },
     "sw_industry": {
         "sw_industry_value_v1": "申万行业层级、日期和最新标识合法",
-        "sw_industry_mapping_v1": "申万行业层级映射和有效区间不冲突",
     },
     "trade_cal": {
         "trade_calendar_value_v1": "交易所代码和开市标记合法",
-        "calendar_exchange_coverage_v1": "每日覆盖 SSE 和 SZSE",
+        "calendar_exchange_coverage_v1": "每日覆盖 SSE 和 SZSE（BSE 可选）",
         "calendar_date_coverage_v1": "请求范围内每个自然日都有交易日历",
         "calendar_pretrade_v1": "上一个交易日指向此前最近开市日",
     },
+}
+
+_CHECK_COLUMNS: dict[str, tuple[str, ...]] = {
+    "stock_basic": (
+        "list_date",
+        "ts_code",
+        "symbol",
+        "exchange",
+        "list_status",
+        "delist_date",
+    ),
+    "daily": (
+        "trade_date",
+        "ts_code",
+        "open",
+        "high",
+        "low",
+        "close",
+        "pre_close",
+        "change",
+        "pct_chg",
+        "vol",
+        "amount",
+    ),
+    "daily_basic": (
+        "trade_date",
+        "ts_code",
+        "close",
+        "turnover_rate",
+        "turnover_rate_f",
+        "volume_ratio",
+        "dv_ratio",
+        "dv_ttm",
+        "total_share",
+        "float_share",
+        "free_share",
+        "total_mv",
+        "circ_mv",
+    ),
+    "adj_factor": ("trade_date", "ts_code", "adj_factor"),
+    "suspend_d": ("trade_date", "ts_code", "suspend_type", "suspend_timing"),
+    "stk_limit": ("trade_date", "ts_code", "pre_close", "up_limit", "down_limit"),
+    "stock_st": ("trade_date", "ts_code", "type", "name", "type_name"),
+    "moneyflow": (
+        "trade_date",
+        "ts_code",
+        *(name for name in TABLE_SCHEMAS["moneyflow"].names if name.startswith(("buy_", "sell_"))),
+    ),
+    "dividend": (
+        "end_date",
+        "ts_code",
+        "ann_date",
+        "div_proc",
+        "imp_ann_date",
+        "stk_div",
+        "stk_bo_rate",
+        "stk_co_rate",
+        "cash_div",
+        "cash_div_tax",
+        "base_share",
+    ),
+    "forecast": (
+        "end_date",
+        "ts_code",
+        "ann_date",
+        "type",
+        "update_flag",
+        "p_change_min",
+        "p_change_max",
+        "net_profit_min",
+        "net_profit_max",
+    ),
+    "express": ("end_date", "ts_code", "ann_date", "update_flag"),
+    "fina_audit": (
+        "end_date",
+        "ts_code",
+        "ann_date",
+        "audit_result",
+        "audit_fees",
+        "audit_agency",
+    ),
+    "income": (
+        "end_date",
+        "ts_code",
+        "report_type",
+        "comp_type",
+        "ann_date",
+        "f_ann_date",
+        "update_flag",
+    ),
+    "balancesheet": (
+        "end_date",
+        "ts_code",
+        "report_type",
+        "comp_type",
+        "ann_date",
+        "f_ann_date",
+        "update_flag",
+    ),
+    "cashflow": (
+        "end_date",
+        "ts_code",
+        "report_type",
+        "comp_type",
+        "ann_date",
+        "f_ann_date",
+        "update_flag",
+    ),
+    "fina_indicator": ("end_date", "ts_code", "ann_date", "update_flag"),
+    "sw_industry": (
+        "in_date",
+        "ts_code",
+        "l1_code",
+        "l1_name",
+        "l2_code",
+        "l2_name",
+        "l3_code",
+        "l3_name",
+        "out_date",
+        "is_new",
+    ),
+    "trade_cal": ("cal_date", "exchange", "is_open"),
 }
 
 
@@ -146,7 +250,8 @@ class _Partition:
     files: tuple[Path, ...]
 
 
-DatasetChecker = Callable[[str, date | None, pa.Table], list[Issue]]
+Rows = Sequence[Mapping[str, object]]
+DatasetChecker = Callable[[str, date | None, Rows], list[Issue]]
 
 
 def detect(
@@ -185,7 +290,7 @@ def detect(
                     fix_mode="MANUAL",
                     observed={"row_count": 0},
                     suggested=None,
-                    message=f"{dataset} 在发布范围内没有数据",
+                    message=f"{dataset} 在检测范围内没有数据",
                 )
             )
 
@@ -326,8 +431,10 @@ def _detect_dataset(
     for manifest in sorted(table_root.rglob("_manifest.json")):
         label = _partition_label(table_root, manifest)
         partition_date = _partition_date(table_root, manifest)
-        if partition_date is not None and (
-            partition_date > through or (start is not None and partition_date < start)
+        if (
+            dataset in _MARKET_DATE_DATASETS
+            and partition_date is not None
+            and (partition_date > through or (start is not None and partition_date < start))
         ):
             continue
         partition, manifest_issues = _check_manifest(dataset, manifest, table_root)
@@ -360,6 +467,7 @@ def _check_manifest(
     try:
         return _load_partition(manifest, table_root), []
     except (OSError, ValueError, json.JSONDecodeError) as exc:
+        partition_date = _partition_date(table_root, manifest)
         return None, [
             Issue.create(
                 dataset=dataset,
@@ -368,7 +476,7 @@ def _check_manifest(
                 rule_id="manifest_v1",
                 fix_mode="MANUAL",
                 observed={"error": str(exc)},
-                suggested=None,
+                suggested=_refetch(partition_date) if partition_date else None,
                 message=f"{dataset} 分区 Manifest 无法读取",
             )
         ]
@@ -387,7 +495,7 @@ def _check_manifest_files_exist(dataset: str, partition: _Partition) -> list[Iss
             rule_id="manifest_file_missing_v1",
             fix_mode="MANUAL",
             observed={"files": [path.name for path in missing_files]},
-            suggested=None,
+            suggested=_refetch(partition.value) if partition.value else None,
             message=f"{dataset} 分区 Manifest 引用的文件不存在",
         )
     ]
@@ -414,7 +522,7 @@ def _check_parquet_files(
                     rule_id="parquet_read_v1",
                     fix_mode="MANUAL",
                     observed={"error": str(exc)},
-                    suggested=None,
+                    suggested=_refetch(partition.value) if partition.value else None,
                     message=f"{dataset} Parquet 文件无法读取",
                 )
             )
@@ -444,7 +552,7 @@ def _check_parquet_schema(
         rule_id="schema_v1",
         fix_mode="MANUAL",
         observed={"schema": str(parquet.schema_arrow)},
-        suggested=None,
+        suggested=_refetch(partition.value) if partition.value else None,
         message=f"{dataset} Parquet Schema 与登记 Schema 不一致",
     )
 
@@ -482,7 +590,8 @@ def _check_table(
     issues.extend(_check_duplicate_primary_keys(dataset, partition, partition_date, table))
     issues.extend(_check_required_values(dataset, partition, partition_date, table))
     issues.extend(_check_finite_floats(dataset, partition, partition_date, table))
-    issues.extend(_DATASET_CHECKERS[dataset](partition, partition_date, table))
+    rows = table.select(_CHECK_COLUMNS[dataset]).to_pylist()
+    issues.extend(_DATASET_CHECKERS[dataset](partition, partition_date, rows))
     return issues
 
 
@@ -494,7 +603,7 @@ def _check_partition_values(
 ) -> list[Issue]:
     """检查分区路径与每行的分区字段是否一致。"""
     partition_field = TABLE_PARTITION_BY[dataset]
-    partition_values = {row[partition_field] for row in table.to_pylist()}
+    partition_values = set(table.column(partition_field).unique().to_pylist())
     if None in partition_values or (
         partition_date is not None and partition_values != {partition_date}
     ):
@@ -506,7 +615,7 @@ def _check_partition_values(
                 rule_id="partition_value_v1",
                 fix_mode="MANUAL",
                 observed={partition_field: sorted(str(value) for value in partition_values)},
-                suggested=None,
+                suggested=_refetch(partition_date) if partition_date else None,
                 message=f"{dataset} 分区路径与记录 {partition_field} 不一致",
             )
         ]
@@ -521,7 +630,7 @@ def _check_duplicate_primary_keys(
 ) -> list[Issue]:
     """检查分区内的业务主键是否重复。"""
     primary_key = (TABLE_PARTITION_BY[dataset], *TABLE_PRIMARY_KEY[dataset])
-    rows = table.to_pylist()
+    rows = table.select(primary_key).to_pylist()
     counts = Counter(tuple(row[name] for name in primary_key) for row in rows)
     issues: list[Issue] = []
     for values, count in sorted(counts.items(), key=lambda item: str(item[0])):
@@ -552,23 +661,31 @@ def _check_required_values(
     """检查 Schema 中标记为必填的字段。"""
     schema = TABLE_SCHEMAS[dataset]
     required = [field.name for field in schema if not field.nullable]
+    missing_by_row: dict[int, list[str]] = {}
+    for name in required:
+        column = table.column(name)
+        if not column.null_count:
+            continue
+        for raw_index in pc.indices_nonzero(pc.is_null(column)).to_pylist():
+            if raw_index is None:
+                continue
+            index = int(raw_index)
+            missing_by_row.setdefault(index, []).append(name)
     issues: list[Issue] = []
-    for row in table.to_pylist():
-        key = _row_key(dataset, row)
-        missing = [name for name in required if row[name] is None]
-        if missing:
-            issues.append(
-                Issue.create(
-                    dataset=dataset,
-                    partition=partition,
-                    key=key,
-                    rule_id="required_value_v1",
-                    fix_mode="MANUAL",
-                    observed={name: None for name in missing},
-                    suggested=_suggested_refetch(dataset, row, partition_date),
-                    message=f"{dataset} 必填字段为空: {missing}",
-                )
+    for index, missing in missing_by_row.items():
+        row = _row_at(dataset, table, index)
+        issues.append(
+            Issue.create(
+                dataset=dataset,
+                partition=partition,
+                key=_row_key(dataset, row),
+                rule_id="required_value_v1",
+                fix_mode="MANUAL",
+                observed={name: None for name in missing},
+                suggested=_suggested_refetch(dataset, row, partition_date),
+                message=f"{dataset} 必填字段为空: {missing}",
             )
+        )
     return issues
 
 
@@ -581,46 +698,56 @@ def _check_finite_floats(
     """检查所有浮点字段是否包含 NaN 或无穷值。"""
     schema = TABLE_SCHEMAS[dataset]
     issues: list[Issue] = []
-    for row in table.to_pylist():
-        key = _row_key(dataset, row)
-        for field in schema:
-            value = row[field.name]
-            if (
-                pa.types.is_floating(field.type)
-                and isinstance(value, float)
-                and not math.isfinite(value)
-            ):
-                critical = field.name in _CRITICAL_FLOAT_FIELDS.get(dataset, frozenset())
-                issues.append(
-                    Issue.create(
-                        dataset=dataset,
-                        partition=partition,
-                        key=key,
-                        rule_id="finite_float_v1",
-                        fix_mode="MANUAL" if critical else "AUTO_FIX",
-                        observed={field.name: value},
-                        suggested=(
-                            _suggested_refetch(dataset, row, partition_date)
-                            if critical
-                            else {"values": {field.name: None}}
-                        ),
-                        message=f"{dataset}.{field.name} 包含非有限浮点数",
-                    )
+    for field in schema:
+        if not pa.types.is_floating(field.type):
+            continue
+        column = table.column(field.name)
+        invalid = cast(
+            pa.ChunkedArray,
+            pc.and_(pc.is_valid(column), pc.invert(pc.is_finite(column))),
+        )
+        for raw_index in pc.indices_nonzero(invalid).to_pylist():
+            if raw_index is None:
+                continue
+            index = int(raw_index)
+            row = _row_at(dataset, table, index)
+            value = column[index].as_py()
+            critical = field.name in _CRITICAL_FLOAT_FIELDS.get(dataset, frozenset())
+            issues.append(
+                Issue.create(
+                    dataset=dataset,
+                    partition=partition,
+                    key=_row_key(dataset, row),
+                    rule_id="finite_float_v1",
+                    fix_mode="MANUAL" if critical else "AUTO_FIX",
+                    observed={field.name: value},
+                    suggested=(
+                        _suggested_refetch(dataset, row, partition_date)
+                        if critical
+                        else {"values": {field.name: None}}
+                    ),
+                    message=f"{dataset}.{field.name} 包含非有限浮点数",
                 )
+            )
     return issues
+
+
+def _row_at(dataset: str, table: pa.Table, index: int) -> dict[str, object]:
+    names = (TABLE_PARTITION_BY[dataset], *TABLE_PRIMARY_KEY[dataset])
+    return {name: table.column(name)[index].as_py() for name in names}
 
 
 def check_daily(
     partition: str,
     partition_date: date | None,
-    table: pa.Table,
+    rows: Rows,
 ) -> list[Issue]:
     """检查 daily：完整性、数值范围、OHLC 关系和收盘价一致性。"""
     issues: list[Issue] = []
-    for row in table.to_pylist():
+    for row in rows:
         key = _row_key("daily", row)
         refetch = _suggested_refetch("daily", row, partition_date)
-        required = ("open", "high", "low", "close", "pre_close", "vol", "amount")
+        required = ("open", "high", "low", "close", "vol", "amount")
         missing = [name for name in required if row[name] is None]
         if missing:
             issues.append(
@@ -629,10 +756,8 @@ def check_daily(
             continue
         if not all(_finite_number(row[name]) for name in required):
             continue
-        open_, high, low, close, pre_close, volume, amount = (
-            _number(row[name]) for name in required
-        )
-        range_invalid = min(open_, high, low, close, pre_close) <= 0 or volume < 0 or amount < 0
+        open_, high, low, close, volume, amount = (_number(row[name]) for name in required)
+        range_invalid = min(open_, high, low, close) <= 0 or volume < 0 or amount < 0
         if range_invalid:
             issues.append(
                 _manual("daily", partition, key, "daily_range_v1", row, required, refetch)
@@ -640,49 +765,6 @@ def check_daily(
         elif high < max(open_, low, close) or low > min(open_, high, close):
             issues.append(
                 _manual("daily", partition, key, "daily_ohlc_v1", row, required[:4], refetch)
-            )
-        change = row["change"]
-        pct_chg = row["pct_chg"]
-        if not (_finite_number(change) and _finite_number(pct_chg)):
-            continue
-        from_change = round(pre_close + _number(change), 2)
-        from_pct = pre_close * (1 + _number(pct_chg) / 100)
-        can_fix_close = (
-            math.isclose(from_change, from_pct, abs_tol=0.0051)
-            and not math.isclose(close, from_change, abs_tol=0.0051)
-            and low <= from_change <= high
-        )
-        if can_fix_close:
-            issues.append(
-                Issue.create(
-                    dataset="daily",
-                    partition=partition,
-                    key=key,
-                    rule_id="daily_close_consistency_v1",
-                    fix_mode="AUTO_FIX",
-                    observed={
-                        "close": close,
-                        "pre_close": pre_close,
-                        "change": change,
-                        "pct_chg": pct_chg,
-                    },
-                    suggested={"values": {"close": from_change}},
-                    message="close 与 change/pct_chg 不一致，两个独立字段指向同一修正值",
-                )
-            )
-        elif not math.isclose(close, from_change, abs_tol=0.0051) or not math.isclose(
-            _number(pct_chg), _number(change) / pre_close * 100, abs_tol=0.011
-        ):
-            issues.append(
-                _manual(
-                    "daily",
-                    partition,
-                    key,
-                    "daily_arithmetic_v1",
-                    row,
-                    ("close", "pre_close", "change", "pct_chg"),
-                    refetch,
-                )
             )
         if (volume == 0) != (amount == 0):
             issues.append(
@@ -696,17 +778,55 @@ def check_daily(
                     refetch,
                 )
             )
+        pre_close_value = row["pre_close"]
+        if pre_close_value is None:
+            continue
+        if not _finite_number(pre_close_value):
+            continue
+        pre_close = _number(pre_close_value)
+        if pre_close <= 0:
+            issues.append(
+                _manual(
+                    "daily",
+                    partition,
+                    key,
+                    "daily_range_v1",
+                    row,
+                    ("pre_close",),
+                    refetch,
+                )
+            )
+            continue
+        change = row["change"]
+        pct_chg = row["pct_chg"]
+        if not (_finite_number(change) and _finite_number(pct_chg)):
+            continue
+        from_change = round(pre_close + _number(change), 2)
+        if not math.isclose(close, from_change, abs_tol=0.0051) or not math.isclose(
+            _number(pct_chg), _number(change) / pre_close * 100, abs_tol=0.011
+        ):
+            issues.append(
+                _manual(
+                    "daily",
+                    partition,
+                    key,
+                    "daily_arithmetic_v1",
+                    row,
+                    ("close", "pre_close", "change", "pct_chg"),
+                    refetch,
+                )
+            )
     return issues
 
 
 def check_adj_factor(
     partition: str,
     partition_date: date | None,
-    table: pa.Table,
+    rows: Rows,
 ) -> list[Issue]:
     """检查 adj_factor：复权因子必须为正数。"""
     issues: list[Issue] = []
-    for row in table.to_pylist():
+    for row in rows:
         value = row["adj_factor"]
         if value is None or (_finite_number(value) and _number(value) <= 0):
             issues.append(
@@ -726,15 +846,11 @@ def check_adj_factor(
 def check_stk_limit(
     partition: str,
     partition_date: date | None,
-    table: pa.Table,
+    rows: Rows,
 ) -> list[Issue]:
     """检查 stk_limit：关键价格完整且涨跌停顺序正确。"""
     fields = ("up_limit", "down_limit")
-    all_null = [
-        name
-        for name in fields
-        if table.num_rows and table.column(name).null_count == table.num_rows
-    ]
+    all_null = [name for name in fields if rows and all(row[name] is None for row in rows)]
     if all_null:
         return [
             Issue.create(
@@ -743,13 +859,13 @@ def check_stk_limit(
                 key={"trade_date": partition_date},
                 rule_id="stk_limit_partition_missing_v1",
                 fix_mode="MANUAL",
-                observed={"all_null_fields": all_null, "row_count": table.num_rows},
+                observed={"all_null_fields": all_null, "row_count": len(rows)},
                 suggested=_refetch(partition_date) if partition_date else None,
                 message=f"stk_limit 整个分区的关键字段为空: {all_null}",
             )
         ]
     issues: list[Issue] = []
-    for row in table.to_pylist():
+    for row in rows:
         key = _row_key("stk_limit", row)
         refetch = _suggested_refetch("stk_limit", row, partition_date)
         if any(row[name] is None for name in fields):
@@ -762,7 +878,11 @@ def check_stk_limit(
             if (
                 down_limit < 0
                 or up_limit < down_limit
-                or (_finite_number(pre_close) and not down_limit <= _number(pre_close) <= up_limit)
+                or (
+                    _finite_number(pre_close)
+                    and _number(pre_close) > 0
+                    and not down_limit <= _number(pre_close) <= up_limit
+                )
             ):
                 issues.append(
                     _manual(
@@ -781,13 +901,12 @@ def check_stk_limit(
 def check_trade_cal(
     partition: str,
     partition_date: date | None,
-    table: pa.Table,
+    rows: Rows,
 ) -> list[Issue]:
     """检查 trade_cal：交易所、开市标记和沪深市场覆盖完整。"""
     issues: list[Issue] = []
-    rows = table.to_pylist()
     for row in rows:
-        if row["exchange"] not in _EXCHANGES or row["is_open"] not in {0, 1}:
+        if row["exchange"] not in _VALID_EXCHANGES or row["is_open"] not in {0, 1}:
             issues.append(
                 _manual(
                     "trade_cal",
@@ -800,7 +919,7 @@ def check_trade_cal(
                 )
             )
     if partition_date is not None:
-        missing = sorted(_EXCHANGES - {row["exchange"] for row in rows})
+        missing = sorted(_REQUIRED_CALENDAR_EXCHANGES - {row["exchange"] for row in rows})
         if missing:
             issues.append(
                 Issue.create(
@@ -817,16 +936,16 @@ def check_trade_cal(
     return issues
 
 
-def check_stock_basic(partition: str, partition_date: date | None, table: pa.Table) -> list[Issue]:
+def check_stock_basic(partition: str, partition_date: date | None, rows: Rows) -> list[Issue]:
     """检查 stock_basic：证券身份和上市生命周期。"""
     issues: list[Issue] = []
     suffix_by_exchange = {"SSE": "SH", "SZSE": "SZ", "BSE": "BJ"}
-    for row in table.to_pylist():
+    for row in rows:
         key = _row_key("stock_basic", row)
         code = row["ts_code"]
         symbol = row["symbol"]
         exchange = row["exchange"]
-        suffix = suffix_by_exchange.get(exchange)
+        suffix = suffix_by_exchange.get(exchange) if isinstance(exchange, str) else None
         identity_ok = (
             isinstance(code, str)
             and isinstance(symbol, str)
@@ -870,7 +989,7 @@ def check_stock_basic(partition: str, partition_date: date | None, table: pa.Tab
     return issues
 
 
-def check_daily_basic(partition: str, partition_date: date | None, table: pa.Table) -> list[Issue]:
+def check_daily_basic(partition: str, partition_date: date | None, rows: Rows) -> list[Issue]:
     """检查 daily_basic：非负范围、股本顺序和市值恒等式。"""
     issues: list[Issue] = []
     nonnegative = (
@@ -886,7 +1005,7 @@ def check_daily_basic(partition: str, partition_date: date | None, table: pa.Tab
         "total_mv",
         "circ_mv",
     )
-    for row in table.to_pylist():
+    for row in rows:
         key = _row_key("daily_basic", row)
         refetch = _suggested_refetch("daily_basic", row, partition_date)
         invalid = [
@@ -904,60 +1023,14 @@ def check_daily_basic(partition: str, partition_date: date | None, table: pa.Tab
                     refetch,
                 )
             )
-        total, floating, free = (
-            row["total_share"],
-            row["float_share"],
-            row["free_share"],
-        )
-        share_bad = (
-            _finite_number(total)
-            and _finite_number(floating)
-            and _number(floating) > _number(total) + 0.001
-        ) or (
-            _finite_number(floating)
-            and _finite_number(free)
-            and _number(free) > _number(floating) + 0.001
-        )
-        if share_bad:
-            issues.append(
-                _manual(
-                    "daily_basic",
-                    partition,
-                    key,
-                    "daily_basic_share_order_v1",
-                    row,
-                    ("total_share", "float_share", "free_share"),
-                    refetch,
-                    severity="WARNING",
-                )
-            )
-        market_value_bad = _product_mismatch(row, "total_mv", "close", "total_share") or (
-            _product_mismatch(row, "circ_mv", "close", "float_share")
-        )
-        if market_value_bad:
-            issues.append(
-                _manual(
-                    "daily_basic",
-                    partition,
-                    key,
-                    "daily_basic_market_value_v1",
-                    row,
-                    ("close", "total_share", "float_share", "total_mv", "circ_mv"),
-                    refetch,
-                    severity="WARNING",
-                )
-            )
     return issues
 
 
-def check_suspend_d(partition: str, partition_date: date | None, table: pa.Table) -> list[Issue]:
+def check_suspend_d(partition: str, partition_date: date | None, rows: Rows) -> list[Issue]:
     """检查 suspend_d：停复牌类型和时间段。"""
     issues: list[Issue] = []
-    for row in table.to_pylist():
-        timing = row["suspend_timing"]
-        invalid = row["suspend_type"] not in {"S", "R"} or (
-            row["suspend_type"] == "R" and timing is not None
-        )
+    for row in rows:
+        invalid = row["suspend_type"] not in {"S", "R"}
         if invalid:
             issues.append(
                 _manual(
@@ -973,12 +1046,12 @@ def check_suspend_d(partition: str, partition_date: date | None, table: pa.Table
     return issues
 
 
-def check_stock_st(partition: str, partition_date: date | None, table: pa.Table) -> list[Issue]:
+def check_stock_st(partition: str, partition_date: date | None, rows: Rows) -> list[Issue]:
     """检查 stock_st：状态和名称完整。"""
     issues: list[Issue] = []
-    for row in table.to_pylist():
+    for row in rows:
         fields = ("name", "type", "type_name")
-        if any(not isinstance(row[name], str) or not row[name].strip() for name in fields):
+        if any(not _nonblank_text(row[name]) for name in fields):
             issues.append(
                 _manual(
                     "stock_st",
@@ -993,13 +1066,13 @@ def check_stock_st(partition: str, partition_date: date | None, table: pa.Table)
     return issues
 
 
-def check_moneyflow(partition: str, partition_date: date | None, table: pa.Table) -> list[Issue]:
+def check_moneyflow(partition: str, partition_date: date | None, rows: Rows) -> list[Issue]:
     """检查 moneyflow：买卖分档量额必须非负。"""
     issues: list[Issue] = []
     fields = tuple(
         name for name in TABLE_SCHEMAS["moneyflow"].names if name.startswith(("buy_", "sell_"))
     )
-    for row in table.to_pylist():
+    for row in rows:
         invalid = [name for name in fields if _finite_number(row[name]) and _number(row[name]) < 0]
         if invalid:
             issues.append(
@@ -1016,8 +1089,8 @@ def check_moneyflow(partition: str, partition_date: date | None, table: pa.Table
     return issues
 
 
-def check_dividend(partition: str, partition_date: date | None, table: pa.Table) -> list[Issue]:
-    """检查 dividend：数值、送转合计和实施日期。"""
+def check_dividend(partition: str, partition_date: date | None, rows: Rows) -> list[Issue]:
+    """检查 dividend：明确枚举、非负数值和送转合计。"""
     issues: list[Issue] = []
     processes = {
         "预案",
@@ -1037,16 +1110,31 @@ def check_dividend(partition: str, partition_date: date | None, table: pa.Table)
         "cash_div_tax",
         "base_share",
     )
-    for row in table.to_pylist():
+    for row in rows:
         key = _row_key("dividend", row)
         refetch = _suggested_refetch("dividend", row, partition_date)
         process = row["div_proc"]
         invalid = [name for name in numeric if _finite_number(row[name]) and _number(row[name]) < 0]
-        if not isinstance(process, str) or process not in processes:
+        normalized_process = process.strip() if isinstance(process, str) else None
+        if normalized_process in processes and normalized_process != process:
+            issues.append(
+                Issue.create(
+                    dataset="dividend",
+                    partition=partition,
+                    key=key,
+                    rule_id="dividend_value_v1",
+                    fix_mode="AUTO_FIX",
+                    observed={"div_proc": process},
+                    suggested={"values": {"div_proc": normalized_process}},
+                    message="dividend.div_proc 含首尾空白",
+                )
+            )
+        elif normalized_process not in processes:
             invalid.append("div_proc")
         if (
             _finite_number(row["cash_div"])
             and _finite_number(row["cash_div_tax"])
+            and _number(row["cash_div_tax"]) > 0
             and _number(row["cash_div"]) > _number(row["cash_div_tax"]) + 1e-8
         ):
             invalid.extend(("cash_div", "cash_div_tax"))
@@ -1077,23 +1165,10 @@ def check_dividend(partition: str, partition_date: date | None, table: pa.Table)
                     refetch,
                 )
             )
-        if process == "实施" and not _implemented_dividend_dates_valid(row):
-            issues.append(
-                _manual(
-                    "dividend",
-                    partition,
-                    key,
-                    "dividend_date_order_v1",
-                    row,
-                    ("imp_ann_date", "record_date", "ex_date", "pay_date", "div_listdate"),
-                    refetch,
-                    severity="WARNING",
-                )
-            )
     return issues
 
 
-def check_forecast(partition: str, partition_date: date | None, table: pa.Table) -> list[Issue]:
+def check_forecast(partition: str, partition_date: date | None, rows: Rows) -> list[Issue]:
     """检查 forecast：类型、上下限和公告日期。"""
     issues: list[Issue] = []
     types = {
@@ -1110,10 +1185,14 @@ def check_forecast(partition: str, partition_date: date | None, table: pa.Table)
         "减亏",
         "其他",
     }
-    for row in table.to_pylist():
+    for row in rows:
         key = _row_key("forecast", row)
         refetch = _suggested_refetch("forecast", row, partition_date)
-        if row["type"] not in types or row["update_flag"] not in {None, "0", "1"}:
+        if (
+            row["type"] not in types
+            or row["update_flag"] not in {None, "0", "1"}
+            or not _quarter_end(row["end_date"])
+        ):
             issues.append(
                 _manual(
                     "forecast",
@@ -1139,35 +1218,13 @@ def check_forecast(partition: str, partition_date: date | None, table: pa.Table)
                     refetch,
                 )
             )
-        first, announced = row["first_ann_date"], row["ann_date"]
-        if not _quarter_end(row["end_date"]) or (
-            isinstance(first, date) and isinstance(announced, date) and first > announced
-        ):
-            issues.append(
-                _manual(
-                    "forecast",
-                    partition,
-                    key,
-                    "forecast_date_order_v1",
-                    row,
-                    ("end_date", "first_ann_date", "ann_date"),
-                    refetch,
-                    severity="WARNING",
-                )
-            )
     return issues
 
 
-def check_express(partition: str, partition_date: date | None, table: pa.Table) -> list[Issue]:
-    """检查 express：公告字段和可重算同比指标。"""
+def check_express(partition: str, partition_date: date | None, rows: Rows) -> list[Issue]:
+    """检查 express：公告日期、报告期和版本标识。"""
     issues: list[Issue] = []
-    comparisons = (
-        ("revenue", "or_last_year", "yoy_sales"),
-        ("operate_profit", "op_last_year", "yoy_op"),
-        ("total_profit", "tp_last_year", "yoy_tp"),
-        ("diluted_eps", "eps_last_year", "yoy_eps"),
-    )
-    for row in table.to_pylist():
+    for row in rows:
         key = _row_key("express", row)
         refetch = _suggested_refetch("express", row, partition_date)
         if not _formal_announcement_valid(row, actual=False) or row["update_flag"] not in {
@@ -1186,48 +1243,20 @@ def check_express(partition: str, partition_date: date | None, table: pa.Table) 
                     refetch,
                 )
             )
-        if row["is_audit"] not in {None, 0, 1}:
-            issues.append(
-                _manual(
-                    "express",
-                    partition,
-                    key,
-                    "express_audit_flag_v1",
-                    row,
-                    ("is_audit",),
-                    refetch,
-                    severity="WARNING",
-                )
-            )
-        bad = [names for names in comparisons if _growth_mismatch(row, *names)]
-        if bad:
-            fields = tuple(dict.fromkeys(name for names in bad for name in names))
-            issues.append(
-                _manual(
-                    "express",
-                    partition,
-                    key,
-                    "express_growth_v1",
-                    row,
-                    fields,
-                    refetch,
-                    severity="WARNING",
-                )
-            )
     return issues
 
 
-def check_fina_audit(partition: str, partition_date: date | None, table: pa.Table) -> list[Issue]:
+def check_fina_audit(partition: str, partition_date: date | None, rows: Rows) -> list[Issue]:
     """检查 fina_audit：日期、费用和年度审计信息。"""
     issues: list[Issue] = []
-    for row in table.to_pylist():
+    for row in rows:
         invalid = not _formal_announcement_valid(row, actual=False) or (
             _finite_number(row["audit_fees"]) and _number(row["audit_fees"]) < 0
         )
-        if row["end_date"] and row["end_date"].month == 12:
+        end_date = row["end_date"]
+        if isinstance(end_date, date) and end_date.month == 12:
             invalid = invalid or any(
-                not isinstance(row[name], str) or not row[name].strip()
-                for name in ("audit_result", "audit_agency")
+                not _nonblank_text(row[name]) for name in ("audit_result", "audit_agency")
             )
         if invalid:
             issues.append(
@@ -1245,109 +1274,100 @@ def check_fina_audit(partition: str, partition_date: date | None, table: pa.Tabl
     return issues
 
 
-def check_income(partition: str, partition_date: date | None, table: pa.Table) -> list[Issue]:
-    """检查 income：公告字段和利润勾稽关系。"""
-    equations = (
-        ("total_profit", (("operate_profit", 1), ("non_oper_income", 1), ("non_oper_exp", -1))),
-        ("n_income", (("total_profit", 1), ("income_tax", -1))),
-        ("n_income", (("n_income_attr_p", 1), ("minority_gain", 1))),
-        ("t_compr_income", (("n_income", 1), ("oth_compr_income", 1))),
-        ("t_compr_income", (("compr_inc_attr_p", 1), ("compr_inc_attr_m_s", 1))),
-    )
+def check_income(partition: str, partition_date: date | None, rows: Rows) -> list[Issue]:
+    """检查 income 的公告日期、报告类型和版本标识。"""
     return _check_financial_statement(
         "income",
         partition,
         partition_date,
-        table,
+        rows,
         "income_value_v1",
-        "income_equation_v1",
-        equations,
     )
 
 
-def check_balancesheet(partition: str, partition_date: date | None, table: pa.Table) -> list[Issue]:
-    """检查 balancesheet：公告字段和资产负债权益勾稽。"""
-    equations = (
-        ("total_assets", (("total_liab_hldr_eqy", 1),)),
-        ("total_liab_hldr_eqy", (("total_liab", 1), ("total_hldr_eqy_inc_min_int", 1))),
-        (
-            "total_hldr_eqy_inc_min_int",
-            (("total_hldr_eqy_exc_min_int", 1), ("minority_int", 1)),
-        ),
-    )
+def check_balancesheet(partition: str, partition_date: date | None, rows: Rows) -> list[Issue]:
+    """检查 balancesheet 的公告日期、报告类型和版本标识。"""
     return _check_financial_statement(
         "balancesheet",
         partition,
         partition_date,
-        table,
+        rows,
         "balancesheet_value_v1",
-        "balancesheet_equation_v1",
-        equations,
     )
 
 
-def check_cashflow(partition: str, partition_date: date | None, table: pa.Table) -> list[Issue]:
-    """检查 cashflow：公告字段、流量净额和现金余额勾稽。"""
-    equations = (
-        ("n_cashflow_act", (("c_inf_fr_operate_a", 1), ("st_cash_out_act", -1))),
-        ("n_cashflow_inv_act", (("stot_inflows_inv_act", 1), ("stot_out_inv_act", -1))),
-        ("n_cash_flows_fnc_act", (("stot_cash_in_fnc_act", 1), ("stot_cashout_fnc_act", -1))),
-        (
-            "n_incr_cash_cash_equ",
-            (
-                ("n_cashflow_act", 1),
-                ("n_cashflow_inv_act", 1),
-                ("n_cash_flows_fnc_act", 1),
-                ("eff_fx_flu_cash", 1),
-            ),
-        ),
-        ("c_cash_equ_end_period", (("c_cash_equ_beg_period", 1), ("n_incr_cash_cash_equ", 1))),
-        ("im_net_cashflow_oper_act", (("n_cashflow_act", 1),)),
-        ("im_n_incr_cash_equ", (("n_incr_cash_cash_equ", 1),)),
-    )
+def check_cashflow(partition: str, partition_date: date | None, rows: Rows) -> list[Issue]:
+    """检查 cashflow 的公告日期、报告类型和版本标识。"""
     return _check_financial_statement(
         "cashflow",
         partition,
         partition_date,
-        table,
+        rows,
         "cashflow_value_v1",
-        "cashflow_equation_v1",
-        equations,
     )
 
 
-def check_fina_indicator(
-    partition: str, partition_date: date | None, table: pa.Table
-) -> list[Issue]:
+def check_fina_indicator(partition: str, partition_date: date | None, rows: Rows) -> list[Issue]:
     """检查 fina_indicator：公告、报告期和版本标识。"""
     issues: list[Issue] = []
-    for row in table.to_pylist():
-        if not _formal_announcement_valid(row, actual=False) or row["update_flag"] not in {
+    formal_versions = {
+        (row["ts_code"], row["end_date"])
+        for row in rows
+        if _formal_announcement_valid(row, actual=False) and row["update_flag"] == "1"
+    }
+    for row in rows:
+        if _formal_announcement_valid(row, actual=False) and row["update_flag"] in {
             None,
             "0",
             "1",
         }:
+            continue
+        observed = {name: row.get(name) for name in ("end_date", "ann_date", "update_flag")}
+        end = row.get("end_date")
+        announced = row.get("ann_date")
+        superseded_early_version = (
+            isinstance(end, date)
+            and isinstance(announced, date)
+            and announced < end
+            and row.get("update_flag") == "0"
+            and (row.get("ts_code"), end) in formal_versions
+        )
+        if superseded_early_version:
             issues.append(
-                _manual(
-                    "fina_indicator",
-                    partition,
-                    _row_key("fina_indicator", row),
-                    "fina_indicator_value_v1",
-                    row,
-                    ("end_date", "ann_date", "update_flag"),
-                    _suggested_refetch("fina_indicator", row, partition_date),
+                Issue.create(
+                    dataset="fina_indicator",
+                    partition=partition,
+                    key=_row_key("fina_indicator", row),
+                    rule_id="fina_indicator_value_v1",
+                    severity="ERROR",
+                    fix_mode="AUTO_FIX",
+                    observed=observed,
+                    suggested={"delete": True},
+                    message="提前公告的旧版本已有正式后续版本，删除不可能的历史版本",
                 )
             )
+            continue
+        issues.append(
+            _manual(
+                "fina_indicator",
+                partition,
+                _row_key("fina_indicator", row),
+                "fina_indicator_value_v1",
+                row,
+                ("end_date", "ann_date", "update_flag"),
+                _suggested_refetch("fina_indicator", row, partition_date),
+            )
+        )
     return issues
 
 
-def check_sw_industry(partition: str, partition_date: date | None, table: pa.Table) -> list[Issue]:
+def check_sw_industry(partition: str, partition_date: date | None, rows: Rows) -> list[Issue]:
     """检查 sw_industry：层级字段、有效区间和最新标识。"""
     issues: list[Issue] = []
     hierarchy = ("l1_code", "l1_name", "l2_code", "l2_name", "l3_code", "l3_name")
-    for row in table.to_pylist():
+    for row in rows:
         invalid = (
-            any(not isinstance(row[name], str) or not row[name].strip() for name in hierarchy)
+            any(not _nonblank_text(row[name]) for name in hierarchy)
             or row["is_new"] not in {"Y", "N"}
             or (
                 isinstance(row["out_date"], date)
@@ -1406,10 +1426,14 @@ def check_trade_calendar_series(
         partition = index[current]
         for row in _read_partition_rows(partition):
             exchange = row["exchange"]
-            if not isinstance(exchange, str) or exchange not in _EXCHANGES:
+            if not isinstance(exchange, str) or exchange not in _VALID_EXCHANGES:
                 continue
             expected = previous_open.get(exchange)
-            if row["pretrade_date"] != expected and (start is None or current >= start):
+            if (
+                expected is not None
+                and row["pretrade_date"] != expected
+                and (start is None or current >= start)
+            ):
                 issues.append(
                     _manual(
                         "trade_cal",
@@ -1443,31 +1467,15 @@ def check_cross_dataset_consistency(
     issues: list[Issue] = []
     if {"daily", "adj_factor"} <= selected:
         issues.extend(_check_daily_and_adj_factor(root, through=through, start=start))
-    if {"daily", "daily_basic"} <= selected:
-        issues.extend(_check_daily_and_daily_basic(root, through=through, start=start))
-    if {"daily", "stk_limit"} <= selected:
-        issues.extend(_check_daily_and_stk_limit(root, through=through, start=start))
-    if {"daily", "suspend_d"} <= selected:
-        issues.extend(_check_daily_and_suspend(root, through=through, start=start))
-    if {"daily", "moneyflow"} <= selected:
-        issues.extend(_check_daily_and_moneyflow(root, through=through, start=start))
-    if "sw_industry" in selected:
-        issues.extend(_check_sw_industry_series(root, through=through, start=start))
     return issues
 
 
 def _check_daily_and_adj_factor(root: Path, *, through: date, start: date | None) -> list[Issue]:
+    """前复权回测的唯一跨表硬要求：每条日线都有同日因子。"""
     daily = _partition_index(root, "daily", through=through, start=start)
     factors = _partition_index(root, "adj_factor", through=through, start=start)
     issues: list[Issue] = []
-    previous_matched: dict[str, tuple[float, float]] = {}
-    previous_factor: dict[str, float] = {}
-    decrease_count = 0
-    decrease_samples: list[dict[str, object]] = []
-    extra_count = 0
-    extra_samples: list[dict[str, object]] = []
-
-    for current in sorted(set(daily) | set(factors)):
+    for current in sorted(daily):
         daily_rows = _rows_by_code(daily.get(current))
         factor_rows = _rows_by_code(factors.get(current))
         missing = sorted(daily_rows.keys() - factor_rows.keys())
@@ -1484,305 +1492,18 @@ def _check_daily_and_adj_factor(root: Path, *, through: date, start: date | None
                     message="日线缺少同代码同日期的复权因子",
                 )
             )
-            for code in missing:
-                previous_matched.pop(code, None)
-
-        extras = sorted(factor_rows.keys() - daily_rows.keys())
-        extra_count += len(extras)
-        extra_samples.extend(
-            {"ts_code": code, "trade_date": current}
-            for code in extras[: max(0, 10 - len(extra_samples))]
-        )
-
-        continuity_bad: list[dict[str, object]] = []
-        for code, factor_row in factor_rows.items():
-            value = factor_row["adj_factor"]
-            if not _finite_number(value) or _number(value) <= 0:
-                continue
-            factor = _number(value)
-            if code in previous_factor and factor < previous_factor[code]:
-                decrease_count += 1
-                if len(decrease_samples) < 10:
-                    decrease_samples.append(
-                        {
-                            "ts_code": code,
-                            "trade_date": current,
-                            "previous": previous_factor[code],
-                            "current": factor,
-                        }
-                    )
-            previous_factor[code] = factor
-            daily_row = daily_rows.get(code)
-            if daily_row is None or not _finite_number(daily_row["close"]):
-                continue
-            previous = previous_matched.get(code)
-            if previous is not None and _finite_number(daily_row["pre_close"]):
-                previous_close, previous_adj = previous
-                expected = round(previous_close * previous_adj / factor, 2)
-                actual = _number(daily_row["pre_close"])
-                if not math.isclose(actual, expected, abs_tol=0.011):
-                    continuity_bad.append(
-                        {
-                            "ts_code": code,
-                            "expected_pre_close": expected,
-                            "actual_pre_close": actual,
-                        }
-                    )
-            previous_matched[code] = (_number(daily_row["close"]), factor)
-        if continuity_bad:
-            issues.append(
-                _cross_partition_issue(
-                    dataset="adj_factor",
-                    partition=factors.get(current),
-                    day=current,
-                    rule_id="adj_factor_continuity_v1",
-                    count=len(continuity_bad),
-                    samples=continuity_bad[:10],
-                    severity="WARNING",
-                    message="复权因子与相邻日线无法形成连续复权价格",
-                )
-            )
-
-    if decrease_count:
-        issues.append(
-            _dataset_series_issue(
-                "adj_factor",
-                "adj_factor_decrease_v1",
-                decrease_count,
-                decrease_samples,
-                "复权因子出现下降；这不是硬错误，但需要核对公司行动或历史修订",
-            )
-        )
-    if extra_count:
-        issues.append(
-            _dataset_series_issue(
-                "adj_factor",
-                "adj_factor_without_daily_v1",
-                extra_count,
-                extra_samples,
-                "存在没有同日行情的复权因子；需要区分停牌、退市和历史代码",
-            )
-        )
     return issues
-
-
-def _check_daily_and_daily_basic(root: Path, *, through: date, start: date | None) -> list[Issue]:
-    daily = _partition_index(root, "daily", through=through, start=start)
-    basics = _partition_index(root, "daily_basic", through=through, start=start)
-    issues: list[Issue] = []
-    for current in sorted(set(daily) | set(basics)):
-        daily_rows = _rows_by_code(daily.get(current))
-        basic_rows = _rows_by_code(basics.get(current))
-        bad: list[dict[str, object]] = []
-        for code, row in basic_rows.items():
-            market = daily_rows.get(code)
-            if market is None:
-                bad.append({"ts_code": code, "reason": "没有同日日线"})
-            elif (
-                _finite_number(row["close"])
-                and _finite_number(market["close"])
-                and not math.isclose(
-                    _number(row["close"]), _number(market["close"]), abs_tol=0.0011
-                )
-            ):
-                bad.append(
-                    {
-                        "ts_code": code,
-                        "daily_basic_close": row["close"],
-                        "daily_close": market["close"],
-                    }
-                )
-        if bad:
-            issues.append(
-                _cross_partition_issue(
-                    dataset="daily_basic",
-                    partition=basics.get(current),
-                    day=current,
-                    rule_id="daily_basic_daily_match_v1",
-                    count=len(bad),
-                    samples=bad[:10],
-                    severity="WARNING",
-                    message="每日指标与同日日线覆盖或收盘价不一致",
-                )
-            )
-    return issues
-
-
-def _check_daily_and_stk_limit(root: Path, *, through: date, start: date | None) -> list[Issue]:
-    daily = _partition_index(root, "daily", through=through, start=start)
-    limits = _partition_index(root, "stk_limit", through=through, start=start)
-    issues: list[Issue] = []
-    for current in sorted(set(daily) & set(limits)):
-        daily_rows = _rows_by_code(daily[current])
-        limit_rows = _rows_by_code(limits[current])
-        bad: list[dict[str, object]] = []
-        for code in daily_rows.keys() & limit_rows.keys():
-            market, limit = daily_rows[code], limit_rows[code]
-            required = (
-                market["pre_close"],
-                market["high"],
-                market["low"],
-                limit["pre_close"],
-                limit["up_limit"],
-                limit["down_limit"],
-            )
-            if not all(_finite_number(value) for value in required):
-                continue
-            if (
-                not math.isclose(
-                    _number(market["pre_close"]), _number(limit["pre_close"]), abs_tol=0.011
-                )
-                or _number(market["high"]) > _number(limit["up_limit"]) + 0.011
-                or _number(market["low"]) < _number(limit["down_limit"]) - 0.011
-            ):
-                bad.append(
-                    {
-                        "ts_code": code,
-                        "daily": {
-                            "pre_close": market["pre_close"],
-                            "high": market["high"],
-                            "low": market["low"],
-                        },
-                        "stk_limit": {
-                            "pre_close": limit["pre_close"],
-                            "up_limit": limit["up_limit"],
-                            "down_limit": limit["down_limit"],
-                        },
-                    }
-                )
-        if bad:
-            issues.append(
-                _cross_partition_issue(
-                    dataset="stk_limit",
-                    partition=limits.get(current),
-                    day=current,
-                    rule_id="stk_limit_daily_match_v1",
-                    count=len(bad),
-                    samples=bad[:10],
-                    severity="WARNING",
-                    message="涨跌停价格与同日日线不一致",
-                )
-            )
-    return issues
-
-
-def _check_daily_and_suspend(root: Path, *, through: date, start: date | None) -> list[Issue]:
-    daily = _partition_index(root, "daily", through=through, start=start)
-    suspends = _partition_index(root, "suspend_d", through=through, start=start)
-    issues: list[Issue] = []
-    for current in sorted(set(daily) & set(suspends)):
-        daily_codes = set(_rows_by_code(daily[current]))
-        conflicts = [
-            row["ts_code"]
-            for row in _read_partition_rows(suspends[current])
-            if row["suspend_type"] == "S"
-            and row["suspend_timing"] is None
-            and row["ts_code"] in daily_codes
-        ]
-        if conflicts:
-            issues.append(
-                _cross_partition_issue(
-                    dataset="suspend_d",
-                    partition=suspends.get(current),
-                    day=current,
-                    rule_id="suspend_daily_conflict_v1",
-                    count=len(conflicts),
-                    samples=conflicts[:10],
-                    severity="ERROR",
-                    message="全日停牌证券仍存在同日日线",
-                )
-            )
-    return issues
-
-
-def _check_daily_and_moneyflow(root: Path, *, through: date, start: date | None) -> list[Issue]:
-    daily = _partition_index(root, "daily", through=through, start=start)
-    flows = _partition_index(root, "moneyflow", through=through, start=start)
-    issues: list[Issue] = []
-    for current in sorted(set(flows)):
-        daily_codes = set(_rows_by_code(daily.get(current)))
-        missing = sorted(set(_rows_by_code(flows[current])) - daily_codes)
-        if missing:
-            issues.append(
-                _cross_partition_issue(
-                    dataset="moneyflow",
-                    partition=flows.get(current),
-                    day=current,
-                    rule_id="moneyflow_daily_coverage_v1",
-                    count=len(missing),
-                    samples=missing[:10],
-                    severity="WARNING",
-                    message="资金流向没有对应同日日线",
-                )
-            )
-    return issues
-
-
-def _check_sw_industry_series(root: Path, *, through: date, start: date | None) -> list[Issue]:
-    index = _partition_index(root, "sw_industry", through=through, start=start)
-    rows = [row for partition in index.values() for row in _read_partition_rows(partition)]
-    mappings: dict[str, dict[str, set[str]]] = {level: {} for level in ("l1", "l2", "l3")}
-    by_stock: dict[str, list[Mapping[str, object]]] = {}
-    for row in rows:
-        for level in mappings:
-            code = row[f"{level}_code"]
-            name = row[f"{level}_name"]
-            if isinstance(code, str) and isinstance(name, str):
-                mappings[level].setdefault(code, set()).add(name)
-        by_stock.setdefault(str(row["ts_code"]), []).append(row)
-
-    bad: list[dict[str, object]] = []
-    for level, values in mappings.items():
-        for code, names in values.items():
-            if len(names) > 1:
-                bad.append({"level": level, "code": code, "names": sorted(names)})
-    for code, members in by_stock.items():
-        current = [row for row in members if row["is_new"] == "Y"]
-        if len(current) > 1:
-            bad.append({"ts_code": code, "reason": "存在多个当前行业", "count": len(current)})
-        ordered = sorted(members, key=lambda row: str(row["in_date"]))
-        for previous, following in zip(ordered, ordered[1:], strict=False):
-            previous_out = previous["out_date"]
-            following_in = following["in_date"]
-            if previous_out is None or (
-                isinstance(previous_out, date)
-                and isinstance(following_in, date)
-                and following_in < previous_out
-            ):
-                bad.append(
-                    {
-                        "ts_code": code,
-                        "reason": "行业有效区间重叠",
-                        "previous_in": previous["in_date"],
-                        "previous_out": previous_out,
-                        "following_in": following_in,
-                    }
-                )
-                break
-    if not bad:
-        return []
-    return [
-        _dataset_series_issue(
-            "sw_industry",
-            "sw_industry_mapping_v1",
-            len(bad),
-            bad[:10],
-            "申万行业代码名称映射、当前成员或有效区间存在冲突",
-        )
-    ]
 
 
 def _check_financial_statement(
     dataset: str,
     partition: str,
     partition_date: date | None,
-    table: pa.Table,
+    rows: Rows,
     value_rule: str,
-    equation_rule: str,
-    equations: tuple[tuple[str, tuple[tuple[str, int], ...]], ...],
 ) -> list[Issue]:
     issues: list[Issue] = []
-    for row in table.to_pylist():
+    for row in rows:
         key = _row_key(dataset, row)
         refetch = _suggested_refetch(dataset, row, partition_date)
         if (
@@ -1811,29 +1532,6 @@ def _check_financial_statement(
                         "update_flag",
                     ),
                     refetch,
-                )
-            )
-        failed = [target for target, terms in equations if _equation_mismatch(row, target, terms)]
-        if failed:
-            fields = tuple(
-                dict.fromkeys(
-                    name
-                    for target, terms in equations
-                    if target in failed
-                    for name in (target, *(term[0] for term in terms))
-                )
-            )
-            issues.append(
-                _manual(
-                    dataset,
-                    partition,
-                    key,
-                    equation_rule,
-                    row,
-                    fields,
-                    refetch,
-                    severity="WARNING",
-                    message=f"{dataset} 核心勾稽关系不一致: {failed}",
                 )
             )
     return issues
@@ -1897,35 +1595,6 @@ def _cross_partition_issue(
     )
 
 
-def _dataset_series_issue(
-    dataset: str,
-    rule_id: str,
-    count: int,
-    samples: list[dict[str, object]],
-    message: str,
-) -> Issue:
-    return Issue.create(
-        dataset=dataset,
-        partition=None,
-        key={"dataset": dataset},
-        rule_id=rule_id,
-        severity="WARNING",
-        fix_mode="MANUAL",
-        observed={"count": count, "samples": samples},
-        suggested=None,
-        message=message,
-    )
-
-
-def _product_mismatch(row: Mapping[str, object], result: str, left: str, right: str) -> bool:
-    values = (row[result], row[left], row[right])
-    if not all(_finite_number(value) for value in values):
-        return False
-    actual = _number(values[0])
-    expected = _number(values[1]) * _number(values[2])
-    return not math.isclose(actual, expected, rel_tol=0.001, abs_tol=1.0)
-
-
 def _bounds_reversed(lower: object, upper: object) -> bool:
     return _finite_number(lower) and _finite_number(upper) and _number(lower) > _number(upper)
 
@@ -1937,22 +1606,6 @@ def _quarter_end(value: object) -> bool:
         (9, 30),
         (12, 31),
     }
-
-
-def _implemented_dividend_dates_valid(row: Mapping[str, object]) -> bool:
-    announced = row["imp_ann_date"]
-    record = row["record_date"]
-    ex_date = row["ex_date"]
-    if not all(isinstance(value, date) for value in (announced, record, ex_date)):
-        return False
-    assert isinstance(announced, date) and isinstance(record, date) and isinstance(ex_date, date)
-    if announced > record or record > ex_date:
-        return False
-    for name in ("pay_date", "div_listdate"):
-        value = row[name]
-        if isinstance(value, date) and value < record:
-            return False
-    return True
 
 
 def _formal_announcement_valid(row: Mapping[str, object], *, actual: bool) -> bool:
@@ -1976,29 +1629,6 @@ def _report_type_valid(row: Mapping[str, object]) -> bool:
         and isinstance(comp_type, str)
         and bool(comp_type.strip())
     )
-
-
-def _growth_mismatch(row: Mapping[str, object], current: str, previous: str, growth: str) -> bool:
-    values = (row[current], row[previous], row[growth])
-    if not all(_finite_number(value) for value in values) or math.isclose(
-        _number(values[1]), 0.0, abs_tol=1e-12
-    ):
-        return False
-    expected = (_number(values[0]) / _number(values[1]) - 1) * 100
-    return not math.isclose(_number(values[2]), expected, abs_tol=0.1)
-
-
-def _equation_mismatch(
-    row: Mapping[str, object],
-    target: str,
-    terms: tuple[tuple[str, int], ...],
-) -> bool:
-    values = (row[target], *(row[name] for name, _ in terms))
-    if not all(_finite_number(value) for value in values):
-        return False
-    actual = _number(row[target])
-    expected = sum(_number(row[name]) * sign for name, sign in terms)
-    return not math.isclose(actual, expected, rel_tol=1e-6, abs_tol=1.0)
 
 
 _DATASET_CHECKERS: dict[str, DatasetChecker] = {
@@ -2125,6 +1755,10 @@ def _partition_date(table_root: Path, manifest: Path) -> date | None:
 
 def _finite_number(value: object) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+
+def _nonblank_text(value: object) -> bool:
+    return isinstance(value, str) and bool(value.strip())
 
 
 def _number(value: object) -> float:

@@ -12,7 +12,6 @@ import pytest
 from market_data import (
     ALL_SYMBOLS,
     DataAdapter,
-    DataCapability,
     DataCapabilityNotSupportedError,
     DataCatalog,
     DataReader,
@@ -24,7 +23,6 @@ from market_data import (
 )
 from market_data.adapters import QmtAdapter, TushareAdapter
 from market_data.reader import (
-    _CAPABILITY_METHODS,
     CalendarReader,
     ClassificationReader,
     CorporateActionsReader,
@@ -32,7 +30,7 @@ from market_data.reader import (
     MarketReader,
     ReferenceReader,
 )
-from models import CAPABILITY_SCHEMAS, CASH_FLOW_STATEMENT_SCHEMA, DAILY_METRICS_SCHEMA
+from models import CASH_FLOW_STATEMENT_SCHEMA, DAILY_METRICS_SCHEMA, ROUTE_SCHEMAS
 from qmt_protocol import BarQuote, DividendFactor, HistoryBar, SequencedQuote, TickQuote
 from qmt_receiver import QmtDataStore
 from tushare_data import TABLE_SCHEMAS, TushareDataStore
@@ -52,9 +50,7 @@ def _us(value: datetime) -> int:
     return int(value.timestamp() * 1_000_000)
 
 
-class _CustomDailyMetricsAdapter:
-    capabilities = frozenset({DataCapability.DAILY_METRICS})
-
+class _CustomDailyMetricsAdapter(DataAdapter):
     def daily_metrics(
         self,
         *,
@@ -74,19 +70,23 @@ class _CustomDailyMetricsAdapter:
         return table if columns is None else table.select(columns)
 
 
-class _IncompleteDailyMetricsAdapter:
-    capabilities = frozenset({DataCapability.DAILY_METRICS})
+class _IncompleteDailyMetricsAdapter(DataAdapter):
+    pass
 
 
-def test_every_capability_has_a_platform_schema() -> None:
-    assert set(CAPABILITY_SCHEMAS) == set(DataCapability)
-    assert set(_CAPABILITY_METHODS) == set(DataCapability)
-    assert all(isinstance(schema, pa.Schema) for schema in CAPABILITY_SCHEMAS.values())
+def test_every_route_has_a_platform_schema() -> None:
+    assert all(isinstance(route, str) for route in ROUTE_SCHEMAS)
+    assert all(isinstance(schema, pa.Schema) for schema in ROUTE_SCHEMAS.values())
 
 
-def test_adapters_expose_explicit_capability_parameters() -> None:
+def test_adapters_expose_explicit_query_parameters() -> None:
+    assert issubclass(TushareAdapter, DataAdapter)
+    assert issubclass(QmtAdapter, DataAdapter)
     assert not hasattr(TushareAdapter, "read")
     assert not hasattr(QmtAdapter, "read")
+    assert not hasattr(TushareAdapter, "capabilities")
+    assert not hasattr(QmtAdapter, "capabilities")
+    assert not hasattr(TushareAdapter, "require_available")
     assert tuple(inspect.signature(TushareAdapter.daily_bars).parameters) == (
         "self",
         "as_of",
@@ -156,7 +156,7 @@ def test_reader_rejects_invalid_internal_result_limit(
         )
 
 
-def test_reader_routes_injected_adapter_by_declared_capability(tmp_path: Path) -> None:
+def test_reader_routes_injected_adapter_by_explicit_method(tmp_path: Path) -> None:
     custom: DataAdapter = _CustomDailyMetricsAdapter()
     with DataCatalog(tushare_root=tmp_path / "tushare", qmt_root=tmp_path / "qmt") as catalog:
         reader = DataReader(
@@ -176,17 +176,19 @@ def test_reader_routes_injected_adapter_by_declared_capability(tmp_path: Path) -
     ]
 
 
-def test_reader_rejects_declared_capability_without_required_method(tmp_path: Path) -> None:
+def test_adapter_base_reports_an_unsupported_method_when_queried(tmp_path: Path) -> None:
     incomplete: DataAdapter = _IncompleteDailyMetricsAdapter()
-    with (
-        DataCatalog(tushare_root=tmp_path / "tushare", qmt_root=tmp_path / "qmt") as catalog,
-        pytest.raises(DataCapabilityNotSupportedError, match="缺少适配器方法.*daily_metrics"),
-    ):
-        DataReader(
+    with DataCatalog(tushare_root=tmp_path / "tushare", qmt_root=tmp_path / "qmt") as catalog:
+        reader = DataReader(
             catalog,
             sources=SourceConfig(routes={"market.daily_metrics": "custom"}),
             adapters={"custom": incomplete},
         )
+        with pytest.raises(DataCapabilityNotSupportedError, match="不支持方法 'daily_metrics'"):
+            reader.at(_as_of(2, 18)).market.daily_metrics(
+                symbols=("000001.SZ",),
+                start=date(2024, 1, 1),
+            )
 
 
 def test_daily_bars_obey_pit_projection_and_support_arrow_batches(tmp_path: Path) -> None:
@@ -722,6 +724,39 @@ def test_tushare_adapter_calculates_forward_adjustment_internally(tmp_path: Path
     assert row["volume"] == 10_000.0
     assert row["amount"] == 1_000.0
     assert result.sources == ("tushare",)
+
+
+def test_tushare_daily_bars_checks_exact_datasets_once_at_public_entry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, str | tuple[str, ...]]] = []
+    with DataCatalog(
+        tushare_root=tmp_path / "tushare",
+        qmt_root=tmp_path / "qmt",
+    ) as catalog:
+        monkeypatch.setattr(
+            catalog,
+            "require_available",
+            lambda source, datasets: calls.append((source, datasets)),
+        )
+        adapter = TushareAdapter(catalog)
+        for adjustment in ("none", "forward"):
+            adapter.daily_bars(
+                as_of=_as_of(2, 17),
+                symbols=("000001.SZ",),
+                start=None,
+                end=_as_of(2, 17),
+                count=1,
+                adjustment=adjustment,
+                order="asc",
+                fetch_limit=2,
+            )
+
+    assert calls == [
+        ("tushare", "daily"),
+        ("tushare", ("daily", "adj_factor")),
+    ]
 
 
 def test_tushare_forward_adjustment_rejects_missing_factor_after_projection(

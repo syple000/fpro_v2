@@ -65,6 +65,16 @@ class TushareDataStore:
             self._store.compact_partition(dataset, partition_value)
         return data.num_rows
 
+    def _replace_partition(self, dataset: str, partition: date, data: pa.Table) -> int:
+        """完整替换一个日期分区；供有备份保护的数据修复使用。"""
+        if dataset not in TABLE_SCHEMAS:
+            raise ValueError(f"未知数据表: {dataset}")
+        schema = TABLE_SCHEMAS[dataset]
+        if not data.schema.equals(schema, check_metadata=True):
+            raise ValueError(f"{dataset} 输入 Schema 不匹配")
+        self._store.replace_partition(dataset, partition, data)
+        return data.num_rows
+
     def read(
         self,
         dataset: str,

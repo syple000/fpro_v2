@@ -16,6 +16,7 @@ from market_data.errors import (
     DataCapabilityNotSupportedError,
     DataSourceUnavailableError,
 )
+from market_data.protocols import DataAdapter
 from models import (
     ADJUSTMENT_FACTOR_SCHEMA,
     AUDIT_SCHEMA,
@@ -36,7 +37,6 @@ from models import (
     ST_STATUS_SCHEMA,
     STOCK_SCHEMA,
     SUSPENSION_SCHEMA,
-    DataCapability,
 )
 
 _TZ = "Asia/Shanghai"
@@ -55,60 +55,6 @@ _TUSHARE_COMPANY_TYPES = (
 _PLATFORM_TO_TUSHARE_COMPANY_TYPE = {
     platform: source for source, platform in _TUSHARE_COMPANY_TYPES
 }
-_TUSHARE_CAPABILITIES = frozenset(
-    {
-        DataCapability.DAILY_BARS,
-        DataCapability.REALTIME_QUOTES,
-        DataCapability.DAILY_METRICS,
-        DataCapability.MONEYFLOW,
-        DataCapability.SUSPENSIONS,
-        DataCapability.PRICE_LIMITS,
-        DataCapability.ST_STATUS,
-        DataCapability.INCOME,
-        DataCapability.BALANCE_SHEET,
-        DataCapability.CASHFLOW,
-        DataCapability.INDICATORS,
-        DataCapability.FORECAST,
-        DataCapability.EXPRESS,
-        DataCapability.AUDIT,
-        DataCapability.DIVIDENDS,
-        DataCapability.ADJUSTMENT_FACTORS,
-        DataCapability.INDUSTRY,
-        DataCapability.STOCKS,
-        DataCapability.SESSIONS,
-    }
-)
-
-_QMT_CAPABILITIES = frozenset(
-    {
-        DataCapability.DAILY_BARS,
-        DataCapability.INTRADAY_BARS,
-        DataCapability.REALTIME_QUOTES,
-    }
-)
-
-_TUSHARE_CAPABILITY_DATASETS = {
-    DataCapability.DAILY_BARS: ("daily",),
-    DataCapability.REALTIME_QUOTES: ("daily",),
-    DataCapability.DAILY_METRICS: ("daily_basic",),
-    DataCapability.MONEYFLOW: ("moneyflow",),
-    DataCapability.SUSPENSIONS: ("suspend_d",),
-    DataCapability.PRICE_LIMITS: ("stk_limit",),
-    DataCapability.ST_STATUS: ("stock_st",),
-    DataCapability.INCOME: ("income",),
-    DataCapability.BALANCE_SHEET: ("balancesheet",),
-    DataCapability.CASHFLOW: ("cashflow",),
-    DataCapability.INDICATORS: ("fina_indicator",),
-    DataCapability.FORECAST: ("forecast",),
-    DataCapability.EXPRESS: ("express",),
-    DataCapability.AUDIT: ("fina_audit",),
-    DataCapability.DIVIDENDS: ("dividend",),
-    DataCapability.ADJUSTMENT_FACTORS: ("adj_factor",),
-    DataCapability.INDUSTRY: ("sw_industry",),
-    DataCapability.STOCKS: ("stock_basic",),
-    DataCapability.SESSIONS: ("trade_cal",),
-}
-
 _INCOME_SOURCE_FIELDS = {
     "basic_earnings_per_share": "basic_eps",
     "diluted_earnings_per_share": "diluted_eps",
@@ -357,18 +303,12 @@ _AUDIT_SOURCE_FIELDS = {
 }
 
 
-class TushareAdapter:
-    """把已发布的 Tushare Parquet 数据归一为平台字段。"""
-
-    capabilities = _TUSHARE_CAPABILITIES
+class TushareAdapter(DataAdapter):
+    """把已检测的 Tushare Parquet 数据归一为平台字段。"""
 
     def __init__(self, catalog: DataCatalog) -> None:
         self._catalog = catalog
         self._connection = catalog.connection
-
-    def require_available(self, capability: DataCapability) -> None:
-        """在查询前检查该能力的直接已发布依赖。"""
-        self._catalog.require_available("tushare", _TUSHARE_CAPABILITY_DATASETS[capability])
 
     def daily_bars(
         self,
@@ -383,6 +323,8 @@ class TushareAdapter:
         fetch_limit: int | None,
         columns: tuple[str, ...] | None = None,
     ) -> pa.Table:
+        required = ("daily", "adj_factor") if adjustment == "forward" else "daily"
+        self._catalog.require_available("tushare", required)
         direction = _sql_direction(order, default="asc")
         if count is None:
             assert start is not None
@@ -459,7 +401,6 @@ class TushareAdapter:
         direction: str,
         columns: tuple[str, ...] | None,
     ) -> pa.Table:
-        self._catalog.require_available("tushare", "adj_factor")
         query = f"""
             WITH raw_bars AS MATERIALIZED (
                 {raw_bars_sql}
@@ -517,6 +458,7 @@ class TushareAdapter:
         fetch_limit: int | None,
         columns: tuple[str, ...] | None = None,
     ) -> pa.Table:
+        self._catalog.require_available("tushare", "daily")
         params = _query_parameters(
             as_of=as_of,
             trade_date=as_of.date(),
@@ -557,6 +499,7 @@ class TushareAdapter:
         fetch_limit: int | None,
         columns: tuple[str, ...] | None = None,
     ) -> pa.Table:
+        self._catalog.require_available("tushare", "daily_basic")
         direction = _sql_direction(order, default="asc")
         params = _query_parameters(
             as_of=as_of,
@@ -599,6 +542,7 @@ class TushareAdapter:
         fetch_limit: int | None,
         columns: tuple[str, ...] | None = None,
     ) -> pa.Table:
+        self._catalog.require_available("tushare", "moneyflow")
         direction = _sql_direction(order, default="asc")
         params = _query_parameters(
             as_of=as_of,
@@ -646,6 +590,7 @@ class TushareAdapter:
         fetch_limit: int | None,
         columns: tuple[str, ...] | None = None,
     ) -> pa.Table:
+        self._catalog.require_available("tushare", "suspend_d")
         params = _query_parameters(
             as_of=as_of,
             trade_date=as_of.date(),
@@ -717,6 +662,7 @@ class TushareAdapter:
         fetch_limit: int | None,
         columns: tuple[str, ...] | None = None,
     ) -> pa.Table:
+        self._catalog.require_available("tushare", "stk_limit")
         params = _query_parameters(
             as_of=as_of,
             trade_date=as_of.date(),
@@ -742,6 +688,7 @@ class TushareAdapter:
         fetch_limit: int | None,
         columns: tuple[str, ...] | None = None,
     ) -> pa.Table:
+        self._catalog.require_available("tushare", "stock_st")
         params = _query_parameters(
             as_of=as_of,
             trade_date=as_of.date(),
@@ -776,24 +723,42 @@ class TushareAdapter:
     ) -> pa.Table:
         """按平台报表种类分派到 Tushare 的对应原始表。"""
         if kind == "income":
-            method = self.income_statements
-        elif kind == "balance_sheet":
-            method = self.balance_sheets
-        elif kind == "cash_flow":
-            method = self.cash_flow_statements
-        else:
-            raise DataCapabilityNotSupportedError(f"Tushare 不支持财报种类 {kind!r}")
-        return method(
-            as_of=as_of,
-            symbols=symbols,
-            report_start=report_start,
-            report_end=report_end,
-            company_type=company_type,
-            periods=periods,
-            order=order,
-            fetch_limit=fetch_limit,
-            columns=columns,
-        )
+            return self.income_statements(
+                as_of=as_of,
+                symbols=symbols,
+                report_start=report_start,
+                report_end=report_end,
+                company_type=company_type,
+                periods=periods,
+                order=order,
+                fetch_limit=fetch_limit,
+                columns=columns,
+            )
+        if kind == "balance_sheet":
+            return self.balance_sheets(
+                as_of=as_of,
+                symbols=symbols,
+                report_start=report_start,
+                report_end=report_end,
+                company_type=company_type,
+                periods=periods,
+                order=order,
+                fetch_limit=fetch_limit,
+                columns=columns,
+            )
+        if kind == "cash_flow":
+            return self.cash_flow_statements(
+                as_of=as_of,
+                symbols=symbols,
+                report_start=report_start,
+                report_end=report_end,
+                company_type=company_type,
+                periods=periods,
+                order=order,
+                fetch_limit=fetch_limit,
+                columns=columns,
+            )
+        raise DataCapabilityNotSupportedError(f"Tushare 不支持财报种类 {kind!r}")
 
     def income_statements(
         self,
@@ -808,6 +773,7 @@ class TushareAdapter:
         fetch_limit: int | None,
         columns: tuple[str, ...] | None = None,
     ) -> pa.Table:
+        self._catalog.require_available("tushare", "income")
         return self._statements(
             table="income",
             schema=INCOME_STATEMENT_SCHEMA,
@@ -837,6 +803,7 @@ class TushareAdapter:
         fetch_limit: int | None,
         columns: tuple[str, ...] | None = None,
     ) -> pa.Table:
+        self._catalog.require_available("tushare", "balancesheet")
         return self._statements(
             table="balancesheet",
             schema=BALANCE_SHEET_SCHEMA,
@@ -871,6 +838,7 @@ class TushareAdapter:
         fetch_limit: int | None,
         columns: tuple[str, ...] | None = None,
     ) -> pa.Table:
+        self._catalog.require_available("tushare", "cashflow")
         return self._statements(
             table="cashflow",
             schema=CASH_FLOW_STATEMENT_SCHEMA,
@@ -979,6 +947,7 @@ class TushareAdapter:
         fetch_limit: int | None,
         columns: tuple[str, ...] | None = None,
     ) -> pa.Table:
+        self._catalog.require_available("tushare", "fina_indicator")
         expressions = _scale_expressions(
             _INDICATOR_SOURCE_FIELDS,
             _INDICATOR_PERCENT_FIELDS,
@@ -1053,22 +1022,36 @@ class TushareAdapter:
     ) -> pa.Table:
         """按平台披露种类分派到 Tushare 的对应原始表。"""
         if kind == "forecast":
-            method = self.forecasts
-        elif kind == "express":
-            method = self.express_reports
-        elif kind == "audit":
-            method = self.audit_reports
-        else:
-            raise DataCapabilityNotSupportedError(f"Tushare 不支持披露种类 {kind!r}")
-        return method(
-            as_of=as_of,
-            symbols=symbols,
-            visible_start=visible_start,
-            visible_end=visible_end,
-            order=order,
-            fetch_limit=fetch_limit,
-            columns=columns,
-        )
+            return self.forecasts(
+                as_of=as_of,
+                symbols=symbols,
+                visible_start=visible_start,
+                visible_end=visible_end,
+                order=order,
+                fetch_limit=fetch_limit,
+                columns=columns,
+            )
+        if kind == "express":
+            return self.express_reports(
+                as_of=as_of,
+                symbols=symbols,
+                visible_start=visible_start,
+                visible_end=visible_end,
+                order=order,
+                fetch_limit=fetch_limit,
+                columns=columns,
+            )
+        if kind == "audit":
+            return self.audit_reports(
+                as_of=as_of,
+                symbols=symbols,
+                visible_start=visible_start,
+                visible_end=visible_end,
+                order=order,
+                fetch_limit=fetch_limit,
+                columns=columns,
+            )
+        raise DataCapabilityNotSupportedError(f"Tushare 不支持披露种类 {kind!r}")
 
     def forecasts(
         self,
@@ -1081,6 +1064,7 @@ class TushareAdapter:
         fetch_limit: int | None,
         columns: tuple[str, ...] | None = None,
     ) -> pa.Table:
+        self._catalog.require_available("tushare", "forecast")
         expressions = _scale_expressions(
             _FORECAST_SOURCE_FIELDS,
             ("net_income_change_lower_bound", "net_income_change_upper_bound"),
@@ -1123,6 +1107,7 @@ class TushareAdapter:
         fetch_limit: int | None,
         columns: tuple[str, ...] | None = None,
     ) -> pa.Table:
+        self._catalog.require_available("tushare", "express")
         expressions = _scale_expressions(
             _EXPRESS_SOURCE_FIELDS,
             _EXPRESS_PERCENT_FIELDS,
@@ -1155,6 +1140,7 @@ class TushareAdapter:
         fetch_limit: int | None,
         columns: tuple[str, ...] | None = None,
     ) -> pa.Table:
+        self._catalog.require_available("tushare", "fina_audit")
         return self._disclosures(
             table="fina_audit",
             schema=AUDIT_SCHEMA,
@@ -1235,6 +1221,7 @@ class TushareAdapter:
         fetch_limit: int | None,
         columns: tuple[str, ...] | None = None,
     ) -> pa.Table:
+        self._catalog.require_available("tushare", "dividend")
         visible_at = _next_session_time("imp_ann_date")
         direction = _sql_direction(order, default="asc")
         params = _query_parameters(
@@ -1279,6 +1266,7 @@ class TushareAdapter:
         fetch_limit: int | None,
         columns: tuple[str, ...] | None = None,
     ) -> pa.Table:
+        self._catalog.require_available("tushare", "adj_factor")
         direction = _sql_direction(order, default="asc")
         params = _query_parameters(
             as_of=as_of,
@@ -1309,6 +1297,7 @@ class TushareAdapter:
         fetch_limit: int | None,
         columns: tuple[str, ...] | None = None,
     ) -> pa.Table:
+        self._catalog.require_available("tushare", "sw_industry")
         params = _query_parameters(
             as_of=as_of,
             as_of_date=as_of.date(),
@@ -1340,6 +1329,7 @@ class TushareAdapter:
         fetch_limit: int | None,
         columns: tuple[str, ...] | None = None,
     ) -> pa.Table:
+        self._catalog.require_available("tushare", "stock_basic")
         params = _query_parameters(
             as_of=as_of,
             as_of_date=as_of.date(),
@@ -1376,6 +1366,7 @@ class TushareAdapter:
         fetch_limit: int | None,
         columns: tuple[str, ...] | None = None,
     ) -> pa.Table:
+        self._catalog.require_available("tushare", "trade_cal")
         direction = _sql_direction(order, default="asc")
         params = _query_parameters(
             as_of_date=as_of.date(),
@@ -1405,6 +1396,7 @@ class TushareAdapter:
         end: date,
         exchange: str,
     ) -> pa.Table:
+        self._catalog.require_available("tushare", "trade_cal")
         query = """
             SELECT cal_date,
                    exchange
@@ -1423,10 +1415,8 @@ class TushareAdapter:
         )
 
 
-class QmtAdapter:
+class QmtAdapter(DataAdapter):
     """把 QMT 下载历史行情和已接收实时事件归一为平台字段。"""
-
-    capabilities = _QMT_CAPABILITIES
 
     def __init__(self, catalog: DataCatalog) -> None:
         self._connection = catalog.connection
@@ -1766,7 +1756,7 @@ def _fetch(
             raise DataSourceUnavailableError("交易日历未覆盖计算可见时间所需的下一交易日") from exc
         if _SUSPENSION_TIMING_ERROR in message:
             raise DataSourceUnavailableError("Tushare 停牌时段格式无效") from exc
-        raise DataSourceUnavailableError("读取已发布数据失败") from exc
+        raise DataSourceUnavailableError("读取已检测数据失败") from exc
     return _coerce_schema(table, output_schema) if output_schema is not None else table
 
 

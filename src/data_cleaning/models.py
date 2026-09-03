@@ -7,14 +7,14 @@ import math
 import os
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass
-from datetime import date
+from datetime import UTC, date, datetime
 from hashlib import sha256
 from pathlib import Path
 from typing import Any, Literal
 from uuid import uuid4
 
 FixMode = Literal["AUTO_FIX", "MANUAL"]
-DecisionAction = Literal["PATCH", "REFETCH", "ACCEPT"]
+DecisionAction = Literal["PATCH"]
 IssueSeverity = Literal["ERROR", "WARNING"]
 CheckStatus = Literal["PASS", "WARN", "FAIL"]
 
@@ -99,9 +99,8 @@ class DetectionReport:
 
     @property
     def passed(self) -> bool:
-        return not any(
-            issue.severity == "ERROR" and issue.fix_mode == "MANUAL" for issue in self.issues
-        )
+        """没有任何 ERROR 才算通过；WARNING 只记录，不阻止使用。"""
+        return not any(issue.severity == "ERROR" for issue in self.issues)
 
 
 def write_report(report: DetectionReport, path: str | Path) -> None:
@@ -122,6 +121,48 @@ def write_report(report: DetectionReport, path: str | Path) -> None:
     lines.extend(_json_text({"kind": "check", **asdict(check)}) for check in report.checks)
     lines.extend(_json_text({"kind": "issue", **asdict(issue)}) for issue in report.issues)
     _atomic_write(destination, "\n".join(lines) + "\n")
+
+
+def record_detection(root: str | Path, report: DetectionReport) -> Path:
+    """把检测报告留在数据目录；全量全表检测同时更新当前质量状态。"""
+    source = Path(root).expanduser().resolve()
+    timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
+    destination = (
+        source / "_quality" / "detections" / f"{timestamp}-{report.input_fingerprint[:12]}.jsonl"
+    )
+    write_report(report, destination)
+
+    # 局部检查只是一份排查记录，不能覆盖代表整库状态的质量门禁。
+    from tushare_data.schemas import TABLE_SCHEMAS
+
+    if report.start is None and set(report.datasets) == set(TABLE_SCHEMAS):
+        states = {
+            dataset: {
+                "errors": sum(
+                    issue.dataset == dataset and issue.severity == "ERROR"
+                    for issue in report.issues
+                ),
+                "warnings": sum(
+                    issue.dataset == dataset and issue.severity == "WARNING"
+                    for issue in report.issues
+                ),
+            }
+            for dataset in report.datasets
+        }
+        _atomic_write(
+            source / "_quality" / "status.json",
+            _json_text(
+                {
+                    "version": 1,
+                    "through": report.through,
+                    "input_fingerprint": report.input_fingerprint,
+                    "report": destination.relative_to(source).as_posix(),
+                    "datasets": states,
+                }
+            )
+            + "\n",
+        )
+    return destination
 
 
 def read_report(path: str | Path) -> DetectionReport:
@@ -168,11 +209,11 @@ def read_decisions(path: str | Path | None) -> dict[str, Decision]:
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise ValueError(f"人工决策第 {line_number} 行格式无效") from exc
-        if decision.action not in {"PATCH", "REFETCH", "ACCEPT"}:
-            raise ValueError(f"人工决策第 {line_number} 行 action 无效")
-        if not decision.reason.strip():
+        if decision.action != "PATCH":
+            raise ValueError(f"人工决策第 {line_number} 行只允许 PATCH")
+        if not isinstance(decision.reason, str) or not decision.reason.strip():
             raise ValueError(f"人工决策第 {line_number} 行 reason 不能为空")
-        if decision.action == "PATCH" and (not decision.expected or not decision.values):
+        if not decision.expected or not decision.values:
             raise ValueError("PATCH 必须同时提供 expected 和 values")
         if decision.issue_id in decisions:
             raise ValueError(f"人工决策包含重复 issue_id: {decision.issue_id}")

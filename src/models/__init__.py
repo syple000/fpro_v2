@@ -16,7 +16,6 @@ from models.data import (
     STATUS_SCHEMA,
     STOCK_SCHEMA,
     SUSPENSION_SCHEMA,
-    DataCapability,
     QueryResult,
 )
 from models.financial import (
@@ -29,28 +28,28 @@ from models.financial import (
     INCOME_STATEMENT_SCHEMA,
 )
 
-CAPABILITY_SCHEMAS = MappingProxyType(
+ROUTE_SCHEMAS = MappingProxyType(
     {
-        DataCapability.DAILY_BARS: BAR_SCHEMA,
-        DataCapability.INTRADAY_BARS: BAR_SCHEMA,
-        DataCapability.REALTIME_QUOTES: CURRENT_SCHEMA,
-        DataCapability.DAILY_METRICS: DAILY_METRICS_SCHEMA,
-        DataCapability.MONEYFLOW: MONEYFLOW_SCHEMA,
-        DataCapability.SUSPENSIONS: SUSPENSION_SCHEMA,
-        DataCapability.PRICE_LIMITS: PRICE_LIMIT_SCHEMA,
-        DataCapability.ST_STATUS: ST_STATUS_SCHEMA,
-        DataCapability.INCOME: INCOME_STATEMENT_SCHEMA,
-        DataCapability.BALANCE_SHEET: BALANCE_SHEET_SCHEMA,
-        DataCapability.CASHFLOW: CASH_FLOW_STATEMENT_SCHEMA,
-        DataCapability.INDICATORS: FINANCIAL_INDICATOR_SCHEMA,
-        DataCapability.FORECAST: FORECAST_SCHEMA,
-        DataCapability.EXPRESS: EXPRESS_SCHEMA,
-        DataCapability.AUDIT: AUDIT_SCHEMA,
-        DataCapability.DIVIDENDS: DIVIDEND_SCHEMA,
-        DataCapability.ADJUSTMENT_FACTORS: ADJUSTMENT_FACTOR_SCHEMA,
-        DataCapability.INDUSTRY: INDUSTRY_SCHEMA,
-        DataCapability.STOCKS: STOCK_SCHEMA,
-        DataCapability.SESSIONS: SESSION_SCHEMA,
+        "market.daily_bars": BAR_SCHEMA,
+        "market.intraday_bars": BAR_SCHEMA,
+        "market.realtime_quotes": CURRENT_SCHEMA,
+        "market.daily_metrics": DAILY_METRICS_SCHEMA,
+        "market.moneyflow": MONEYFLOW_SCHEMA,
+        "market.suspensions": SUSPENSION_SCHEMA,
+        "market.price_limits": PRICE_LIMIT_SCHEMA,
+        "market.st_status": ST_STATUS_SCHEMA,
+        "fundamentals.income": INCOME_STATEMENT_SCHEMA,
+        "fundamentals.balance_sheet": BALANCE_SHEET_SCHEMA,
+        "fundamentals.cashflow": CASH_FLOW_STATEMENT_SCHEMA,
+        "fundamentals.indicators": FINANCIAL_INDICATOR_SCHEMA,
+        "fundamentals.forecast": FORECAST_SCHEMA,
+        "fundamentals.express": EXPRESS_SCHEMA,
+        "fundamentals.audit": AUDIT_SCHEMA,
+        "corporate_actions.dividends": DIVIDEND_SCHEMA,
+        "corporate_actions.adjustment_factors": ADJUSTMENT_FACTOR_SCHEMA,
+        "classification.industry": INDUSTRY_SCHEMA,
+        "reference.stocks": STOCK_SCHEMA,
+        "calendar.sessions": SESSION_SCHEMA,
     }
 )
 
@@ -60,7 +59,6 @@ __all__ = [
     "BAR_SCHEMA",
     "BALANCE_SHEET_SCHEMA",
     "CASH_FLOW_STATEMENT_SCHEMA",
-    "CAPABILITY_SCHEMAS",
     "CURRENT_SCHEMA",
     "DAILY_METRICS_SCHEMA",
     "DIVIDEND_SCHEMA",
@@ -76,6 +74,6 @@ __all__ = [
     "ST_STATUS_SCHEMA",
     "STATUS_SCHEMA",
     "SUSPENSION_SCHEMA",
-    "DataCapability",
+    "ROUTE_SCHEMAS",
     "QueryResult",
 ]
