@@ -169,7 +169,6 @@ class CorporateAction:
 
     action_id: str
     symbol: str
-    visible_at: datetime
     record_date: date | None
     ex_date: date | None
     pay_date: date | None

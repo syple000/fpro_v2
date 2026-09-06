@@ -1,11 +1,11 @@
-"""分红送股处理；日期推进与账户记账集中在这里。"""
+"""分红送股处理；只按业务日期驱动账户记账。"""
 
 from __future__ import annotations
 
 import math
 from collections import defaultdict
 from collections.abc import Iterable
-from datetime import date, datetime, time
+from datetime import date, datetime
 
 from backtest.broker import SimulatedBroker
 from backtest.clock import at_time
@@ -41,35 +41,55 @@ class CorporateActionProcessor:
         reader: DataReader,
         config: BacktestConfig,
     ) -> CorporateActionProcessor:
-        """从 market_data 读取回测期末已知的公司行动并建立日期索引。"""
-        final_at = at_time(config.end_date, time(23, 59, 59))
+        """读取当前数据快照中的实施记录，而不是模拟时刻可见的公告。
+
+        策略通过 ``reader.at(clock.now)`` 读取 PIT 数据；这里读取的是账户需要
+        回放的最终经济事实。两者使用同一份 market_data，但时间语义不同。
+        """
+        latest_stored_at = at_time(date.max, datetime.max.time())
         rows = (
-            reader.at(final_at)
+            reader.at(latest_stored_at)
             .corporate_actions.dividends(
                 symbols=config.symbols or ALL_SYMBOLS,
-                visible_end=final_at,
             )
             .table.to_pylist()
         )
+
         actions: list[CorporateAction] = []
-        for index, row in enumerate(rows):
+        seen: set[tuple[object, ...]] = set()
+        for row in rows:
+            # market_data 保留预案和历史版本；账户只执行已经实施的事实。
+            if row.get("div_proc") != "实施":
+                continue
+            record_date = row.get("record_date")
+            if (
+                record_date is None
+                or not config.start_date <= record_date <= config.end_date
+            ):
+                continue
+
             stock_dividend = row.get("stock_dividend")
             if stock_dividend is None:
                 stock_dividend = (row.get("stock_bonus_rate") or 0.0) + (
                     row.get("stock_conversion_rate") or 0.0
                 )
+            stock_dividend = float(stock_dividend or 0.0)
+            key = _business_key(row, stock_dividend)
+            if key in seen:
+                continue
+            seen.add(key)
+
             actions.append(
                 CorporateAction(
-                    action_id=f"CA{index:08d}",
+                    action_id=_action_id(key),
                     symbol=row["symbol"],
-                    visible_at=row["visible_at"],
-                    record_date=row.get("record_date"),
+                    record_date=record_date,
                     ex_date=row.get("ex_date"),
                     pay_date=row.get("pay_date"),
                     listing_date=row.get("listing_date"),
                     cash_dividend=row.get("cash_dividend"),
                     cash_dividend_before_tax=row.get("cash_dividend_before_tax"),
-                    stock_dividend=float(stock_dividend or 0.0),
+                    stock_dividend=stock_dividend,
                 )
             )
         return cls(actions)
@@ -82,64 +102,64 @@ class CorporateActionProcessor:
     ) -> None:
         """日初依次处理除权、派息和红股上市。"""
         for action in self._ex.get(at.date(), ()):
-            self._require_visible(action, at)
             broker.cancel_symbol(
                 action.symbol,
                 OrderReason.CORPORATE_ACTION,
                 at,
             )
-            entitlement = portfolio.entitlement(action.action_id)
-            holding = portfolio.account_snapshot().holding(action.symbol)
-            if entitlement is None:
-                if holding is not None and holding.quantity > 0:
-                    raise CorporateActionError(
-                        f"{action.action_id} 缺少股权登记日持仓快照"
-                    )
-                entitlement = 0
-            self._recognize(action, entitlement, portfolio)
+            entitlement = self._entitlement(action, portfolio)
+            if entitlement > 0:
+                self._validate(action)
+                self._recognize_cash(action, entitlement, portfolio)
+                self._recognize_stock(action, entitlement, portfolio)
 
         for action in self._pay.get(at.date(), ()):
-            self._require_visible(action, at)
+            # 特殊分配可能没有除权日，此时不猜日期，在真实派息日直接入账。
+            if action.ex_date is None:
+                entitlement = self._entitlement(action, portfolio)
+                if entitlement > 0:
+                    self._validate(action)
+                    self._recognize_cash(action, entitlement, portfolio)
             portfolio.settle_dividend(action.action_id)
 
         for action in self._listing.get(at.date(), ()):
-            self._require_visible(action, at)
+            # 没有除权日的送股，在真实上市日直接增加为可卖股票。
+            if action.ex_date is None:
+                entitlement = self._entitlement(action, portfolio)
+                if entitlement > 0:
+                    self._validate(action)
+                    self._recognize_stock(action, entitlement, portfolio)
             portfolio.list_stock_dividend(action.action_id)
 
     def on_session_end(self, at: datetime, portfolio: Portfolio) -> None:
-        """日终按收盘持仓记录股权登记日权益。"""
+        """日终按收盘持仓记录权益；该内部快照不会暴露给策略。"""
         for action in self._record.get(at.date(), ()):
-            self._require_visible(action, at)
-            portfolio.capture_entitlement(action.action_id, action.symbol)
+            entitlement = portfolio.capture_entitlement(action.action_id, action.symbol)
+            # 无持仓的公司行动与账户无关，不因缺少后续日期而中断回测。
+            if entitlement > 0:
+                self._validate(action)
 
     @staticmethod
-    def _recognize(
+    def _recognize_cash(
         action: CorporateAction,
         entitlement: int,
         portfolio: Portfolio,
     ) -> None:
-        """除权日把登记数量换算成应收现金和待上市红股。"""
-        cash_per_share = (
-            action.cash_dividend
-            if action.cash_dividend is not None
-            else action.cash_dividend_before_tax
-        )
-        if cash_per_share is not None:
-            if not math.isfinite(cash_per_share) or cash_per_share < 0:
-                raise CorporateActionError(
-                    f"{action.action_id} 每股现金分红无效"
-                )
-            if cash_per_share > 0 and action.pay_date is None:
-                raise CorporateActionError(f"{action.action_id} 缺少派息日")
+        """把登记数量换算成应收现金；调用前已经完成业务校验。"""
+        cash_per_share = _cash_per_share(action)
+        if cash_per_share is not None and cash_per_share > 0:
             portfolio.recognize_dividend(
                 action.action_id, entitlement * cash_per_share
             )
 
-        if not math.isfinite(action.stock_dividend) or action.stock_dividend < 0:
-            raise CorporateActionError(f"{action.action_id} 送股比例无效")
+    @staticmethod
+    def _recognize_stock(
+        action: CorporateAction,
+        entitlement: int,
+        portfolio: Portfolio,
+    ) -> None:
+        """把登记数量换算成待上市红股；调用前已经完成业务校验。"""
         if action.stock_dividend > 0:
-            if action.listing_date is None:
-                raise CorporateActionError(f"{action.action_id} 缺少红股上市日")
             portfolio.add_stock_dividend(
                 action.action_id,
                 action.symbol,
@@ -148,9 +168,73 @@ class CorporateActionProcessor:
             )
 
     @staticmethod
-    def _require_visible(action: CorporateAction, at: datetime) -> None:
-        """禁止使用模拟时刻之后才公布的公司行动，守住 PIT 边界。"""
-        if action.visible_at > at:
+    def _validate(action: CorporateAction) -> None:
+        """只校验会实际影响当前账户的公司行动。"""
+        cash_per_share = _cash_per_share(action)
+        if cash_per_share is not None and (
+            not math.isfinite(cash_per_share) or cash_per_share < 0
+        ):
+            raise CorporateActionError(f"{action.action_id} 每股现金分红无效")
+        if (
+            cash_per_share is not None
+            and cash_per_share > 0
+            and action.pay_date is None
+        ):
+            raise CorporateActionError(f"{action.action_id} 缺少派息日")
+
+        if not math.isfinite(action.stock_dividend) or action.stock_dividend < 0:
+            raise CorporateActionError(f"{action.action_id} 送股比例无效")
+        if action.stock_dividend > 0 and action.listing_date is None:
+            raise CorporateActionError(f"{action.action_id} 缺少红股上市日")
+
+        if action.record_date is None:
+            raise CorporateActionError(f"{action.action_id} 缺少股权登记日")
+        if action.ex_date is not None and action.ex_date <= action.record_date:
+            raise CorporateActionError(f"{action.action_id} 除权日不晚于股权登记日")
+        if action.pay_date is not None and action.pay_date < action.record_date:
+            raise CorporateActionError(f"{action.action_id} 派息日早于股权登记日")
+        if action.listing_date is not None and action.listing_date < action.record_date:
+            raise CorporateActionError(f"{action.action_id} 红股上市日早于股权登记日")
+
+    @staticmethod
+    def _entitlement(action: CorporateAction, portfolio: Portfolio) -> int:
+        """读取登记数量；持仓存在却没有登记快照时拒绝猜测。"""
+        entitlement = portfolio.entitlement(action.action_id)
+        if entitlement is not None:
+            return entitlement
+        holding = portfolio.account_snapshot().holding(action.symbol)
+        if holding is not None and holding.quantity > 0:
             raise CorporateActionError(
-                f"{action.action_id} 在 {at.isoformat()} 尚不可见，无法无前视地处理"
+                f"{action.action_id} 缺少股权登记日持仓快照"
             )
+        return 0
+
+
+def _cash_per_share(action: CorporateAction) -> float | None:
+    """优先使用标准现金分红字段，缺失时退回税前字段。"""
+    return (
+        action.cash_dividend
+        if action.cash_dividend is not None
+        else action.cash_dividend_before_tax
+    )
+
+
+def _business_key(row: dict[str, object], stock_dividend: float) -> tuple[object, ...]:
+    """忽略报告期等来源差异，识别实际只会执行一次的公司行动。"""
+    return (
+        row["symbol"],
+        row.get("record_date"),
+        row.get("ex_date"),
+        row.get("pay_date"),
+        row.get("listing_date"),
+        row.get("cash_dividend"),
+        row.get("cash_dividend_before_tax"),
+        stock_dividend,
+        row.get("base_date"),
+        row.get("base_share"),
+    )
+
+
+def _action_id(key: tuple[object, ...]) -> str:
+    """使用业务字段生成可读且不依赖查询顺序的稳定编号。"""
+    return "CA:" + ":".join("-" if value is None else str(value) for value in key)
