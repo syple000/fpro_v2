@@ -1,191 +1,147 @@
-# 回测入门：这个项目到底需要什么
+# 回测引擎
 
-这个回测只解决一个问题：用历史数据检验“月末选股、下一交易日开盘交易”的 A 股日频策略。
-
-它不是交易平台，也不是通用量化框架。代码只保留六个部分。
-
-## 1. 回测需要哪些部分
+这个回测只有一条同步流水线，支持 `1m/5m/15m/30m/60m/1d`：
 
 ```text
-历史数据 → 策略 → 模拟成交 → 账户记账 → 每日循环 → 结果指标
+交易日开始
+  → T+1 解锁
+  → 公司行动和退市处理
+
+每根完整 Bar
+  → DataView 读取 open / close
+  → Broker 用 open 撮合上一根 Bar 后提交的订单
+  → Portfolio 应用成交
+  → Portfolio 用 close 估值
+  → Strategy 读取 DataView，返回目标权重
+  → 目标权重转换成订单，交给 Broker 等待下一根 Bar
+
+当天最后一根 Bar
+  → 登记公司行动权益
+  → 记录账户净值
 ```
 
-| 部分 | 回答的问题 | 代码 |
-| --- | --- | --- |
-| 数据 | 当时能看到什么？ | `data.py` |
-| 策略 | 根据已知数据想持有什么？ | `strategies/momentum.py` |
-| 执行 | 订单能不能成交、成交多少、多少钱？ | `execution.py` |
-| 账户 | 成交后现金和持仓如何变化？ | `portfolio.py` |
-| 主循环 | 这些步骤按什么时间顺序发生？ | `engine.py` |
-| 指标 | 最终赚亏和风险如何？ | `metrics.py` |
+回测结束后，待处理订单标记为 `EXPIRED`，然后计算指标并按需写文件。
 
-`config.py` 只是这些部分共用的少量参数；`runner.py` 负责把它们连接起来；`output.py` 可以把结果
-保存下来，但输出不是回测计算的一部分。
+## 最重要的边界
 
-### 配置分成三组
+`Clock` 只根据交易日历和频率生成时间，不读取行情。
 
-| 配置 | 控制什么 | 常用例子 |
-| --- | --- | --- |
-| `BacktestConfig` | 日期、资金、滑点、成交量限制、佣金和基础股票池 | `slippage_bps=5` 表示 0.05% 单边滑点 |
-| `MomentumConfig` | 动量区间、排名比例、持仓数量和目标仓位 | `gross_exposure=0.98` 表示使用 98% 仓位 |
-| `RunOptions` | 数据从哪里读取、结果是否写入文件 | `output_dir=None` 表示不写文件 |
+每个时间点由 `reader.at(event.at)` 创建 PIT `DataView`。当前 Bar、历史窗口、复权、文件裁剪、
+缓存和批量查询全部属于 `market_data`。回测层不维护 `BarFeed`、`HistoricalData` 或第二套缓存。
 
-百分比参数都使用小数，`0.10` 表示 10%；只有 `slippage_bps` 使用基点，`1 bps` 表示 0.01%。
-初次阅读可以全部使用默认值，只修改开始日期、结束日期和初始资金。
+引擎仍把当前查询结果转换成一个只有 `symbol / interval_start / open / close` 的 `Bar`，因为
+Broker 和 Portfolio 需要明确的业务字段。这个对象不读取数据，也不保存历史。
 
-## 2. 最小数据流
+## 撮合时间
+
+一分钟示例：
 
 ```text
-盘前：T+1 解锁、处理分红送转、退市核销
-  ↓
-开盘：执行上一交易日收盘生成的订单
-  ↓
-收盘：释放当日日线、估值、调用策略
-  ↓
-策略返回完整目标权重
-  ↓
-下一交易日重复
+09:31 收到 [09:30, 09:31] 的完整 Bar
+  → 更早的订单按 09:30 open 撮合
+  → 策略在 09:31 产生新订单
+
+09:32 收到 [09:31, 09:32] 的完整 Bar
+  → 09:31 的新订单按 09:31 open 撮合
+  → 再执行 09:32 的策略
 ```
 
-引擎只接收实现固定接口的策略对象：
+因此策略不会使用产生信号的同一根 Bar 成交。成交记录的 `filled_at` 是下一根 Bar 的
+`interval_start`，但回测是在该 Bar 完整后才确认结果。这是 Bar 级回测，不是逐笔仿真。
+
+## 文件职责
+
+| 文件 | 内容 |
+| --- | --- |
+| `config.py` | 回测参数和路径参数 |
+| `clock.py` | Event、交易时间线、单向时钟 |
+| `domain.py` | Bar、订单、成交、账户快照、最终结果 |
+| `strategy.py` | 只有一个 `on_bar` 的策略接口 |
+| `orders.py` | 目标权重校验及订单数量计算 |
+| `broker.py` | 待处理订单、撮合、费用、滑点、成交限制 |
+| `portfolio.py` | 现金、持仓、T+1、估值、分红状态 |
+| `corporate_actions.py` | 股权登记、除权、派息、红股上市 |
+| `universe.py` | 可选的默认股票池过滤 |
+| `engine.py` | 按上述顺序调用各模块 |
+| `runner.py` | 注册全部数据路由并组装运行 |
+| `metrics.py` / `output.py` | 指标计算和结果写出 |
+
+保留 `Broker`、`Portfolio` 和 `CorporateActionProcessor` 是因为它们分别保存订单、账户和公司
+行动状态。时间线、目标权重转换、结果收集等无状态逻辑都使用普通函数或列表，不再建立包装类。
+
+## 策略接口
 
 ```python
-class Strategy(ABC):
-    @property
-    def history_window(self) -> int:
-        return 1
+from backtest.clock import Event
+from backtest.domain import AccountSnapshot
+from backtest.strategy import Strategy
+from market_data import DataView
 
-    @abstractmethod
-    def on_close(self, data: SessionData) -> Mapping[str, float] | None: ...
+
+class MyStrategy(Strategy):
+    def on_bar(
+        self,
+        data: DataView,
+        event: Event,
+        account: AccountSnapshot,
+    ) -> dict[str, float] | None:
+        rows = data.market.bars(
+            symbols=("000001.SZ",),
+            frequency=event.frequency,
+            start=event.interval_start,
+            end=event.at,
+            fields=("close",),
+        ).table.to_pylist()
+        if not rows or rows[0]["close"] is None:
+            return None
+        return {"000001.SZ": 0.5}
 ```
 
-- 返回 `None`：今天不调仓；
-- 返回权重字典：这是完整目标组合，未出现的旧持仓目标为零。
+返回值含义：
 
-`history_window` 告诉数据层需要保留多少个交易日，`on_close` 是引擎调用策略的唯一入口。具体
-策略如何取历史端点、计算分数和选择股票都封装在策略类中；引擎不依赖这些细节。
+- `None`：本次不调仓；
+- `{}`：清空现有持仓；
+- `{"000001.SZ": 0.5}`：完整目标组合，平安银行目标权重为 50%。
 
-接口只固定当前真正需要的两个约定，不增加账户快照、初始化回调、盘前回调、事件总线或命令
-Context。以后增加策略时继承 `Strategy` 并实现 `on_close`；需要多日历史时再覆盖
-`history_window`。
+策略只能看到当前 `DataView` 和只读账户快照，不能创建未来 `DataView`，也不能直接修改账户。
 
-## 3. 正确性是否足够
+内置动量策略直接向 `market_data` 请求历史：
 
-对于当前的 A 股日频、收盘选股、次日开盘执行研究，正确性足够。代码守住了以下底线。
+```python
+data.market.bars(
+    symbols=candidates,
+    frequency="1d",
+    count=lookback_sessions + 1,
+    fields=("close",),
+    adjustment="forward",
+)
+```
 
-### 不偷看未来
+## 当前交易规则
 
-- 股票池通过 PIT `DataReader` 查询；
-- 策略只能读取已经释放的历史；
-- 当日收盘生成的信号最早下一交易日开盘成交；
-- 股票状态和公司行动按模拟时间判断可见性。
+- 下一根 Bar 开盘价一次性撮合；
+- 停牌不成交，涨停不买，跌停不卖；
+- 买入使用 100 股整手，清仓允许零股；
+- 买入受现金限制，卖出受持仓和 T+1 限制；
+- 可选使用上一根 Bar 的成交量限制成交规模；
+- 同批订单先卖后买；
+- 计算滑点、佣金、印花税和过户费；
+- 未完全成交的剩余部分不继续排队。
 
-### 成交不会过度乐观
+## 运行和验证
 
-- 停牌不成交；
-- 开盘涨停不买、跌停不卖；
-- 买入按 100 股整数手；
-- 卖出受 T+1 可卖数量限制；
-- 默认不超过上一交易日成交量的 10%；
-- 计算滑点、佣金、历史印花税和过户费；
-- 资金不足时减少买入数量，账户不能透支。
+`run_from_storage` 已注册全部 routes，新策略不需要处理数据源注册：
 
-卖出先执行，买入再按证券代码顺序执行。默认动量策略只使用 98% 目标仓位，通常不会发生多只
-股票争抢最后一笔现金；如果研究重点是极端资金分配，再单独增加组合分配算法。
-
-### 账户收益没有重复计算
-
-- 成交和估值使用未复权价格；
-- 策略动量使用 `close / pre_close` 链接的总收益序列；
-- 账户显式处理现金分红、送转股、红股上市和退市；
-- 每日检查现金和持仓数量不为负。
-
-这避免了“使用复权价格计算账户收益，同时又给账户增加分红”的双重计算。
-
-### 有测试保护关键顺序
-
-测试覆盖：
-
-- 收盘信号只能下一交易日开盘成交；
-- T+1；
-- 停牌、涨跌停和明确拒绝原因；
-- 执行计算不会直接修改账户；
-- 费用政策切换日期；
-- 分红、派息、送转和红股上市；
-- 零波动时 Sharpe 返回 `None`；
-- 最小结果输出。
-
-## 4. “足够正确”不等于什么
-
-当前结果不能用于回答以下问题：
-
-- 分钟或 Tick 级成交；
-- 盘口排队、冲击成本和盘中路径；
-- 融资融券、期货、期权和多币种；
-- 配股、换股、吸收合并等缺少完整数据的公司行动；
-- 指数基准和超额收益；
-- 实盘下单可靠性。
-
-只要研究问题仍是日频多头选股，就不需要为这些未来需求增加代码。
-
-## 5. 当前动量策略
-
-月末对候选股票计算过去第 120 至第 20 个交易日之间的收益，选择排名前 10% 中最强的 30 只：
-
-- 目标总仓位 98%；
-- 单只股票不超过 5%；
-- 默认至少上市 250 个交易日；
-- 默认排除 ST；
-- 下一交易日开盘调仓。
-
-动量收益计算、排序和目标权重位于 `strategies/momentum.py`，不依赖回测，可以原样用于实盘。
-`backtest/strategy.py` 的 `MonthlyMomentumStrategy` 封装回测数据适配，对引擎只暴露固定接口。
-
-## 6. 如何运行
-
-只看终端结果：
+```python
+completed = run_from_storage(
+    config=BacktestConfig(...),
+    strategy=MyStrategy(),
+    options=RunOptions(output_dir=...),
+)
+```
 
 ```bash
-uv run --group backtest backtest-momentum \
-  --start 2017-01-01 \
-  --end 2026-08-22 \
-  --tushare-dir dataset/tushare \
-  --qmt-dir dataset/qmt
+uv run --group dev pytest -q
+uv run --group dev ruff check .
+uv run --group dev pyright
 ```
-
-`dataset/tushare` 是检测和可回滚修复后的唯一数据目录；不再需要发布版本切换。
-完整用法见 [`data_cleaning`](data_cleaning.md)。
-
-需要保存结果时，显式指定一个尚不存在的目录：
-
-```bash
-uv run --group backtest backtest-momentum \
-  --start 2017-01-01 \
-  --end 2026-08-22 \
-  --tushare-dir dataset/tushare \
-  --qmt-dir dataset/qmt \
-  --output-dir runs/my-first-backtest
-```
-
-输出只有：
-
-```text
-config.json
-metrics.json
-orders.parquet
-fills.parquet
-equity.parquet
-```
-
-指标只保留累计收益、年化收益、波动率、Sharpe、最大回撤、换手率、订单/成交数和费用。
-
-## 7. 建议阅读顺序
-
-1. `strategies/momentum.py`：策略想做什么；
-2. `engine.py`：每天按什么顺序执行；
-3. `execution.py`：为什么成交或不成交；
-4. `portfolio.py`：现金和持仓如何变化；
-5. `data.py`：如何避免未来数据；
-6. `metrics.py`：结果如何汇总。
-
-先理解这一条完整链路，再根据真实研究问题扩展。不要为了“以后可能用到”提前增加抽象。

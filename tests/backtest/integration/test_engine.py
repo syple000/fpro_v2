@@ -1,135 +1,154 @@
 from __future__ import annotations
 
-from datetime import date
-from pathlib import Path
+from datetime import date, time
+from typing import cast
 
-import pyarrow as pa
+import pytest
 
+from backtest.clock import Event
 from backtest.config import BacktestConfig
-from backtest.data import MarketData, SessionData
+from backtest.domain import AccountSnapshot, BacktestResult, OrderStatus
 from backtest.engine import BacktestEngine
 from backtest.strategy import Strategy
-from market_data import DataCatalog, DataReader, SourceConfig
-from tushare_data import TABLE_SCHEMAS, TushareDataStore
-
-
-def _table(dataset: str, *rows: dict[str, object]) -> pa.Table:
-    return pa.Table.from_pylist(list(rows), schema=TABLE_SCHEMAS[dataset])
+from market_data import DataReader, DataView
+from tests.backtest.conftest import (
+    MemoryDataReader,
+    bar_table,
+    daily_bar,
+    timestamp,
+)
 
 
 class OneShotStrategy(Strategy):
     def __init__(self) -> None:
-        self.ordered = False
-        self.visible_history: list[tuple[int, ...]] = []
+        self.calls = 0
+        self.events: list[str] = []
+        self.quantities: list[int] = []
 
-    def on_close(self, data: SessionData) -> dict[str, float] | None:
-        self.visible_history.append(
-            tuple(point.session_index for point in data.history("000001.SZ"))
-        )
-        if not self.ordered:
-            self.ordered = True
-            return {"000001.SZ": 0.5}
-        return None
+    def on_bar(
+        self,
+        data: DataView,
+        event: Event,
+        account: AccountSnapshot,
+    ) -> dict[str, float] | None:
+        del data
+        self.events.append(f"bar:{event.at:%Y-%m-%d %H:%M}")
+        holding = account.holding("000001.SZ")
+        self.quantities.append(holding.quantity if holding is not None else 0)
+        self.calls += 1
+        return {"000001.SZ": 0.5} if self.calls == 1 else None
 
 
-def test_close_signal_only_fills_at_next_open(tmp_path: Path) -> None:
-    tushare_root = tmp_path / "tushare"
-    sessions = (date(2024, 1, 2), date(2024, 1, 3), date(2024, 1, 4))
-    with TushareDataStore(tushare_root) as store:
-        store.write(
-            "stock_basic",
-            _table(
-                "stock_basic",
-                {
-                    "ts_code": "000001.SZ",
-                    "symbol": "000001",
-                    "exchange": "SZSE",
-                    "curr_type": "CNY",
-                    "list_status": "L",
-                    "list_date": date(1991, 4, 3),
-                },
-            ),
-        )
-        for index, session in enumerate(sessions):
-            store.write(
-                "trade_cal",
-                _table(
-                    "trade_cal",
-                    {
-                        "exchange": "SSE",
-                        "cal_date": session,
-                        "is_open": 1,
-                        "pretrade_date": sessions[index - 1] if index else None,
-                    },
-                ),
-            )
-            store.write(
-                "daily",
-                _table(
-                    "daily",
-                    {
-                        "ts_code": "000001.SZ",
-                        "trade_date": session,
-                        "open": 10.0 + index,
-                        "high": 10.5 + index,
-                        "low": 9.5 + index,
-                        "close": 10.0 + index,
-                        "pre_close": 9.0 + index,
-                        "vol": 10_000.0,
-                        "amount": 100_000.0,
-                    },
-                ),
-            )
-            store.write(
-                "stk_limit",
-                _table(
-                    "stk_limit",
-                    {
-                        "ts_code": "000001.SZ",
-                        "trade_date": session,
-                        "pre_close": 9.0 + index,
-                        "up_limit": 20.0,
-                        "down_limit": 1.0,
-                    },
-                ),
-            )
+def _run(
+    config: BacktestConfig,
+    reader: MemoryDataReader,
+    sessions: tuple[date, ...],
+    calendar: tuple[date, ...],
+    strategy: Strategy,
+) -> BacktestResult:
+    return BacktestEngine(
+        reader=cast(DataReader, reader),
+        config=config,
+        sessions=sessions,
+        calendar=calendar,
+        strategy=strategy,
+    ).run()
 
-    routes = {
-        route: "tushare"
-        for route in (
-            "calendar.sessions",
-            "corporate_actions.dividends",
-            "market.daily_bars",
-            "market.price_limits",
-            "market.st_status",
-            "market.suspensions",
-            "reference.stocks",
-        )
-    }
+
+def test_daily_signal_fills_at_next_session_open() -> None:
+    sessions = (date(2026, 1, 5), date(2026, 1, 6), date(2026, 1, 7))
+    calendar = (*sessions, date(2026, 1, 8))
     config = BacktestConfig(
-        start_date=sessions[0],
-        end_date=sessions[-1],
-        initial_cash=100_000.0,
+        sessions[0],
+        sessions[-1],
+        frequency="1d",
+        symbols=("000001.SZ",),
+        initial_cash=100_000,
+        slippage_bps=0,
+        volume_limit=None,
         commission_rate=0,
         minimum_commission=0,
-        slippage_bps=0,
-        max_volume_fraction=None,
     )
-    with DataCatalog(tushare_root=tushare_root, qmt_root=tmp_path / "qmt") as catalog:
-        data = MarketData(
-            DataReader(catalog, sources=SourceConfig(routes)),
-            config,
-        )
-        strategy = OneShotStrategy()
-        result = BacktestEngine(
-            config=config,
-            data=data,
-            strategy=strategy,
-        ).run()
+    strategy = OneShotStrategy()
+    reader = MemoryDataReader(
+        bar_table(
+            [
+                daily_bar(sessions[0], 10),
+                daily_bar(sessions[1], 12, open_price=11),
+                daily_bar(sessions[2], 13),
+            ]
+        ),
+        calendar,
+    )
 
-    assert len(result.fills) == 1
-    assert result.orders[0].order.submitted_at.date() == sessions[0]
-    assert result.fills[0].filled_at.date() == sessions[1]
-    assert result.fills[0].market_price == 11.0
-    assert result.equity[0].total_equity == 100_000.0
-    assert strategy.visible_history == [(0,), (0, 1), (0, 1, 2)]
+    result = _run(config, reader, sessions, calendar, strategy)
+
+    assert strategy.events[:2] == [
+        "bar:2026-01-05 16:05",
+        "bar:2026-01-06 16:05",
+    ]
+    assert strategy.quantities[:2] == [0, 5_000]
+    assert [update.status for update in result.order_updates] == [
+        OrderStatus.SUBMITTED,
+        OrderStatus.FILLED,
+    ]
+    assert result.fills[0].filled_at == timestamp(sessions[1], time(9, 30))
+    assert result.fills[0].execution_price == 11
+    assert result.fills[0].quantity == 5_000
+    assert result.order_updates[-1].status is OrderStatus.FILLED
+    assert result.equity[-1].total_equity == pytest.approx(109_999.45)
+
+
+def test_minute_signal_fills_on_next_bar_before_strategy_callback() -> None:
+    session = date(2026, 1, 5)
+    next_session = date(2026, 1, 6)
+    config = BacktestConfig(
+        session,
+        session,
+        frequency="1m",
+        symbols=("000001.SZ",),
+        initial_cash=100_000,
+        slippage_bps=0,
+        volume_limit=None,
+        commission_rate=0,
+        minimum_commission=0,
+    )
+    rows = [
+        {
+            "symbol": "000001.SZ",
+            "interval_start": timestamp(session, time(9, 30)),
+            "interval_end": timestamp(session, time(9, 31)),
+            "open": 9.5,
+            "high": 10.0,
+            "low": 9.5,
+            "close": 10.0,
+        },
+        {
+            "symbol": "000001.SZ",
+            "interval_start": timestamp(session, time(9, 31)),
+            "interval_end": timestamp(session, time(9, 32)),
+            "open": 11.0,
+            "high": 12.0,
+            "low": 11.0,
+            "close": 12.0,
+        },
+    ]
+    strategy = OneShotStrategy()
+    reader = MemoryDataReader(bar_table(rows), (session, next_session))
+
+    result = _run(
+        config,
+        reader,
+        (session,),
+        (session, next_session),
+        strategy,
+    )
+
+    assert strategy.events[:2] == [
+        "bar:2026-01-05 09:31",
+        "bar:2026-01-05 09:32",
+    ]
+    assert strategy.quantities[:2] == [0, 5_000]
+    assert result.fills[0].filled_at == timestamp(session, time(9, 31))
+    assert result.fills[0].execution_price == 11
+    assert result.equity[-1].total_equity == pytest.approx(104_999.45)

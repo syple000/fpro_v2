@@ -1,74 +1,144 @@
-"""与回测或实盘无关的动量决策。"""
+"""一个刻意保持简单的月度动量示例策略。"""
 
 from __future__ import annotations
 
 import math
-from collections.abc import Mapping
+from collections import defaultdict
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
+from datetime import datetime
+
+from backtest.clock import Event
+from backtest.domain import AccountSnapshot
+from backtest.strategy import Strategy
+from backtest.universe import select_stock_universe
+from market_data import DataView
 
 
 @dataclass(frozen=True, slots=True)
 class MomentumConfig:
-    """月度动量策略参数。
+    """月度动量策略自己的参数，不混入通用回测配置。"""
 
-    默认比较“当前交易日前第 120 日”到“第 20 日”的累计收益，在月末选择排名靠前的股票并
-    等权持有。这里的比例都使用小数，例如 0.10 表示 10%。
-    """
-
-    # 动量区间较早的端点距离当前多少个交易日。默认 120。
-    lookback_sessions: int = 120
-    # 动量区间较近的端点距离当前多少个交易日。默认跳过最近 20 日，避免追逐短期波动。
-    skip_sessions: int = 20
-    # 从拥有有效动量分数的股票中取排名前多少比例。0.10 表示前 10%。
-    top_fraction: float = 0.10
-    # 最多持有多少只股票；最终数量还会受到 top_fraction 限制。
-    max_positions: int = 30
-    # 所有目标持仓权重之和。0.98 表示计划使用 98% 资金，留下约 2% 现金缓冲。
-    gross_exposure: float = 0.98
-    # 单只股票的最大目标权重。0.05 表示最多占总资产 5%。
-    max_position_weight: float = 0.05
-    # True 时只买入动量收益大于 0 的股票；没有合格股票时保持现金。
-    require_positive_momentum: bool = False
+    # 从当前交易日向前比较多少个交易日的累计收益。
+    lookback_sessions: int = 20
+    # 每次调仓最多持有得分最高的多少只股票。
+    selection_count: int = 10
+    # 候选股票至少已经历多少个交易日。
+    minimum_listing_sessions: int = 250
+    # 是否排除当前处于 ST 状态的股票。
+    exclude_st: bool = True
 
     def __post_init__(self) -> None:
-        if self.lookback_sessions <= self.skip_sessions or self.skip_sessions < 0:
-            raise ValueError("lookback_sessions 必须大于 skip_sessions，且 skip_sessions 不能为负")
-        if not 0 < self.top_fraction <= 1:
-            raise ValueError("top_fraction 必须位于 (0, 1]")
-        if self.max_positions < 1:
-            raise ValueError("max_positions 必须是正整数")
-        if not 0 < self.gross_exposure <= 1:
-            raise ValueError("gross_exposure 必须位于 (0, 1]")
-        if not 0 < self.max_position_weight <= 1:
-            raise ValueError("max_position_weight 必须位于 (0, 1]")
+        """拒绝没有业务意义的窗口和数量。"""
+        if self.lookback_sessions < 1:
+            raise ValueError("lookback_sessions 必须是正整数")
+        if self.selection_count < 1:
+            raise ValueError("selection_count 必须是正整数")
+        if self.minimum_listing_sessions < 0:
+            raise ValueError("minimum_listing_sessions 不能为负")
 
 
-def momentum_return(old_value: float | None, recent_value: float | None) -> float | None:
-    """用两个总收益指数端点计算动量；数据如何取得由运行环境负责。"""
-
-    if old_value is None or recent_value is None or old_value <= 0:
+def momentum_return(closes: Sequence[float | None]) -> float | None:
+    """用窗口首尾两个前复权收盘价计算动量收益。"""
+    if len(closes) < 2:
         return None
-    value = recent_value / old_value - 1.0
+    first, last = closes[0], closes[-1]
+    if (
+        first is None
+        or last is None
+        or not math.isfinite(first)
+        or not math.isfinite(last)
+        or first <= 0
+    ):
+        return None
+    value = last / first - 1
     return value if math.isfinite(value) else None
 
 
 def select_momentum_targets(
-    scores: Mapping[str, float | None],
+    data: DataView,
+    event: Event,
     config: MomentumConfig,
+    *,
+    allowed_symbols: Iterable[str] | None = None,
 ) -> dict[str, float]:
-    """按动量分数生成完整目标权重，回测和实盘使用同一决策。"""
+    """从 DataView 查询候选池和历史行情，返回等权目标组合。"""
+    candidates = select_stock_universe(
+        data,
+        minimum_listing_sessions=config.minimum_listing_sessions,
+        exclude_st=config.exclude_st,
+        allowed_symbols=allowed_symbols,
+    )
+    if not candidates:
+        return {}
 
-    ranked = [
-        (symbol, score)
-        for symbol, score in scores.items()
-        if score is not None
-        and math.isfinite(score)
-        and (not config.require_positive_momentum or score > 0)
+    # 历史窗口、复权和底层查询优化都由 market_data 处理；策略只声明所需数据。
+    rows = data.market.bars(
+        symbols=candidates,
+        frequency="1d",
+        count=config.lookback_sessions + 1,
+        fields=("close",),
+        adjustment="forward",
+    ).table.to_pylist()
+    histories: dict[str, list[tuple[datetime, float | None]]] = defaultdict(list)
+    for row in rows:
+        interval_start = row["interval_start"]
+        if not isinstance(interval_start, datetime):
+            raise TypeError("行情 interval_start 必须是 datetime")
+        histories[row["symbol"]].append((interval_start, row.get("close")))
+
+    scored: list[tuple[float, str]] = []
+    required = config.lookback_sessions + 1
+    for symbol in candidates:
+        history = sorted(histories[symbol], key=lambda item: item[0])
+        if len(history) != required or history[-1][0].date() != event.session:
+            continue
+        score = momentum_return([close for _, close in history])
+        if score is not None:
+            scored.append((score, symbol))
+
+    selected = [
+        symbol
+        for _, symbol in sorted(scored, key=lambda item: (-item[0], item[1]))[
+            : config.selection_count
+        ]
     ]
-    ranked.sort(key=lambda item: (-item[1], item[0]))
-    count = min(math.ceil(len(ranked) * config.top_fraction), config.max_positions)
-    selected = ranked[:count]
     if not selected:
         return {}
-    weight = min(config.gross_exposure / len(selected), config.max_position_weight)
-    return {symbol: weight for symbol, _ in selected}
+    weight = 1 / len(selected)
+    return {symbol: weight for symbol in selected}
+
+
+class MonthlyMomentumStrategy(Strategy):
+    """仅在每月最后一个交易日的日线结束后进行一次等权调仓。"""
+
+    def __init__(
+        self,
+        config: MomentumConfig | None = None,
+        *,
+        allowed_symbols: Iterable[str] | None = None,
+    ) -> None:
+        """保存策略参数；allowed_symbols 可进一步限制候选范围。"""
+        self.config = config or MomentumConfig()
+        self.allowed_symbols = (
+            tuple(allowed_symbols) if allowed_symbols is not None else None
+        )
+
+    def on_bar(
+        self,
+        data: DataView,
+        event: Event,
+        account: AccountSnapshot,
+    ) -> dict[str, float] | None:
+        """非月末返回 None；月末直接从当前 DataView 计算完整目标组合。"""
+        del account
+        if event.frequency != "1d":
+            raise ValueError("MonthlyMomentumStrategy 只按日线交易")
+        if not event.is_session_end or not event.is_month_end:
+            return None
+        return select_momentum_targets(
+            data,
+            event,
+            self.config,
+            allowed_symbols=self.allowed_symbols,
+        )

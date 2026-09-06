@@ -9,3 +9,4 @@ __pycache__/
 /dataset
 /runs
 data_validation.json
+/output

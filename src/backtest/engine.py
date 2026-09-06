@@ -1,167 +1,145 @@
-"""单进程、同步、确定性的日频回测循环。"""
+"""把时钟、数据、撮合、账户和策略串成一条同步流水线。"""
 
 from __future__ import annotations
 
 import math
-from collections.abc import Mapping
-from dataclasses import dataclass
+from collections.abc import Sequence
 from datetime import date, datetime, time
 
+from backtest.broker import SimulatedBroker
+from backtest.clock import Clock, Event, at_time, market_timeline
 from backtest.config import BacktestConfig
 from backtest.corporate_actions import CorporateActionProcessor
-from backtest.data import MarketData, event_time
-from backtest.execution import LOT_SIZE, ExecutionEngine
+from backtest.domain import BacktestResult, Bar, EquitySnapshot, OrderReason
+from backtest.errors import DataError
+from backtest.orders import create_orders
 from backtest.portfolio import Portfolio
 from backtest.strategy import Strategy
-from backtest.types import EquitySnapshot, Fill, OrderReason, OrderResult, OrderSide
-from strategies import validate_target_weights
-
-
-@dataclass(frozen=True, slots=True)
-class BacktestResult:
-    sessions: tuple[date, ...]
-    orders: tuple[OrderResult, ...]
-    fills: tuple[Fill, ...]
-    equity: tuple[EquitySnapshot, ...]
+from backtest.universe import listed_symbols
+from market_data import ALL_SYMBOLS, DataReader, DataView
 
 
 class BacktestEngine:
-    """盘前处理账户，开盘执行昨日目标，收盘生成新目标。"""
+    """按固定顺序执行回测，不实现数据、撮合或账户的内部规则。"""
 
     def __init__(
         self,
         *,
+        reader: DataReader,
         config: BacktestConfig,
-        data: MarketData,
+        sessions: Sequence[date],
+        calendar: Sequence[date],
         strategy: Strategy,
+        actions: CorporateActionProcessor | None = None,
     ) -> None:
+        """创建回测所需的时钟、账户和模拟 Broker。"""
+        if not sessions:
+            raise DataError("回测区间内没有交易日")
+        self.reader = reader
         self.config = config
-        self.data = data
         self.strategy = strategy
+        self.events = market_timeline(sessions, calendar, config.frequency)
+        self.clock = Clock()
         self.portfolio = Portfolio(config.initial_cash)
-        self.execution = ExecutionEngine(config)
-        self.actions = CorporateActionProcessor(data.corporate_actions)
+        self.broker = SimulatedBroker(config)
+        self.actions = actions or CorporateActionProcessor(())
         self._equity: list[EquitySnapshot] = []
 
     def run(self) -> BacktestResult:
-        if not self.data.sessions:
-            self.data.load()
-            self.actions = CorporateActionProcessor(self.data.corporate_actions)
+        """逐个事件推进，最后返回订单、成交和每日净值。"""
+        active_session: date | None = None
+        for event in self.events:
+            if event.session != active_session:
+                start_at = at_time(event.session, time(9, 25))
+                self.clock.move_to(start_at)
+                self._start_session(start_at, self.reader.at(start_at))
+                active_session = event.session
+            self.clock.move_to(event.at)
+            self._process_bar(event, self.reader.at(event.at))
+            if event.is_session_end:
+                self._end_session(event)
+            self.portfolio.assert_valid()
 
-        for session_index, session in enumerate(self.data.sessions):
-            bars = self.data.prepare_session(session)
-            pre_open = event_time(session, time(9, 25))
-            self.portfolio.unlock_t1()
-            self.actions.pre_open(
-                pre_open,
-                portfolio=self.portfolio,
-                execution=self.execution,
-            )
-            self._write_off_delisted(session)
+        if self.clock.now is not None:
+            self.broker.expire_all(self.clock.now)
+        equity = tuple(self._equity)
+        return BacktestResult(
+            sessions=tuple(snapshot.session for snapshot in equity),
+            orders=self.broker.orders,
+            order_updates=self.broker.updates,
+            fills=self.broker.fills,
+            equity=equity,
+        )
 
-            market_open = event_time(session, time(9, 30))
-            symbols = self.execution.pending_symbols
-            statuses = self.data.statuses(session, symbols) if symbols else {}
-            fills = self.execution.execute_open(
-                event_time=market_open,
+    def _start_session(self, at: datetime, data: DataView) -> None:
+        """日初解锁 T+1，处理公司行动，并核销退市持仓。"""
+        self.portfolio.unlock_t1()
+        self.actions.on_session_start(at, self.portfolio, self.broker)
+
+        held = {holding.symbol for holding in self.portfolio.account_snapshot().holdings}
+        managed = set(self.broker.pending_symbols) | held
+        if not managed:
+            return
+        for symbol in sorted(managed - listed_symbols(data)):
+            self.broker.cancel_symbol(symbol, OrderReason.DELISTED, at)
+            self.portfolio.write_off(symbol)
+
+    def _process_bar(self, event: Event, data: DataView) -> None:
+        """读取 Bar，然后依次撮合、估值、执行策略和提交订单。"""
+        bars = self._read_bars(event, data)
+
+        # 先撮合旧订单，保证本次策略产生的订单只能使用下一根 Bar 的开盘价。
+        if self.broker.pending_symbols:
+            fills = self.broker.match_bar(
+                event=event,
                 bars=bars,
-                statuses=statuses,
-                previous_volumes=self.data.previous_volumes(symbols),
-                cash=self.portfolio.cash,
-                total_quantities={
-                    symbol: position.total_quantity
-                    for symbol, position in self.portfolio.positions.items()
-                },
-                sellable_quantities={
-                    symbol: position.sellable_quantity
-                    for symbol, position in self.portfolio.positions.items()
-                },
+                account=self.portfolio.account_snapshot(),
+                data=data,
             )
             for fill in fills:
                 self.portfolio.apply_fill(fill)
 
-            close_at = event_time(session, time(16, 5))
-            self.data.release_close(session, session_index)
-            self.portfolio.mark_to_market(
-                {
-                    symbol: bar.close
-                    for symbol, bar in self.data.released_bars.items()
-                    if bar.close is not None
-                }
-            )
-            self.actions.capture_record_date(close_at, self.portfolio)
-            self._equity.append(self.portfolio.snapshot(session))
+        prices = {
+            symbol: float(bar.close)
+            for symbol, bar in bars.items()
+            if bar.close is not None and math.isfinite(bar.close) and bar.close > 0
+        }
+        self.portfolio.mark_to_market(prices)
 
-            targets = self.strategy.on_close(self.data.session_data(session, session_index))
-            next_session = self.data.next_session(session)
-            if targets is not None and next_session is not None:
-                self._submit_rebalance(
-                    validate_target_weights(targets),
-                    submitted_at=close_at,
-                    earliest_session=next_session,
-                )
-            self.portfolio.assert_invariants()
+        weights = self.strategy.on_bar(data, event, self.portfolio.account_snapshot())
+        if weights is None:
+            return
+        for order in create_orders(
+            weights,
+            self.portfolio.account_snapshot(),
+            prices,
+        ):
+            self.broker.submit(order, event.at)
 
-        self.execution.expire_all()
-        return BacktestResult(
-            sessions=self.data.sessions,
-            orders=tuple(self.execution.results),
-            fills=tuple(self.execution.fills),
-            equity=tuple(self._equity),
-        )
-
-    def _submit_rebalance(
-        self,
-        target_weights: Mapping[str, float],
-        *,
-        submitted_at: datetime,
-        earliest_session: date,
-    ) -> None:
-        symbols = set(target_weights)
-        symbols.update(
-            symbol
-            for symbol, position in self.portfolio.positions.items()
-            if position.total_quantity > 0
-        )
-        for symbol in sorted(symbols):
-            weight = target_weights.get(symbol, 0.0)
-            position = self.portfolio.positions.get(symbol)
-            current_quantity = position.total_quantity if position else 0
-            target_quantity = self._target_quantity(symbol, weight)
-            difference = target_quantity - current_quantity
-            if difference == 0:
-                continue
-            side = OrderSide.BUY if difference > 0 else OrderSide.SELL
-            quantity = abs(difference)
-            if side is OrderSide.BUY or target_quantity != 0:
-                quantity = quantity // LOT_SIZE * LOT_SIZE
-            if quantity <= 0:
-                continue
-            self.execution.submit_order(
+    def _read_bars(self, event: Event, data: DataView) -> dict[str, Bar]:
+        """读取当前事件区间内用于撮合和估值的 open、close。"""
+        rows = data.market.bars(
+            symbols=self.config.symbols or ALL_SYMBOLS,
+            frequency=event.frequency,
+            start=event.interval_start,
+            end=event.at,
+            fields=("open", "close"),
+            adjustment="none",
+        ).table.to_pylist()
+        bars: dict[str, Bar] = {}
+        for row in rows:
+            symbol = row["symbol"]
+            if symbol in bars:
+                raise DataError(f"一个 K 线事件出现重复证券: {symbol}")
+            bars[symbol] = Bar(
                 symbol=symbol,
-                side=side,
-                quantity=quantity,
-                submitted_at=submitted_at,
-                earliest_fill_at=event_time(earliest_session, time(9, 30)),
-                target_weight=weight,
+                interval_start=row["interval_start"],
+                open=row.get("open"),
+                close=row.get("close"),
             )
+        return bars
 
-    def _target_quantity(self, symbol: str, weight: float) -> int:
-        if weight == 0:
-            return 0
-        price = self.data.last_prices.get(symbol)
-        if price is None or not math.isfinite(price) or price <= 0:
-            position = self.portfolio.positions.get(symbol)
-            return position.total_quantity if position else 0
-        return math.floor(self.portfolio.total_equity * weight / price / LOT_SIZE) * LOT_SIZE
-
-    def _write_off_delisted(self, session: date) -> None:
-        listed = self.data.listed_symbols(session)
-        active = [
-            symbol
-            for symbol, position in self.portfolio.positions.items()
-            if position.total_quantity > 0 and symbol not in listed
-        ]
-        for symbol in sorted(active):
-            self.execution.cancel_symbol(symbol, reason=OrderReason.DELISTED)
-            self.portfolio.write_off(symbol)
+    def _end_session(self, event: Event) -> None:
+        """日终登记公司行动权益并记录账户净值。"""
+        self.actions.on_session_end(event.at, self.portfolio)
+        self._equity.append(self.portfolio.equity_snapshot(event.session))

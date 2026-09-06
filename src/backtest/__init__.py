@@ -1,20 +1,24 @@
-"""简单、严格的日频 A 股回测模块。"""
+"""清晰、同步、事件驱动的历史回测引擎。"""
 
 from backtest.config import BacktestConfig, RunOptions
-from backtest.errors import (
-    AccountInvariantError,
-    BacktestConfigurationError,
-    BacktestDataError,
-    BacktestError,
-    UnsupportedCorporateActionError,
+from backtest.domain import BacktestResult
+from backtest.engine import BacktestEngine
+from backtest.runner import (
+    CompletedRun,
+    default_source_config,
+    run_backtest,
+    run_from_storage,
 )
+from backtest.strategy import Strategy
 
 __all__ = [
-    "AccountInvariantError",
     "BacktestConfig",
-    "BacktestConfigurationError",
-    "BacktestDataError",
-    "BacktestError",
+    "BacktestEngine",
+    "BacktestResult",
+    "CompletedRun",
     "RunOptions",
-    "UnsupportedCorporateActionError",
+    "Strategy",
+    "default_source_config",
+    "run_backtest",
+    "run_from_storage",
 ]

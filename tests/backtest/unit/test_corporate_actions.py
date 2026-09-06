@@ -1,56 +1,67 @@
-from __future__ import annotations
+from datetime import date, time
 
-from datetime import date, datetime
-from zoneinfo import ZoneInfo
+import pytest
 
+from backtest.broker import SimulatedBroker
+from backtest.clock import at_time
 from backtest.config import BacktestConfig
 from backtest.corporate_actions import CorporateActionProcessor
-from backtest.execution import ExecutionEngine
+from backtest.domain import CorporateAction, Fill, Side
 from backtest.portfolio import Portfolio
-from backtest.types import CorporateAction
-
-SHANGHAI = ZoneInfo("Asia/Shanghai")
 
 
-def _at(day: int, hour: int = 9, minute: int = 25) -> datetime:
-    return datetime(2024, 1, day, hour, minute, tzinfo=SHANGHAI)
-
-
-def test_dividend_receivable_and_stock_listing_are_separate_events() -> None:
-    portfolio = Portfolio(10_000.0)
-    position = portfolio.position("000001.SZ")
-    position.total_quantity = 100
-    position.sellable_quantity = 100
-    position.average_cost = 10.0
-    position.last_price = 10.0
+def test_cash_and_stock_dividend_follow_record_ex_pay_and_listing_dates() -> None:
+    portfolio = Portfolio(100_000)
+    portfolio.apply_fill(
+        Fill(
+            "F",
+            "O",
+            "000001.SZ",
+            Side.BUY,
+            at_time(date(2026, 1, 2), time(9, 30)),
+            1_000,
+            10,
+            10,
+            10_000,
+            0,
+            0,
+            0,
+            0,
+        )
+    )
+    portfolio.unlock_t1()
     action = CorporateAction(
-        action_id="CA1",
+        action_id="CA",
         symbol="000001.SZ",
-        visible_at=_at(1),
-        record_date=date(2024, 1, 2),
-        ex_date=date(2024, 1, 3),
-        pay_date=date(2024, 1, 4),
-        listing_date=date(2024, 1, 5),
+        visible_at=at_time(date(2026, 1, 2), time(9)),
+        record_date=date(2026, 1, 2),
+        ex_date=date(2026, 1, 5),
+        pay_date=date(2026, 1, 6),
+        listing_date=date(2026, 1, 7),
         cash_dividend=0.5,
-        cash_dividend_before_tax=0.6,
+        cash_dividend_before_tax=None,
         stock_dividend=0.1,
     )
-    processor = CorporateActionProcessor((action,))
-    execution = ExecutionEngine(
-        BacktestConfig(start_date=date(2024, 1, 1), end_date=date(2024, 1, 5))
+    processor = CorporateActionProcessor([action])
+    broker = SimulatedBroker(
+        BacktestConfig(date(2026, 1, 2), date(2026, 1, 7))
     )
 
-    processor.capture_record_date(_at(2, 16, 5), portfolio)
-    processor.pre_open(_at(3), portfolio=portfolio, execution=execution)
-    assert portfolio.dividend_receivable == 50.0
-    assert position.total_quantity == 110
-    assert position.sellable_quantity == 100
-    assert position.pending_listing_quantity == 10
+    processor.on_session_end(
+        at_time(date(2026, 1, 2), time(16, 5)), portfolio
+    )
+    processor.on_session_start(
+        at_time(date(2026, 1, 5), time(9, 25)), portfolio, broker
+    )
+    position = portfolio.position("000001.SZ")
+    assert portfolio.dividend_receivable == pytest.approx(500)
+    assert (position.quantity, position.pending_listing_quantity) == (1_100, 100)
 
-    processor.pre_open(_at(4), portfolio=portfolio, execution=execution)
-    assert portfolio.dividend_receivable == 0.0
-    assert portfolio.cash == 10_050.0
-    processor.pre_open(_at(5), portfolio=portfolio, execution=execution)
-    assert position.pending_listing_quantity == 0
-    assert position.sellable_quantity == 110
-    portfolio.assert_invariants()
+    processor.on_session_start(
+        at_time(date(2026, 1, 6), time(9, 25)), portfolio, broker
+    )
+    assert portfolio.cash == pytest.approx(90_500)
+    processor.on_session_start(
+        at_time(date(2026, 1, 7), time(9, 25)), portfolio, broker
+    )
+    assert position.sellable_quantity == 1_100

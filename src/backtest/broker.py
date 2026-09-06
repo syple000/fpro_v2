@@ -1,0 +1,348 @@
+"""订单状态和 A 股开盘价撮合规则。"""
+
+from __future__ import annotations
+
+import math
+from collections.abc import Mapping
+from datetime import date, datetime
+
+from backtest.clock import Event
+from backtest.config import BacktestConfig
+from backtest.domain import (
+    AccountSnapshot,
+    Bar,
+    Fill,
+    MarketStatus,
+    Order,
+    OrderReason,
+    OrderRequest,
+    OrderStatus,
+    OrderUpdate,
+    Side,
+)
+from backtest.orders import LOT_SIZE
+from market_data import DataView
+
+
+class SimulatedBroker:
+    """保存订单，并在下一根完整 K 线到达时按其开盘价撮合一次。"""
+
+    def __init__(self, config: BacktestConfig) -> None:
+        """固定本次回测的费用、滑点和成交量限制。"""
+        self.config = config
+        self._pending: list[Order] = []
+        self._orders: list[Order] = []
+        self._updates: list[OrderUpdate] = []
+        self._fills: list[Fill] = []
+        self._next_order_id = 1
+        self._next_fill_id = 1
+
+    @property
+    def orders(self) -> tuple[Order, ...]:
+        """全部原始订单。"""
+        return tuple(self._orders)
+
+    @property
+    def updates(self) -> tuple[OrderUpdate, ...]:
+        """全部订单状态变化。"""
+        return tuple(self._updates)
+
+    @property
+    def fills(self) -> tuple[Fill, ...]:
+        """全部成交。"""
+        return tuple(self._fills)
+
+    @property
+    def pending_symbols(self) -> tuple[str, ...]:
+        """仍在等待下一根 K 线的证券代码。"""
+        return tuple(sorted({order.symbol for order in self._pending}))
+
+    def submit(self, request: OrderRequest, submitted_at: datetime) -> None:
+        """接收订单并记录 SUBMITTED 状态。"""
+        order = Order(
+            order_id=f"O{self._next_order_id:08d}",
+            symbol=request.symbol,
+            side=request.side,
+            quantity=request.quantity,
+            submitted_at=submitted_at,
+            target_weight=request.target_weight,
+        )
+        self._next_order_id += 1
+        self._orders.append(order)
+        self._pending.append(order)
+        self._updates.append(OrderUpdate(order, OrderStatus.SUBMITTED, submitted_at))
+
+    def match_bar(
+        self,
+        *,
+        event: Event,
+        bars: Mapping[str, Bar],
+        account: AccountSnapshot,
+        data: DataView,
+    ) -> tuple[Fill, ...]:
+        """撮合当前所有待处理订单，并返回本次新成交。"""
+        if not self._pending:
+            return ()
+
+        # 当前策略尚未执行，所以 pending 全部来自更早的 K 线。
+        orders = self._pending
+        self._pending = []
+        orders.sort(key=lambda order: (order.side is Side.BUY, order.symbol, order.order_id))
+        symbols = tuple(sorted({order.symbol for order in orders}))
+        statuses = self._market_statuses(data, symbols)
+        previous_volumes = self._previous_volumes(
+            data,
+            symbols,
+            frequency=event.frequency,
+            interval_start=event.interval_start,
+        )
+
+        # 同一批次先卖后买，卖出释放的现金可供随后买入。
+        cash = account.cash
+        sellable = {
+            holding.symbol: holding.sellable_quantity for holding in account.holdings
+        }
+        fills: list[Fill] = []
+        for order in orders:
+            bar = bars.get(order.symbol)
+            filled_at = bar.interval_start if bar is not None else event.interval_start
+            quantity, reason, price = self._executable_quantity(
+                order,
+                bar=bar,
+                status=statuses.get(order.symbol, MarketStatus(order.symbol)),
+                previous_volume=previous_volumes.get(order.symbol),
+                cash=cash,
+                sellable=sellable.get(order.symbol, 0),
+                trading_date=filled_at.date(),
+            )
+            if quantity == 0 or price is None:
+                self._updates.append(
+                    OrderUpdate(
+                        order,
+                        OrderStatus.NOT_FILLED,
+                        event.at,
+                        reason=reason,
+                    )
+                )
+                continue
+
+            fill = self._make_fill(order, filled_at, quantity, price)
+            fills.append(fill)
+            if order.side is Side.BUY:
+                cash -= fill.notional + fill.total_fee
+            else:
+                cash += fill.notional - fill.total_fee
+                sellable[order.symbol] = sellable.get(order.symbol, 0) - quantity
+            status = (
+                OrderStatus.FILLED
+                if quantity == order.quantity
+                else OrderStatus.PARTIALLY_FILLED
+            )
+            self._updates.append(OrderUpdate(order, status, filled_at, quantity, reason))
+
+        self._fills.extend(fills)
+        return tuple(fills)
+
+    def cancel_symbol(self, symbol: str, reason: OrderReason, at: datetime) -> None:
+        """取消指定证券的全部待处理订单。"""
+        remaining: list[Order] = []
+        for order in self._pending:
+            if order.symbol == symbol:
+                self._updates.append(
+                    OrderUpdate(order, OrderStatus.CANCELED, at, reason=reason)
+                )
+            else:
+                remaining.append(order)
+        self._pending = remaining
+
+    def expire_all(self, at: datetime) -> None:
+        """回测结束时把待处理订单标记为 EXPIRED。"""
+        for order in self._pending:
+            self._updates.append(
+                OrderUpdate(
+                    order,
+                    OrderStatus.EXPIRED,
+                    at,
+                    reason=OrderReason.END_OF_BACKTEST,
+                )
+            )
+        self._pending.clear()
+
+    @staticmethod
+    def _market_statuses(
+        data: DataView,
+        symbols: tuple[str, ...],
+    ) -> dict[str, MarketStatus]:
+        """读取本次撮合需要的停牌和涨跌停数据。"""
+        rows = data.market.status(
+            symbols=symbols,
+            fields=("suspended", "up_limit", "down_limit"),
+        ).table.to_pylist()
+        return {
+            row["symbol"]: MarketStatus(
+                symbol=row["symbol"],
+                suspended=row.get("suspended"),
+                up_limit=row.get("up_limit"),
+                down_limit=row.get("down_limit"),
+            )
+            for row in rows
+        }
+
+    def _previous_volumes(
+        self,
+        data: DataView,
+        symbols: tuple[str, ...],
+        *,
+        frequency: str,
+        interval_start: datetime,
+    ) -> dict[str, float | None]:
+        """读取每只证券位于当前 K 线之前的最近成交量。"""
+        result: dict[str, float | None] = {symbol: None for symbol in symbols}
+        if self.config.volume_limit is None:
+            return result
+        rows = data.market.bars(
+            symbols=symbols,
+            frequency=frequency,
+            count=2,
+            fields=("volume",),
+            adjustment="none",
+        ).table.to_pylist()
+        for row in rows:
+            if row["interval_start"] < interval_start:
+                result[row["symbol"]] = row.get("volume")
+        return result
+
+    def _executable_quantity(
+        self,
+        order: Order,
+        *,
+        bar: Bar | None,
+        status: MarketStatus,
+        previous_volume: float | None,
+        cash: float,
+        sellable: int,
+        trading_date: date,
+    ) -> tuple[int, OrderReason, float | None]:
+        """依次应用行情状态、容量、持仓和现金约束。"""
+        if order.quantity <= 0:
+            return 0, OrderReason.INVALID_QUANTITY, None
+        open_price = bar.open if bar is not None else None
+        if not _valid_price(open_price):
+            return 0, OrderReason.MISSING_OPEN, None
+        if status.suspended is True:
+            return 0, OrderReason.SUSPENDED, None
+
+        assert open_price is not None
+        if order.side is Side.BUY and _reaches_limit(open_price, status.up_limit, buy=True):
+            return 0, OrderReason.LIMIT_UP, None
+        if order.side is Side.SELL and _reaches_limit(
+            open_price, status.down_limit, buy=False
+        ):
+            return 0, OrderReason.LIMIT_DOWN, None
+
+        quantity = order.quantity
+        reason = OrderReason.NONE
+        capacity = self._volume_capacity(previous_volume)
+        if capacity is not None and quantity > capacity:
+            quantity = capacity
+            reason = OrderReason.VOLUME_LIMIT
+        if order.side is Side.SELL and quantity > sellable:
+            quantity = sellable
+            reason = OrderReason.INSUFFICIENT_SELLABLE
+        if order.side is Side.BUY:
+            affordable = self._affordable_quantity(
+                quantity, open_price, cash, trading_date
+            )
+            if affordable < quantity:
+                quantity = affordable
+                reason = OrderReason.INSUFFICIENT_CASH
+        return max(quantity, 0), reason, open_price
+
+    def _make_fill(
+        self,
+        order: Order,
+        at: datetime,
+        quantity: int,
+        market_price: float,
+    ) -> Fill:
+        """应用滑点和交易费用，生成成交记录。"""
+        direction = 1 if order.side is Side.BUY else -1
+        execution_price = market_price * (
+            1 + direction * self.config.slippage_bps / 10_000
+        )
+        notional = execution_price * quantity
+        commission, stamp_tax, transfer_fee = self._fees(
+            order.side, notional, at.date()
+        )
+        fill = Fill(
+            fill_id=f"F{self._next_fill_id:08d}",
+            order_id=order.order_id,
+            symbol=order.symbol,
+            side=order.side,
+            filled_at=at,
+            quantity=quantity,
+            market_price=market_price,
+            execution_price=execution_price,
+            notional=notional,
+            commission=commission,
+            stamp_tax=stamp_tax,
+            transfer_fee=transfer_fee,
+            slippage_cost=abs(execution_price - market_price) * quantity,
+        )
+        self._next_fill_id += 1
+        return fill
+
+    def _fees(self, side: Side, notional: float, trading_date: date) -> tuple[float, ...]:
+        """计算佣金、印花税和过户费。"""
+        commission = max(
+            notional * self.config.commission_rate,
+            self.config.minimum_commission,
+        )
+        stamp_tax = 0.0
+        if side is Side.SELL:
+            stamp_rate = 0.0005 if trading_date >= date(2023, 8, 28) else 0.001
+            stamp_tax = notional * stamp_rate
+        transfer_rate = 0.00001 if trading_date >= date(2022, 4, 29) else 0.00002
+        return commission, stamp_tax, notional * transfer_rate
+
+    def _affordable_quantity(
+        self,
+        requested: int,
+        market_price: float,
+        cash: float,
+        trading_date: date,
+    ) -> int:
+        """在最低佣金存在时逐手寻找可负担数量。"""
+        execution_price = market_price * (1 + self.config.slippage_bps / 10_000)
+        quantity = requested // LOT_SIZE * LOT_SIZE
+        while quantity > 0:
+            notional = execution_price * quantity
+            fees = sum(self._fees(Side.BUY, notional, trading_date))
+            if notional + fees <= cash + 1e-9:
+                return quantity
+            quantity -= LOT_SIZE
+        return 0
+
+    def _volume_capacity(self, previous_volume: float | None) -> int | None:
+        """把上一根 K 线成交量参与率转换成整手容量。"""
+        if self.config.volume_limit is None:
+            return None
+        if previous_volume is None or not math.isfinite(previous_volume):
+            return 0
+        return (
+            math.floor(previous_volume * self.config.volume_limit / LOT_SIZE)
+            * LOT_SIZE
+        )
+
+
+def _valid_price(value: float | None) -> bool:
+    """价格必须存在、有限且大于零。"""
+    return value is not None and math.isfinite(value) and value > 0
+
+
+def _reaches_limit(price: float, limit: float | None, *, buy: bool) -> bool:
+    """判断买入是否涨停或卖出是否跌停。"""
+    if not _valid_price(limit):
+        return False
+    assert limit is not None
+    return price >= limit - 1e-9 if buy else price <= limit + 1e-9

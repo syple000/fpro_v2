@@ -1,11 +1,15 @@
-"""回测与实盘共享的纯策略决策。"""
+"""项目自带的示例策略。"""
 
-from strategies.momentum import MomentumConfig, momentum_return, select_momentum_targets
-from strategies.weights import validate_target_weights
+from strategies.momentum import (
+    MomentumConfig,
+    MonthlyMomentumStrategy,
+    momentum_return,
+    select_momentum_targets,
+)
 
 __all__ = [
     "MomentumConfig",
+    "MonthlyMomentumStrategy",
     "momentum_return",
     "select_momentum_targets",
-    "validate_target_weights",
 ]
