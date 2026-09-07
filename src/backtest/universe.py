@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-from bisect import bisect_left
 from collections.abc import Iterable
 from datetime import timedelta
 
+from backtest.errors import DataError
 from market_data import DataView
 
 _STOCK_EXCHANGES = frozenset({"BSE", "SSE", "SZSE"})
@@ -50,11 +50,20 @@ def select_stock_universe(
         sessions = tuple(
             row["cal_date"] for row in calendar_rows if row["is_open"] is True
         )
+        if len(sessions) < minimum_listing_sessions:
+            if not calendar_rows or calendar_rows[0]["cal_date"] > first_listing:
+                raise DataError(
+                    f"上市交易日判断所需的 SSE 日历覆盖不足：截至 {data.as_of.date()} "
+                    f"仅查到 {len(sessions)} 个交易日，需要 {minimum_listing_sessions} 个，"
+                    f"且未覆盖最早上市日 {first_listing}；请补齐历史交易日历"
+                )
+            # 已覆盖全部候选股的上市历史，交易日仍不足，说明它们确实未满门槛。
+            return ()
+
+        # 上市日计作第一天；只需最近 N 个交易日，不要求覆盖老股的完整上市历史。
+        latest_listing_date = sessions[-minimum_listing_sessions]
         stocks = [
-            row
-            for row in stocks
-            if len(sessions) - bisect_left(sessions, row["listing_date"])
-            >= minimum_listing_sessions
+            row for row in stocks if row["listing_date"] <= latest_listing_date
         ]
 
     symbols = tuple(sorted(row["symbol"] for row in stocks))
