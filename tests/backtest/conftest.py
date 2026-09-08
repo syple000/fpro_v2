@@ -153,6 +153,7 @@ class MemoryMarket:
                 "suspended": False,
                 "up_limit": None,
                 "down_limit": None,
+                "price_limit_status": "unlimited",
                 "st_type": None,
                 **self._source.statuses.get(symbol, {}),
             }

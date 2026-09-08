@@ -55,10 +55,19 @@ def _data(
     down_limit: float | None = None,
 ) -> DataView:
     session = config.start_date
+    limited = up_limit is not None or down_limit is not None
     reader = MemoryDataReader(
         bar_table([daily_bar(session, 10)]),
         (session,),
-        statuses={"000001.SZ": {"up_limit": up_limit, "down_limit": down_limit}},
+        statuses={
+            "000001.SZ": {
+                "up_limit": up_limit if up_limit is not None else (1e9 if limited else None),
+                "down_limit": (
+                    down_limit if down_limit is not None else (0.001 if limited else None)
+                ),
+                "price_limit_status": "limited" if limited else "unlimited",
+            }
+        },
     )
     return cast(DataView, reader.at(at_time(session, time(16, 5))))
 
@@ -70,6 +79,45 @@ def _event(session: date) -> Event:
         interval_start=at_time(session, time(9, 30)),
         frequency="1d",
     )
+
+
+@pytest.mark.parametrize(
+    "status,expected_fill",
+    [
+        ({"suspended": None, "price_limit_status": "unlimited"}, False),
+        ({"suspended": False, "price_limit_status": "unknown"}, False),
+        ({"suspended": False, "price_limit_status": None}, False),
+        ({"price_limit_status": "limited", "up_limit": 11}, False),
+        ({"price_limit_status": "limited", "up_limit": 11, "down_limit": 12}, False),
+        ({"price_limit_status": "limited", "up_limit": 11, "down_limit": 0}, False),
+        ({"price_limit_status": "unlimited", "up_limit": 11}, False),
+        ({"suspended": False, "price_limit_status": "unlimited"}, True),
+        ({"price_limit_status": "limited", "up_limit": 11, "down_limit": 9}, True),
+    ],
+)
+def test_execution_requires_known_suspension_and_price_limit_semantics(
+    status: dict[str, object], expected_fill: bool
+) -> None:
+    """未知与显式无限制区别处理，矛盾或不完整的限价不能放行。"""
+    session = date(2026, 1, 5)
+    config = BacktestConfig(session, session, volume_limit=None)
+    reader = MemoryDataReader(
+        bar_table([daily_bar(session, 10)]),
+        (session,),
+        statuses={"000001.SZ": status},
+    )
+    broker = SimulatedBroker(config)
+    broker.submit(OrderRequest("000001.SZ", Side.BUY, 100), at_time(session, time(9, 25)))
+    fills = broker.match_bar(
+        event=_event(session),
+        bars={"000001.SZ": _bar(session, 10)},
+        account=Portfolio(100_000).account_snapshot(),
+        data=cast(DataView, reader.at(at_time(session, time(9, 30)))),
+    )
+    assert bool(fills) is expected_fill
+    if not expected_fill:
+        assert broker.updates[-1].reason is OrderReason.UNKNOWN_MARKET_STATUS
+        assert broker.fills == ()
 
 
 def test_bought_shares_are_not_sellable_until_next_session() -> None:

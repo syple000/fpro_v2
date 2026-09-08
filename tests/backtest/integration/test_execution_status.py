@@ -30,6 +30,7 @@ def test_matching_uses_opening_status_even_when_it_changes_before_bar_end(
 ) -> None:
     day = date(2026, 1, 5)
     with TushareDataStore(tmp_path / "tushare") as store:
+        store._mark_sync_all_completed("suspend_d", day, day)
         store.write(
             "suspend_d",
             pa.Table.from_pylist(

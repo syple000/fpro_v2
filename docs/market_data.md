@@ -122,12 +122,16 @@ QMT 的事件时间必须在导入时归一化；如果以后增加 Tushare 分�
 只有到停牌开始后才对策略可见；已知停牌区间结束后返回 `False`。非空但无法解析的停牌时段是
 源数据错误，不能静默返回未知状态。
 
+`suspended=None` 表示未知，`False` 表示确认正常。Tushare 无停牌行时，仅在固定快照的
+`_meta/sync_all/suspend_d.json` 完成区间内且已到当日 09:25 才返回 `False`；
+缺少该覆盖证明时仍为未知，不以“数据表存在”推断正常。同步完成区间纳入数据快照标识。
+
 策略读取当前状态，而不是整张原始停牌表：
 
 ```python
 data.market.status(
     symbols=("000001.SZ",),
-    fields=("suspended", "up_limit", "down_limit", "st_type"),
+    fields=("suspended", "up_limit", "down_limit", "price_limit_status", "st_type"),
 )
 ```
 
@@ -547,12 +551,16 @@ current = data.market.current(
 ```python
 status = data.market.status(
     symbols=("000001.SZ", "600000.SH"),
-    fields=("suspended", "st_type", "up_limit", "down_limit"),
+    fields=("suspended", "st_type", "up_limit", "down_limit", "price_limit_status"),
 )
 ```
 
-每个 symbol 最多一行，固定按 `symbol ASC` 排序。Reader 内部组合三张 Tushare 表；缺少其中一张
-表的行保持对应状态未知，不能把缺失解释为 `False` 或普通股票。
+每个 symbol 最多一行，固定按 `symbol ASC` 排序。Reader 内部组合三张 Tushare 表；
+缺失状态保持未知，只有具备完整同步覆盖的稀疏停牌数据可以按前述规则确认正常。
+`price_limit_status` 为 `limited`（上下限均有效）、`unlimited`（来源明确无涨跌幅限制）或
+`unknown`（无法确认）。Tushare 只从有效上下限确认 `limited`，空值或零值不自动解释为
+无限制；具备可靠无限制事实的适配器可以明确返回 `unlimited` 并留空上下限。
+撮合要求确认正常交易且限价语义完整，未知或矛盾状态记为 `UNKNOWN_MARKET_STATUS` 并不成交。
 停牌和 ST 等状态表是稀疏表，不能用它们推导全市场股票集合。因此 `status()` 明确拒绝
 `ALL_SYMBOLS`；调用方应先用 `reference.stocks()` 取得 PIT 股票池，再显式传入证券列表。
 

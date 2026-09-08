@@ -30,7 +30,12 @@ from market_data.reader import (
     MarketReader,
     ReferenceReader,
 )
-from models import CASH_FLOW_STATEMENT_SCHEMA, DAILY_METRICS_SCHEMA, ROUTE_SCHEMAS
+from models import (
+    CASH_FLOW_STATEMENT_SCHEMA,
+    DAILY_METRICS_SCHEMA,
+    PRICE_LIMIT_SCHEMA,
+    ROUTE_SCHEMAS,
+)
 from qmt_protocol import BarQuote, DividendFactor, HistoryBar, SequencedQuote, TickQuote
 from qmt_receiver import QmtDataStore
 from tushare_data import TABLE_SCHEMAS, TushareDataStore
@@ -72,6 +77,24 @@ class _CustomDailyMetricsAdapter(DataAdapter):
 
 class _IncompleteDailyMetricsAdapter(DataAdapter):
     pass
+
+
+class _UnlimitedPriceAdapter(DataAdapter):
+    """测试来源明确声明该日无涨跌幅限制，不能从空价格推断。"""
+
+    def price_limits(
+        self,
+        *,
+        as_of: datetime,
+        symbols: tuple[str, ...] | None,
+        fetch_limit: int | None,
+        columns: tuple[str, ...] | None = None,
+    ) -> pa.Table:
+        table = pa.Table.from_pylist(
+            [{"symbol": symbol, "price_limit_status": "unlimited"} for symbol in symbols or ()],
+            schema=PRICE_LIMIT_SCHEMA,
+        )
+        return table if columns is None else table.select(columns)
 
 
 def test_every_route_has_a_platform_schema() -> None:
@@ -435,6 +458,83 @@ def test_intraday_suspension_becomes_false_after_interval_and_rejects_bad_timing
 
     assert during.table.to_pylist()[0]["suspended"] is True
     assert after.table.to_pylist()[0]["suspended"] is False
+
+
+def test_sparse_suspension_absence_requires_complete_snapshot_coverage(tmp_path: Path) -> None:
+    root = tmp_path / "tushare"
+    with TushareDataStore(root) as store:
+        store.write(
+            "suspend_d",
+            _table(
+                "suspend_d",
+                {"ts_code": "000002.SZ", "trade_date": date(2024, 1, 2), "suspend_type": "?"},
+            ),
+        )
+    sources = SourceConfig(routes={"market.suspensions": "tushare"})
+    with DataCatalog(tushare_root=root, qmt_root=tmp_path / "qmt") as catalog:
+        reader = DataReader(catalog, sources=sources)
+
+        def status(day: int = 2, minute: int = 25, symbol: str = "000001.SZ") -> object:
+            result = reader.at(_as_of(day, 9, minute)).market.status(
+                symbols=(symbol,), fields=("suspended",)
+            )
+            return result.table.to_pylist()[0]["suspended"]
+
+        assert status() is None
+        before_snapshot = catalog.snapshot_metadata()["snapshot_id"]
+        with TushareDataStore(root) as store:
+            store._mark_sync_all_completed("suspend_d", date(2024, 1, 2), date(2024, 1, 2))
+        assert status() is None  # 运行采用的快照不随外部元数据变化。
+        catalog.refresh()
+        assert catalog.snapshot_metadata()["snapshot_id"] != before_snapshot
+        assert status() is False
+        assert status(minute=24) is None
+        assert status(day=3) is None
+        assert status(symbol="000002.SZ") is None  # 未知事件代码不能覆盖成正常。
+
+
+def test_price_limit_status_distinguishes_valid_missing_and_explicit_unlimited(
+    tmp_path: Path,
+) -> None:
+    with TushareDataStore(tmp_path / "tushare") as store:
+        store.write(
+            "stk_limit",
+            _table(
+                "stk_limit",
+                {
+                    "ts_code": "000001.SZ", "trade_date": date(2024, 1, 2),
+                    "up_limit": 11, "down_limit": 9,
+                },
+                {"ts_code": "000002.SZ", "trade_date": date(2024, 1, 2)},
+                {
+                    "ts_code": "000003.SZ", "trade_date": date(2024, 1, 2),
+                    "up_limit": 0, "down_limit": 0,
+                },
+            ),
+        )
+    with DataCatalog(tushare_root=tmp_path / "tushare", qmt_root=tmp_path / "qmt") as catalog:
+        reader = DataReader(
+            catalog, sources=SourceConfig(routes={"market.price_limits": "tushare"})
+        )
+        result = reader.at(_as_of(2, 9, 25)).market.status(
+            symbols=("000001.SZ", "000002.SZ", "000003.SZ", "000004.SZ"),
+            fields=("price_limit_status",),
+        )
+        assert result.table.column("price_limit_status").to_pylist() == [
+            "limited", "unknown", "unknown", "unknown"
+        ]
+        custom = DataReader(
+            catalog,
+            sources=SourceConfig(routes={"market.price_limits": "explicit"}),
+            adapters={"explicit": _UnlimitedPriceAdapter()},
+        )
+        unlimited = custom.at(_as_of(2, 9, 25)).market.status(
+            symbols=("000001.SZ",), fields=("up_limit", "down_limit", "price_limit_status")
+        )
+        assert unlimited.table.to_pylist() == [{
+            "symbol": "000001.SZ", "up_limit": None, "down_limit": None,
+            "price_limit_status": "unlimited",
+        }]
 
 
 def test_daily_metrics_normalize_percentages_shares_and_currency(tmp_path: Path) -> None:

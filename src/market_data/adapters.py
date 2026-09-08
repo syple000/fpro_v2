@@ -636,21 +636,35 @@ class TushareAdapter(DataAdapter):
                            CAST(error('{_SUSPENSION_TIMING_ERROR}') AS TIMESTAMPTZ)
                        ) END AS interval_end
                 FROM source
+            ), latest AS (
+                SELECT ts_code AS symbol,
+                       CASE
+                           WHEN suspend_type = 'S' AND suspend_timing IS NULL THEN TRUE
+                           WHEN suspend_type = 'S' AND interval_end > $as_of THEN TRUE
+                           WHEN suspend_type IN ('S', 'R') THEN FALSE
+                       END AS suspended
+                FROM suspensions
+                WHERE (
+                      (suspend_timing IS NULL AND {_day_time("trade_date", "09:25")} <= $as_of)
+                      OR (suspend_timing IS NOT NULL AND interval_start <= $as_of)
+                  )
+                QUALIFY row_number() OVER (
+                    PARTITION BY ts_code ORDER BY interval_start DESC NULLS LAST, suspend_type
+                ) = 1
+            ), requested AS (
+                SELECT unnest($symbols) AS symbol
+                UNION SELECT ts_code AS symbol FROM source WHERE $symbols IS NULL
             )
-            SELECT ts_code AS symbol,
+            SELECT requested.symbol,
                    CASE
-                       WHEN suspend_type = 'S' AND suspend_timing IS NULL THEN TRUE
-                       WHEN suspend_type = 'S' AND interval_end > $as_of THEN TRUE
-                       WHEN suspend_type IN ('S', 'R') THEN FALSE
+                       WHEN latest.symbol IS NOT NULL THEN latest.suspended
+                       WHEN {_day_time("$trade_date", "09:25")} <= $as_of AND EXISTS (
+                           SELECT 1 FROM data_internal.tushare_sync_ranges
+                           WHERE dataset = 'suspend_d'
+                             AND start_date <= $trade_date AND end_date >= $trade_date
+                       ) THEN FALSE
                    END AS suspended
-            FROM suspensions
-            WHERE (
-                  (suspend_timing IS NULL AND {_day_time("trade_date", "09:25")} <= $as_of)
-                  OR (suspend_timing IS NOT NULL AND interval_start <= $as_of)
-              )
-            QUALIFY row_number() OVER (
-                PARTITION BY ts_code ORDER BY interval_start DESC NULLS LAST, suspend_type
-            ) = 1
+            FROM requested LEFT JOIN latest USING (symbol)
             ORDER BY symbol
             LIMIT $fetch_limit
         """
@@ -672,7 +686,10 @@ class TushareAdapter(DataAdapter):
             fetch_limit=fetch_limit,
         )
         query = f"""
-            SELECT ts_code AS symbol, up_limit, down_limit
+            SELECT ts_code AS symbol, up_limit, down_limit,
+                   CASE WHEN isfinite(up_limit) AND isfinite(down_limit)
+                              AND up_limit > 0 AND down_limit > 0 AND down_limit <= up_limit
+                        THEN 'limited' ELSE 'unknown' END AS price_limit_status
             FROM tushare.stk_limit
             WHERE trade_date = $trade_date
               AND {_day_time("trade_date", "09:25")} <= $as_of

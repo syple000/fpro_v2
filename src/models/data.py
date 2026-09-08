@@ -42,6 +42,7 @@ STATUS_SCHEMA = pa.schema(
         pa.field("suspended", pa.bool_()),
         pa.field("up_limit", pa.float64()),
         pa.field("down_limit", pa.float64()),
+        pa.field("price_limit_status", pa.string()),
         pa.field("st_type", pa.string()),
     ]
 )
@@ -51,6 +52,7 @@ PRICE_LIMIT_SCHEMA = pa.schema(
         STATUS_SCHEMA.field("symbol"),
         STATUS_SCHEMA.field("up_limit"),
         STATUS_SCHEMA.field("down_limit"),
+        STATUS_SCHEMA.field("price_limit_status"),
     ]
 )
 ST_STATUS_SCHEMA = pa.schema([STATUS_SCHEMA.field("symbol"), STATUS_SCHEMA.field("st_type")])

@@ -93,41 +93,8 @@ class TushareDataStore:
 
     def _sync_all_completed_ranges(self, dataset: str) -> list[tuple[date, date]]:
         """读取 sync_all 已完整拉取的日期闭区间。"""
-        if dataset not in TABLE_SCHEMAS:
-            raise ValueError(f"未知数据表: {dataset}")
-        path = self._sync_all_meta_dir / f"{dataset}.json"
         with self._sync_all_meta_lock:
-            if not path.exists():
-                return []
-            try:
-                document: object = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError) as exc:
-                raise ValueError(f"无法读取 sync_all 元数据: {path}") from exc
-        if not isinstance(document, dict):
-            raise ValueError(f"sync_all 元数据格式错误: {path}")
-        if document.get("version") != 1 or document.get("dataset") != dataset:
-            raise ValueError(f"sync_all 元数据版本或数据表不匹配: {path}")
-        raw_ranges = document.get("completed_ranges")
-        if not isinstance(raw_ranges, list):
-            raise ValueError(f"sync_all 元数据缺少 completed_ranges: {path}")
-
-        ranges: list[tuple[date, date]] = []
-        for raw_range in raw_ranges:
-            if not isinstance(raw_range, dict):
-                raise ValueError(f"sync_all 完成区间格式错误: {path}")
-            raw_start = raw_range.get("start_date")
-            raw_end = raw_range.get("end_date")
-            if not isinstance(raw_start, str) or not isinstance(raw_end, str):
-                raise ValueError(f"sync_all 完成区间日期格式错误: {path}")
-            try:
-                start_date = date.fromisoformat(raw_start)
-                end_date = date.fromisoformat(raw_end)
-            except ValueError as exc:
-                raise ValueError(f"sync_all 完成区间日期无效: {path}") from exc
-            if start_date > end_date:
-                raise ValueError(f"sync_all 完成区间起止颠倒: {path}")
-            ranges.append((start_date, end_date))
-        return _merge_date_ranges(ranges)
+            return load_sync_all_completed_ranges(self._sync_all_meta_dir, dataset)
 
     def _mark_sync_all_completed(
         self,
@@ -172,6 +139,43 @@ class TushareDataStore:
 
     def __exit__(self, *_: object) -> None:
         self._store.close()
+
+
+def load_sync_all_completed_ranges(metadata_dir: Path, dataset: str) -> list[tuple[date, date]]:
+    """只读同步完成区间，供存储续传和行情覆盖判断共用。"""
+    if dataset not in TABLE_SCHEMAS:
+        raise ValueError(f"未知数据表: {dataset}")
+    path = metadata_dir / f"{dataset}.json"
+    if not path.exists():
+        return []
+    try:
+        document: object = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"无法读取 sync_all 元数据: {path}") from exc
+    if not isinstance(document, dict):
+        raise ValueError(f"sync_all 元数据格式错误: {path}")
+    if document.get("version") != 1 or document.get("dataset") != dataset:
+        raise ValueError(f"sync_all 元数据版本或数据表不匹配: {path}")
+    raw_ranges = document.get("completed_ranges")
+    if not isinstance(raw_ranges, list):
+        raise ValueError(f"sync_all 元数据缺少 completed_ranges: {path}")
+    ranges: list[tuple[date, date]] = []
+    for raw_range in raw_ranges:
+        if not isinstance(raw_range, dict):
+            raise ValueError(f"sync_all 完成区间格式错误: {path}")
+        raw_start = raw_range.get("start_date")
+        raw_end = raw_range.get("end_date")
+        if not isinstance(raw_start, str) or not isinstance(raw_end, str):
+            raise ValueError(f"sync_all 完成区间日期格式错误: {path}")
+        try:
+            start_date = date.fromisoformat(raw_start)
+            end_date = date.fromisoformat(raw_end)
+        except ValueError as exc:
+            raise ValueError(f"sync_all 完成区间日期无效: {path}") from exc
+        if start_date > end_date:
+            raise ValueError(f"sync_all 完成区间起止颠倒: {path}")
+        ranges.append((start_date, end_date))
+    return _merge_date_ranges(ranges)
 
 
 def _merge_date_ranges(ranges: Sequence[tuple[date, date]]) -> list[tuple[date, date]]:

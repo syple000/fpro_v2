@@ -16,12 +16,20 @@ from market_data.errors import DataSourceUnavailableError
 from qmt_receiver.schemas import TABLE_SCHEMAS as QMT_TABLE_SCHEMAS
 from qmt_receiver.storage import load_sync_ranges
 from tushare_data.schemas import TABLE_SCHEMAS
+from tushare_data.storage import load_sync_all_completed_ranges
 
 _QMT_SYNC_RANGE_SCHEMA = pa.schema(
     [
         pa.field("dataset", pa.string(), nullable=False),
         pa.field("code", pa.string(), nullable=False),
         pa.field("period", pa.string()),
+        pa.field("start_date", pa.date32(), nullable=False),
+        pa.field("end_date", pa.date32(), nullable=False),
+    ]
+)
+_TUSHARE_SYNC_RANGE_SCHEMA = pa.schema(
+    [
+        pa.field("dataset", pa.string(), nullable=False),
         pa.field("start_date", pa.date32(), nullable=False),
         pa.field("end_date", pa.date32(), nullable=False),
     ]
@@ -82,10 +90,28 @@ class DataCatalog:
             }
         _refresh_reference_tables(self._connection)
         _refresh_qmt_sync_ranges(self._connection, self._sources["qmt"][0])
+        tushare_sync_ranges = [
+            {"dataset": "suspend_d", "start_date": start, "end_date": end}
+            for start, end in load_sync_all_completed_ranges(
+                self._sources["tushare"][0] / "_meta" / "sync_all", "suspend_d"
+            )
+        ]
+        self._connection.register(
+            "__tushare_sync_ranges",
+            pa.Table.from_pylist(tushare_sync_ranges, schema=_TUSHARE_SYNC_RANGE_SCHEMA),
+        )
+        self._connection.execute(
+            "CREATE OR REPLACE TABLE data_internal.tushare_sync_ranges "
+            "AS SELECT * FROM __tushare_sync_ranges"
+        )
         sync_ranges = self._connection.execute(
             "SELECT * FROM data_internal.qmt_sync_ranges ORDER BY dataset, code, period, start_date"
         ).to_arrow_table().to_pylist()
-        self._snapshot: dict[str, Any] = {"sources": sources, "qmt_sync_ranges": sync_ranges}
+        self._snapshot: dict[str, Any] = {
+            "sources": sources,
+            "qmt_sync_ranges": sync_ranges,
+            "tushare_sync_ranges": tushare_sync_ranges,
+        }
         # 文件名由存储层 UUID 标识；保留注册顺序，匹配重复记录的版本优先级。
         payload = json.dumps(self._snapshot, sort_keys=True, default=str).encode()
         self._snapshot["snapshot_id"] = hashlib.sha256(payload).hexdigest()

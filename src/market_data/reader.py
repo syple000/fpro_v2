@@ -453,13 +453,16 @@ class MarketReader:
             raise ValueError(
                 "market.status() 暂不支持 ALL_SYMBOLS；缺少 PIT 股票池时请显式提供 symbols"
             )
-        allowed = ("suspended", "up_limit", "down_limit", "st_type")
+        allowed = ("suspended", "up_limit", "down_limit", "price_limit_status", "st_type")
         selected = list(allowed) if fields is None else list(fields)
         _fields(selected, allowed, ("symbol",))
         normalized_symbols = _symbols(symbols)
         rows: dict[str, dict[str, object]] = {}
         if normalized_symbols is not None:
-            rows = {symbol: {"symbol": symbol} for symbol in normalized_symbols}
+            rows = {
+                symbol: {"symbol": symbol, "price_limit_status": "unknown"}
+                for symbol in normalized_symbols
+            }
         sources: list[str] = []
         fetch_limit = self._data._max_result_rows + 1
 
@@ -495,7 +498,9 @@ class MarketReader:
                 row = rows.setdefault(symbol, {"symbol": symbol})
                 row["suspended"] = item["suspended"]
 
-        limit_fields = tuple(name for name in ("up_limit", "down_limit") if name in selected)
+        limit_fields = tuple(
+            name for name in ("up_limit", "down_limit", "price_limit_status") if name in selected
+        )
         if limit_fields:
             route = "market.price_limits"
             columns = ("symbol", *limit_fields)

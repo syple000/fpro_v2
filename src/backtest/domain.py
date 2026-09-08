@@ -34,6 +34,7 @@ class OrderReason(StrEnum):
     INSUFFICIENT_SELLABLE = "INSUFFICIENT_SELLABLE"
     MISSING_OPEN = "MISSING_OPEN"
     SUSPENDED = "SUSPENDED"
+    UNKNOWN_MARKET_STATUS = "UNKNOWN_MARKET_STATUS"
     LIMIT_UP = "LIMIT_UP"
     LIMIT_DOWN = "LIMIT_DOWN"
     VOLUME_LIMIT = "VOLUME_LIMIT"
@@ -61,6 +62,7 @@ class MarketStatus:
     suspended: bool | None = None
     up_limit: float | None = None
     down_limit: float | None = None
+    price_limit_status: str = "unknown"
 
 
 @dataclass(frozen=True, slots=True)

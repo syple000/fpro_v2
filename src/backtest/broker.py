@@ -207,7 +207,7 @@ class SimulatedBroker:
         """读取本次撮合需要的停牌和涨跌停数据。"""
         rows = data.market.status(
             symbols=symbols,
-            fields=("suspended", "up_limit", "down_limit"),
+            fields=("suspended", "up_limit", "down_limit", "price_limit_status"),
         ).table.to_pylist()
         return {
             row["symbol"]: MarketStatus(
@@ -215,6 +215,7 @@ class SimulatedBroker:
                 suspended=row.get("suspended"),
                 up_limit=row.get("up_limit"),
                 down_limit=row.get("down_limit"),
+                price_limit_status=row.get("price_limit_status") or "unknown",
             )
             for row in rows
         }
@@ -262,6 +263,8 @@ class SimulatedBroker:
             return 0, OrderReason.MISSING_OPEN, None
         if status.suspended is True:
             return 0, OrderReason.SUSPENDED, None
+        if status.suspended is not False or not _known_price_limits(status):
+            return 0, OrderReason.UNKNOWN_MARKET_STATUS, None
 
         assert open_price is not None
         if order.side is Side.BUY and _reaches_limit(open_price, status.up_limit, buy=True):
@@ -374,6 +377,21 @@ class SimulatedBroker:
 def _valid_price(value: float | None) -> bool:
     """价格必须存在、有限且大于零。"""
     return value is not None and math.isfinite(value) and value > 0
+
+
+def _known_price_limits(status: MarketStatus) -> bool:
+    """无限制必须由来源明确声明；空值或矛盾的价格边界均不能放行。"""
+    if status.price_limit_status == "unlimited":
+        return status.up_limit is None and status.down_limit is None
+    if status.price_limit_status == "limited":
+        return (
+            status.up_limit is not None
+            and status.down_limit is not None
+            and _valid_price(status.up_limit)
+            and _valid_price(status.down_limit)
+            and status.down_limit <= status.up_limit
+        )
+    return False
 
 
 def _reaches_limit(price: float, limit: float | None, *, buy: bool) -> bool:
