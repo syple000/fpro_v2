@@ -6,10 +6,11 @@ import math
 from collections import defaultdict
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
-from datetime import datetime, time
+from datetime import date, datetime, time, timedelta
 
 from backtest.clock import Event
 from backtest.config import BacktestConfig, RunOptions
+from backtest.errors import DataError
 from backtest.runner import CompletedRun, run_from_storage
 from backtest.schedule import Schedule
 from backtest.strategy import Strategy, StrategyContext
@@ -44,15 +45,10 @@ def momentum_return(closes: Sequence[float | None]) -> float | None:
     """用窗口首尾两个前复权收盘价计算动量收益。"""
     if len(closes) < 2:
         return None
-    first, last = closes[0], closes[-1]
-    if (
-        first is None
-        or last is None
-        or not math.isfinite(first)
-        or not math.isfinite(last)
-        or first <= 0
-    ):
+    if any(close is None or not math.isfinite(close) or close <= 0 for close in closes):
         return None
+    first, last = closes[0], closes[-1]
+    assert first is not None and last is not None
     value = last / first - 1
     return value if math.isfinite(value) else None
 
@@ -74,11 +70,25 @@ def select_momentum_targets(
     if not candidates:
         return {}
 
-    # 历史窗口、复权和底层查询优化都由 market_data 处理；策略只声明所需数据。
+    # 先固定交易日窗口，缺行情时跳过该证券，不向更早历史补足记录数。
+    required = config.lookback_sessions + 1
+    calendar_rows = data.calendar.sessions(
+        start=date.min,
+        end=event.session + timedelta(days=1),
+        exchange="SSE",
+        fields=("is_open",),
+    ).table.to_pylist()
+    sessions = [row["cal_date"] for row in calendar_rows if row["is_open"] is True][-required:]
+    if len(sessions) != required or sessions[-1] != event.session:
+        raise DataError(
+            f"动量窗口所需的交易日历不足：截至 {event.session} 需要 {required} 个交易日"
+        )
+
     rows = data.market.bars(
         symbols=candidates,
         frequency="1d",
-        count=config.lookback_sessions + 1,
+        start=sessions[0],
+        end=data.as_of,
         fields=("close",),
         adjustment="forward",
     ).table.to_pylist()
@@ -90,10 +100,9 @@ def select_momentum_targets(
         histories[row["symbol"]].append((interval_start, row.get("close")))
 
     scored: list[tuple[float, str]] = []
-    required = config.lookback_sessions + 1
     for symbol in candidates:
         history = sorted(histories[symbol], key=lambda item: item[0])
-        if len(history) != required or history[-1][0].date() != event.session:
+        if [at.date() for at, _ in history] != sessions:
             continue
         score = momentum_return([close for _, close in history])
         if score is not None:
