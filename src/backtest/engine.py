@@ -92,7 +92,20 @@ class BacktestEngine:
         managed = set(self.broker.pending_symbols) | held
         if not managed:
             return
-        for symbol in sorted(managed - listed_symbols(data)):
+        missing = managed - listed_symbols(data)
+        if not missing:
+            return
+        rows = self.reader.security_lifecycles(symbols=tuple(sorted(missing))).to_pylist()
+        lifecycles = {row["symbol"]: row for row in rows}
+        if len(lifecycles) != len(rows):
+            raise DataError("证券生命周期存在冲突记录")
+        for symbol in sorted(missing):
+            lifecycle = lifecycles.get(symbol)
+            if lifecycle is None:
+                raise DataError(f"{symbol} 主数据缺失，无法确认退市；请检查证券代码映射")
+            delisting_date = lifecycle["delisting_date"]
+            if delisting_date is None or delisting_date > at.date():
+                raise DataError(f"{symbol} 不在上市集合中，但没有已生效的退市事实")
             self.broker.cancel_symbol(symbol, OrderReason.DELISTED, at)
             self.portfolio.write_off(symbol)
 

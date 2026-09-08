@@ -34,6 +34,7 @@ from models import (
     INDUSTRY_SCHEMA,
     MONEYFLOW_SCHEMA,
     PRICE_LIMIT_SCHEMA,
+    SECURITY_LIFECYCLE_SCHEMA,
     SESSION_SCHEMA,
     ST_STATUS_SCHEMA,
     STOCK_SCHEMA,
@@ -1358,6 +1359,28 @@ class TushareAdapter(DataAdapter):
             LIMIT $fetch_limit
         """
         return _fetch(self._connection, query, params, INDUSTRY_SCHEMA, columns)
+
+    def security_lifecycles(
+        self,
+        *,
+        symbols: tuple[str, ...] | None,
+        fetch_limit: int | None,
+    ) -> pa.Table:
+        self._catalog.require_available("tushare", "stock_basic")
+        query = """
+            SELECT DISTINCT ts_code AS symbol, list_date AS listing_date,
+                            delist_date AS delisting_date
+            FROM data_internal.stock_basic
+            WHERE ($symbols IS NULL OR ts_code IN (SELECT unnest($symbols)))
+            ORDER BY symbol
+            LIMIT $fetch_limit
+        """
+        return _fetch(
+            self._connection,
+            query,
+            _query_parameters(symbols=symbols, fetch_limit=fetch_limit),
+            SECURITY_LIFECYCLE_SCHEMA,
+        )
 
     def stocks(
         self,

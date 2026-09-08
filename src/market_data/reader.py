@@ -20,7 +20,13 @@ from market_data.errors import (
     DataSourceNotConfiguredError,
 )
 from market_data.protocols import DataAdapter
-from models import IMPLEMENTED_DIVIDEND_SCHEMA, ROUTE_SCHEMAS, STATUS_SCHEMA, QueryResult
+from models import (
+    IMPLEMENTED_DIVIDEND_SCHEMA,
+    ROUTE_SCHEMAS,
+    SECURITY_LIFECYCLE_SCHEMA,
+    STATUS_SCHEMA,
+    QueryResult,
+)
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 SUPPORTED_FREQUENCIES = frozenset({"1m", "5m", "15m", "30m", "60m", "1d"})
@@ -109,6 +115,26 @@ class DataReader:
             raise DataResultTooLargeError(
                 f"实施分红记录超过内部上限 {self._max_result_rows} 行；请缩小 symbols"
             )
+        return table
+
+    def security_lifecycles(self, *, symbols: Symbols) -> pa.Table:
+        """账户专用生命周期事实；不把未来退市日期暴露给策略 DataView。"""
+        source = self._sources.routes.get("reference.stocks")
+        if source is None:
+            raise DataSourceNotConfiguredError("reference.stocks 未配置来源")
+        adapter = {
+            "tushare": self._tushare_adapter,
+            "qmt": self._qmt_adapter,
+            **self._custom_adapters,
+        }[source]
+        table = adapter.security_lifecycles(
+            symbols=_symbols(symbols),
+            fetch_limit=self._max_result_rows + 1,
+        )
+        _exact_schema(table, SECURITY_LIFECYCLE_SCHEMA, "security_lifecycles")
+        _validate_identity(table, ("symbol",))
+        if table.num_rows > self._max_result_rows:
+            raise DataResultTooLargeError("证券生命周期记录超过内部行数上限")
         return table
 
     def snapshot_metadata(self) -> dict[str, Any]:

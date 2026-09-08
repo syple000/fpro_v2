@@ -145,6 +145,14 @@ INDUSTRY_SCHEMA = pa.schema(
     ]
 )
 
+SECURITY_LIFECYCLE_SCHEMA = pa.schema(
+    [
+        pa.field("symbol", pa.string(), nullable=False),
+        pa.field("listing_date", pa.date32()),
+        pa.field("delisting_date", pa.date32()),
+    ]
+)
+
 STOCK_SCHEMA = pa.schema(
     [
         pa.field("symbol", pa.string(), nullable=False),

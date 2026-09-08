@@ -213,6 +213,15 @@ class DataAdapter:
     ) -> pa.Table:
         self._not_supported("industry")
 
+    def security_lifecycles(
+        self,
+        *,
+        symbols: tuple[str, ...] | None,
+        fetch_limit: int | None,
+    ) -> pa.Table:
+        """账户使用的证券生命周期事实，包含已退市证券。"""
+        self._not_supported("security_lifecycles")
+
     def stocks(
         self,
         *,

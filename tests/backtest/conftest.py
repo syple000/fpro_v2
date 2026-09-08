@@ -7,7 +7,14 @@ import pyarrow as pa
 
 from backtest.clock import SHANGHAI
 from market_data import ALL_SYMBOLS
-from models import BAR_SCHEMA, SESSION_SCHEMA, STATUS_SCHEMA, STOCK_SCHEMA, QueryResult
+from models import (
+    BAR_SCHEMA,
+    SECURITY_LIFECYCLE_SCHEMA,
+    SESSION_SCHEMA,
+    STATUS_SCHEMA,
+    STOCK_SCHEMA,
+    QueryResult,
+)
 
 
 def timestamp(session: date, value: time) -> datetime:
@@ -59,14 +66,22 @@ class MemoryDataReader:
         self.bars = bars
         self.sessions = tuple(sessions)
         raw_symbols = bars.column("symbol").to_pylist()
-        self.symbols = tuple(
-            sorted({symbol for symbol in raw_symbols if isinstance(symbol, str)})
-        )
+        self.symbols = tuple(sorted({symbol for symbol in raw_symbols if isinstance(symbol, str)}))
         self.listing_date = listing_date
         self.statuses = statuses or {}
 
     def at(self, as_of: datetime) -> MemoryDataView:
         return MemoryDataView(self, as_of)
+
+    def security_lifecycles(self, *, symbols: Sequence[str]) -> pa.Table:
+        return pa.Table.from_pylist(
+            [
+                {"symbol": symbol, "listing_date": self.listing_date, "delisting_date": None}
+                for symbol in symbols
+                if symbol in self.symbols
+            ],
+            schema=SECURITY_LIFECYCLE_SCHEMA,
+        )
 
 
 class MemoryDataView:
@@ -198,9 +213,7 @@ class MemoryCalendar:
                 "cal_date": session,
                 "exchange": exchange,
                 "is_open": True,
-                "previous_session": (
-                    self._source.sessions[index - 1] if index > 0 else None
-                ),
+                "previous_session": (self._source.sessions[index - 1] if index > 0 else None),
             }
             for index, session in enumerate(self._source.sessions)
             if start <= session < upper
