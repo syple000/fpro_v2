@@ -1,12 +1,22 @@
 import math
 import statistics
-from datetime import date
+from datetime import date, time
 
+import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
+from backtest.clock import at_time
 from backtest.config import BacktestConfig
-from backtest.domain import BacktestResult, EquitySnapshot
+from backtest.domain import (
+    BacktestResult,
+    EquitySnapshot,
+    Fill,
+    Order,
+    OrderStatus,
+    OrderUpdate,
+    Side,
+)
 from backtest.metrics import calculate_metrics
 from backtest.output import write_results
 from backtest.portfolio import Portfolio
@@ -63,3 +73,40 @@ def test_metrics_and_output_use_explicit_result_tables(tmp_path) -> None:
     assert (output / "metrics.json").is_file()
     assert pq.read_table(output / "equity.parquet").num_rows == 2
     assert pq.read_table(output / "orders.parquet").num_rows == 0
+
+
+def test_empty_and_populated_results_have_identical_business_schemas(tmp_path) -> None:
+    day = date(2026, 1, 5)
+    at = at_time(day, time(9, 30))
+    config = BacktestConfig(day, day)
+    order = Order("order-1", "000001.SZ", Side.BUY, 100, at)
+    fill = Fill(
+        "fill-1", order.order_id, order.symbol, order.side, at, 100, 10, 10, 1000, 5, 0, 0, 0
+    )
+    populated = BacktestResult(
+        (day,), (order,), (OrderUpdate(order, OrderStatus.FILLED, at, 100),), (fill,),
+        (Portfolio(config.initial_cash).equity_snapshot(day),),
+    )
+    empty = BacktestResult((), (), (), (), ())
+    write_results(tmp_path / "empty", config, empty, {})
+    write_results(tmp_path / "populated", config, populated, {})
+
+    for name in ("orders", "order_updates", "fills", "equity"):
+        empty_table = pq.read_table(tmp_path / "empty" / f"{name}.parquet")
+        populated_table = pq.read_table(tmp_path / "populated" / f"{name}.parquet")
+        assert empty_table.num_rows == 0
+        assert populated_table.num_rows == 1
+        assert empty_table.schema == populated_table.schema
+        assert "empty" not in empty_table.column_names
+        assert all(field.type != pa.null() for field in empty_table.schema)
+
+    orders = pq.read_table(tmp_path / "empty" / "orders.parquet")
+    fills = pq.read_table(tmp_path / "populated" / "fills.parquet")
+    assert orders.schema.names == [
+        "order_id", "symbol", "side", "quantity", "submitted_at", "target_weight"
+    ]
+    assert orders.schema.field("target_weight").type == pa.float64()
+    assert fills.schema.field("execution_price").type == pa.float64()
+    assert fills.schema.field("quantity").type == pa.int64()
+    assert fills.schema.field("filled_at").type == pa.timestamp("us", tz="UTC")
+    assert fills["filled_at"][0].as_py() == at

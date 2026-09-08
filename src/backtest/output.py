@@ -13,6 +13,57 @@ import pyarrow.parquet as pq
 from backtest.config import BacktestConfig
 from backtest.domain import BacktestResult
 
+_TIMESTAMP = pa.timestamp("us", tz="UTC")
+_ORDER_SCHEMA = pa.schema(
+    [
+        pa.field("order_id", pa.string(), nullable=False),
+        pa.field("symbol", pa.string(), nullable=False),
+        pa.field("side", pa.string(), nullable=False),
+        pa.field("quantity", pa.int64(), nullable=False),
+        pa.field("submitted_at", _TIMESTAMP, nullable=False),
+        pa.field("target_weight", pa.float64()),
+    ]
+)
+_ORDER_UPDATE_SCHEMA = pa.schema(
+    [
+        pa.field("order_id", pa.string(), nullable=False),
+        pa.field("updated_at", _TIMESTAMP, nullable=False),
+        pa.field("status", pa.string(), nullable=False),
+        pa.field("filled_quantity", pa.int64(), nullable=False),
+        pa.field("remaining_quantity", pa.int64(), nullable=False),
+        pa.field("reason", pa.string(), nullable=False),
+    ]
+)
+_FILL_SCHEMA = pa.schema(
+    [
+        pa.field("fill_id", pa.string(), nullable=False),
+        pa.field("order_id", pa.string(), nullable=False),
+        pa.field("symbol", pa.string(), nullable=False),
+        pa.field("side", pa.string(), nullable=False),
+        pa.field("filled_at", _TIMESTAMP, nullable=False),
+        pa.field("quantity", pa.int64(), nullable=False),
+        pa.field("market_price", pa.float64(), nullable=False),
+        pa.field("execution_price", pa.float64(), nullable=False),
+        pa.field("notional", pa.float64(), nullable=False),
+        pa.field("commission", pa.float64(), nullable=False),
+        pa.field("stamp_tax", pa.float64(), nullable=False),
+        pa.field("transfer_fee", pa.float64(), nullable=False),
+        pa.field("slippage_cost", pa.float64(), nullable=False),
+    ]
+)
+_EQUITY_SCHEMA = pa.schema(
+    [
+        pa.field("session", pa.date32(), nullable=False),
+        pa.field("cash", pa.float64(), nullable=False),
+        pa.field("dividend_receivable", pa.float64(), nullable=False),
+        pa.field("market_value", pa.float64(), nullable=False),
+        pa.field("total_equity", pa.float64(), nullable=False),
+        pa.field("daily_return", pa.float64()),
+        pa.field("holding_count", pa.int64(), nullable=False),
+        pa.field("stale_position_count", pa.int64(), nullable=False),
+    ]
+)
+
 
 def write_results(
     output_dir: Path,
@@ -33,6 +84,7 @@ def write_results(
             }
             for order in result.orders
         ],
+        _ORDER_SCHEMA,
     )
     _write_parquet(
         output_dir / "order_updates.parquet",
@@ -47,14 +99,17 @@ def write_results(
             }
             for update in result.order_updates
         ],
+        _ORDER_UPDATE_SCHEMA,
     )
     _write_parquet(
         output_dir / "fills.parquet",
         [{**asdict(fill), "side": fill.side.value} for fill in result.fills],
+        _FILL_SCHEMA,
     )
     _write_parquet(
         output_dir / "equity.parquet",
         [asdict(snapshot) for snapshot in result.equity],
+        _EQUITY_SCHEMA,
     )
     return output_dir
 
@@ -67,7 +122,7 @@ def _write_json(path: Path, value: object) -> None:
     )
 
 
-def _write_parquet(path: Path, rows: list[dict[str, Any]]) -> None:
-    """写 zstd 压缩 Parquet；空结果仍生成一个可读取的空表。"""
-    table = pa.Table.from_pylist(rows) if rows else pa.table({"empty": pa.array([], pa.null())})
+def _write_parquet(path: Path, rows: list[dict[str, Any]], schema: pa.Schema) -> None:
+    """空表与非空表采用同一字段和类型，时间戳统一保存为 UTC。"""
+    table = pa.Table.from_pylist(rows, schema=schema)
     pq.write_table(table, path, compression="zstd")
