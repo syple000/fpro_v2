@@ -20,7 +20,7 @@ from backtest.domain import (
     OrderUpdate,
     Side,
 )
-from backtest.orders import LOT_SIZE
+from backtest.trading_rules import QuantityRule, quantity_rule
 from market_data import DataView
 
 
@@ -73,6 +73,12 @@ class SimulatedBroker:
             or request.quantity <= 0
         ):
             raise ValueError("委托数量必须为正整数")
+        rule = quantity_rule(request.symbol, submitted_at.date())
+        # 零股卖出需等撮合时结合账户余额校验；买入可以立即检查完整规则。
+        if request.quantity > rule.maximum or (
+            Side(request.side) is Side.BUY and not rule.valid(request.quantity)
+        ):
+            raise ValueError(f"{request.symbol} 委托数量不符合申报规则: {request.quantity}")
         order = Order(
             order_id=f"O{self._next_order_id:08d}",
             symbol=request.symbol,
@@ -272,6 +278,9 @@ class SimulatedBroker:
             price = max(price, status.down_limit)
         quantity = order.quantity
         reason = OrderReason.NONE
+        rule = quantity_rule(order.symbol, trading_date)
+        if not rule.valid(quantity, liquidating=order.side is Side.SELL and quantity == sellable):
+            return 0, OrderReason.INVALID_QUANTITY, None
         capacity = self._volume_capacity(previous_volume)
         if capacity is not None and quantity > capacity:
             quantity = capacity
@@ -279,8 +288,10 @@ class SimulatedBroker:
         if order.side is Side.SELL and quantity > sellable:
             quantity = sellable
             reason = OrderReason.INSUFFICIENT_SELLABLE
+        if not (order.side is Side.SELL and quantity == sellable):
+            quantity = rule.round_down(quantity)
         if order.side is Side.BUY:
-            affordable = self._affordable_quantity(quantity, price, cash, trading_date)
+            affordable = self._affordable_quantity(quantity, price, cash, trading_date, rule)
             if affordable < quantity:
                 quantity = affordable
                 reason = OrderReason.INSUFFICIENT_CASH
@@ -334,15 +345,16 @@ class SimulatedBroker:
         execution_price: float,
         cash: float,
         trading_date: date,
+        rule: QuantityRule,
     ) -> int:
         """在最低佣金存在时逐手寻找可负担数量。"""
-        quantity = requested // LOT_SIZE * LOT_SIZE
+        quantity = rule.round_down(requested)
         while quantity > 0:
             notional = execution_price * quantity
             fees = sum(self._fees(Side.BUY, notional, trading_date))
             if notional + fees <= cash + 1e-9:
                 return quantity
-            quantity -= LOT_SIZE
+            quantity = rule.round_down(quantity - rule.step)
         return 0
 
     def _volume_capacity(self, previous_volume: float | None) -> int | None:
@@ -351,7 +363,7 @@ class SimulatedBroker:
             return None
         if previous_volume is None or not math.isfinite(previous_volume):
             return 0
-        return math.floor(previous_volume * self.config.volume_limit / LOT_SIZE) * LOT_SIZE
+        return max(0, math.floor(previous_volume * self.config.volume_limit))
 
 
 def _valid_price(value: float | None) -> bool:

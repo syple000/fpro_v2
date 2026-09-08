@@ -4,10 +4,10 @@ from __future__ import annotations
 
 import math
 from collections.abc import Mapping
+from datetime import date
 
 from backtest.domain import AccountSnapshot, OrderRequest, Side
-
-LOT_SIZE = 100
+from backtest.trading_rules import quantity_rule
 
 
 def validate_target_weights(weights: Mapping[str, float]) -> dict[str, float]:
@@ -30,12 +30,15 @@ def create_orders(
     weights: Mapping[str, float],
     account: AccountSnapshot,
     prices: Mapping[str, float],
+    *,
+    trading_date: date,
 ) -> tuple[OrderRequest, ...]:
     """把完整目标权重与当前持仓之差直接转换成订单。"""
     targets = validate_target_weights(weights)
     holdings = {holding.symbol: holding for holding in account.holdings}
     result: list[OrderRequest] = []
     for symbol in sorted(set(targets) | set(holdings)):
+        rule = quantity_rule(symbol, trading_date)
         current = holdings[symbol].quantity if symbol in holdings else 0
         weight = targets.get(symbol, 0.0)
         price = prices.get(symbol)
@@ -45,16 +48,20 @@ def create_orders(
             # 没有可靠价格时维持原持仓，不凭空交易。
             target = current
         else:
-            target = math.floor(account.total_equity * weight / price / LOT_SIZE) * LOT_SIZE
+            target = math.floor(account.total_equity * weight / price)
 
         difference = target - current
         if difference == 0:
             continue
         side = Side.BUY if difference > 0 else Side.SELL
         quantity = abs(difference)
-        # 买入和非清仓卖出使用整手；清仓允许卖出零股。
-        if side is Side.BUY or target != 0:
-            quantity = quantity // LOT_SIZE * LOT_SIZE
-        if quantity > 0:
-            result.append(OrderRequest(symbol, side, quantity, weight))
+        # 大目标拆成合法申报；尾单不足最低数量则保留，清仓允许一次卖尽零股。
+        while quantity > 0:
+            amount = min(quantity, rule.maximum)
+            if side is Side.BUY or target != 0:
+                amount = rule.round_down(amount)
+            if amount == 0:
+                break
+            result.append(OrderRequest(symbol, side, amount, weight))
+            quantity -= amount
     return tuple(result)

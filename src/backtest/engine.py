@@ -138,7 +138,7 @@ class BacktestEngine:
             else []
         )
         prices = {row["symbol"]: row["close"] for row in rows}
-        for order in create_orders(targets, account, prices):
+        for order in create_orders(targets, account, prices, trading_date=event.session):
             self.broker.submit(order, event.at)
 
     def _read_bars(self, event: Event, data: DataView) -> dict[str, Bar]:
