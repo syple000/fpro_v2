@@ -1418,8 +1418,21 @@ class TushareAdapter(DataAdapter):
 class QmtAdapter(DataAdapter):
     """把 QMT 下载历史行情和已接收实时事件归一为平台字段。"""
 
-    def __init__(self, catalog: DataCatalog) -> None:
+    def __init__(
+        self,
+        catalog: DataCatalog,
+        *,
+        history_time_label: Literal["start", "end"] = "end",
+        realtime_time_label: Literal["start", "end"] = "start",
+    ) -> None:
         self._connection = catalog.connection
+        if history_time_label not in {"start", "end"} or realtime_time_label not in {
+            "start",
+            "end",
+        }:
+            raise ValueError("QMT 时间标签必须为 start 或 end")
+        self.history_time_label = history_time_label
+        self.realtime_time_label = realtime_time_label
 
     def daily_bars(
         self,
@@ -1526,8 +1539,17 @@ class QmtAdapter(DataAdapter):
         if period is None:
             raise DataCapabilityNotSupportedError(f"QMT 不支持分钟周期 {frequency!r}")
         qmt_period, minutes = period
-        start_expr = _epoch_time("event_time")
-        end_expr = f"{start_expr} + INTERVAL '{minutes} minutes'"
+        event_time = _epoch_time("event_time")
+        # 历史下载与实时持久化分别声明标签语义，不能把两种数据一起平移。
+        start_expr = f"CASE WHEN time_label = 'start' THEN {event_time} ELSE " + (
+            f"CASE WHEN CAST(timezone('{_TZ}', {event_time}) AS TIME) = TIME '09:30' "
+            f"THEN {event_time} - INTERVAL '15 minutes' "
+            f"ELSE {event_time} - INTERVAL '{minutes} minutes' END END"
+        )
+        end_expr = (
+            f"CASE WHEN time_label = 'end' THEN {event_time} "
+            f"ELSE {event_time} + INTERVAL '{minutes} minutes' END"
+        )
         qmt_adjustment = "none"
         direction = _sql_direction(order, default="asc")
         as_of_us = _epoch_us(as_of)
@@ -1538,12 +1560,11 @@ class QmtAdapter(DataAdapter):
             as_of=as_of,
             as_of_date=as_of.date(),
             as_of_us=as_of_us,
-            latest_start_us=as_of_us - minutes * 60 * 1_000_000,
+            history_time_label=self.history_time_label,
+            realtime_time_label=self.realtime_time_label,
             symbols=symbols,
             start=start,
             end=end,
-            start_us=_epoch_us(start),
-            end_us=_epoch_us(end),
             start_date=_local_date(start) if start is not None else None,
             end_date=_local_date(end),
             count=count,
@@ -1553,6 +1574,7 @@ class QmtAdapter(DataAdapter):
             WITH candidates AS (
                 SELECT code,
                        event_time,
+                       $history_time_label AS time_label,
                        open, high, low, close, preClose,
                        CAST(volume * 100.0 AS DOUBLE) AS volume,
                        amount,
@@ -1565,14 +1587,12 @@ class QmtAdapter(DataAdapter):
                   AND ($symbols IS NULL OR code IN (SELECT unnest($symbols)))
                   AND ($start_date IS NULL OR trading_date >= $start_date)
                   AND trading_date <= $end_date
-                  AND event_time <= $latest_start_us
-                  AND ($start_us IS NULL OR event_time >= $start_us)
-                  AND ($end_us IS NULL OR event_time < $end_us)
 
                 UNION ALL
 
                 SELECT code,
                        event_time,
+                       $realtime_time_label AS time_label,
                        quote.open, quote.high, quote.low, quote.close, quote.preClose,
                        {_qmt_share_volume("quote.volume")} AS volume,
                        quote.amount,
@@ -1586,16 +1606,6 @@ class QmtAdapter(DataAdapter):
                   AND trading_date <= $end_date
                   AND event_time IS NOT NULL
                   AND received_at <= $as_of_us
-                  AND event_time <= $latest_start_us
-                  AND ($start_us IS NULL OR event_time >= $start_us)
-                  AND ($end_us IS NULL OR event_time < $end_us)
-            ), latest AS (
-                SELECT *
-                FROM candidates
-                QUALIFY row_number() OVER (
-                    PARTITION BY code, event_time
-                    ORDER BY received_at DESC NULLS LAST, seq DESC
-                ) = 1
             ), platform_bars AS (
                 SELECT code AS symbol,
                        {start_expr} AS interval_start,
@@ -1604,14 +1614,20 @@ class QmtAdapter(DataAdapter):
                        preClose AS pre_close,
                        volume,
                        amount,
-                       event_time
-                FROM latest
+                       event_time, received_at, seq
+                FROM candidates
+            ), latest AS (
+                SELECT * FROM platform_bars
+                QUALIFY row_number() OVER (
+                    PARTITION BY symbol, interval_start, interval_end
+                    ORDER BY received_at DESC NULLS LAST, seq DESC
+                ) = 1
             )
             SELECT symbol,
                    interval_start,
                    interval_end,
                    open, high, low, close, pre_close, volume, amount
-            FROM platform_bars
+            FROM latest
             WHERE interval_end <= $as_of
               AND ($start IS NULL OR interval_start >= $start)
               AND ($end IS NULL OR interval_start < $end)

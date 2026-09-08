@@ -32,6 +32,7 @@ def test_market_hours_control_timeline() -> None:
         segments=((time(9), time(11)),),
         daily_bar_at=time(11, 5),
         session_end=time(11, 5),
+        opening_auction=None,
     )
     events = market_timeline((session,), "60m", market)
 

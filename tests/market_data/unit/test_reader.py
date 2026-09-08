@@ -798,7 +798,7 @@ def test_qmt_adapter_calculates_forward_intraday_from_raw_bars_and_dr(
 ) -> None:
     qmt_root = tmp_path / "qmt"
     raw = HistoryBar(
-        index=20240102093000,
+        index=20240102093100,
         open=10.0,
         high=12.0,
         low=9.0,
@@ -808,7 +808,7 @@ def test_qmt_adapter_calculates_forward_intraday_from_raw_bars_and_dr(
         amount=1_000.0,
     )
     adjusted = HistoryBar(
-        index=20240102093000,
+        index=20240102093100,
         open=5.0,
         high=6.0,
         low=4.5,

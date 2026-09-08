@@ -41,7 +41,7 @@ class BacktestEngine:
         market_events = market_timeline(sessions, config.frequency, config.market)
         strategy_events = strategy.schedule.events(market_events, calendar, config.market)
         # 同一时刻先处理市场，再调用策略，最后登记权益与净值。
-        priority = {"session_start": 0, "bar": 1, "strategy": 2, "session_end": 3}
+        priority = {"session_start": 0, "auction": 1, "bar": 1, "strategy": 2, "session_end": 3}
         self.events = tuple(
             sorted(
                 (*market_events, *strategy_events),
@@ -61,7 +61,7 @@ class BacktestEngine:
             data = self.reader.at(event.at)
             if event.kind == "session_start":
                 self._start_session(event.at, data)
-            elif event.kind == "bar":
+            elif event.kind in {"bar", "auction"}:
                 self._process_bar(event, data)
             elif event.kind == "strategy":
                 self._run_strategy(event, data)
@@ -98,7 +98,7 @@ class BacktestEngine:
         bars = self._read_bars(event, data)
 
         # 先撮合旧订单，保证本次策略产生的订单只能使用下一根 Bar 的开盘价。
-        if self.broker.pending_symbols:
+        if event.kind == "bar" and self.broker.pending_symbols:
             fills = self.broker.match_bar(
                 event=event,
                 bars=bars,

@@ -97,7 +97,11 @@ D 表示记录的 `trade_date`、公告日期或生效日期。可见日期为�
 ### 分钟线和日线
 
 分钟线统一转换为半开区间 `[interval_start, interval_end)`，到 `interval_end` 才进入
-`market.bars()`。QMT 的事件时间必须在导入时归一化；如果以后增加 Tushare 分钟表，必须先验证
+`market.bars()`。`QmtAdapter(history_time_label="end", realtime_time_label="start")`
+分别声明两个数据集的标签语义；不同采集口径可用独立 source_id 注入适配器。
+历史默认对应本地下载数据的结束标签；09:30 开盘记录单独归入 09:15–09:30 发布窗口，
+回测只用其估值，不模拟竞价成交。午休及收盘结束标签保留。其它周期或数据集接入前须核实口径。
+QMT 的事件时间必须在导入时归一化；如果以后增加 Tushare 分钟表，必须先验证
 其 `trade_time` 表示区间开始还是结束，不能由 Reader 临时猜测。
 
 日线分成两个可见事件：

@@ -37,6 +37,8 @@ class MarketHours:
         (time(13), time(15)),
     )
     daily_bar_at: time = time(16, 5)
+    # 开盘集合竞价单独用于估值；结束时间是数据发布边界，不参与开盘价撮合。
+    opening_auction: tuple[time, time] | None = (time(9, 15), time(9, 30))
 
     def __post_init__(self) -> None:
         ZoneInfo(self.timezone)
@@ -49,6 +51,10 @@ class MarketHours:
             previous_end = end
         if not previous_end <= self.daily_bar_at <= self.session_end:
             raise ValueError("日线可见时间必须位于最后收盘与交易日结束之间")
+        if self.opening_auction is not None:
+            start, end = self.opening_auction
+            if not start < end <= self.segments[0][0] or end < self.session_start:
+                raise ValueError("集合竞价发布边界必须位于日初与连续交易开始之间")
 
     def at(self, session: date, value: time) -> datetime:
         return datetime.combine(session, value, tzinfo=ZoneInfo(self.timezone))
@@ -67,7 +73,7 @@ class Event:
     interval_start: datetime
     # 撮合使用的行情周期，不是 Schedule 中的策略调用周期。
     frequency: str
-    kind: Literal["session_start", "bar", "strategy", "session_end"] = "bar"
+    kind: Literal["session_start", "auction", "bar", "strategy", "session_end"] = "bar"
 
 
 def market_timeline(
@@ -94,6 +100,17 @@ def market_timeline(
                 )
             )
         else:
+            if market.opening_auction is not None:
+                auction_start, auction_end = market.opening_auction
+                events.append(
+                    Event(
+                        market.at(session, auction_end),
+                        session,
+                        market.at(session, auction_start),
+                        frequency,
+                        "auction",
+                    )
+                )
             events.extend(_intraday_events(session, frequency, market))
         end = market.at(session, market.session_end)
         events.append(Event(end, session, end, frequency, "session_end"))

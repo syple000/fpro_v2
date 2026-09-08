@@ -87,6 +87,11 @@ class BacktestConfig:
             "session_start": self.market.session_start.isoformat(),
             "session_end": self.market.session_end.isoformat(),
             "daily_bar_at": self.market.daily_bar_at.isoformat(),
+            "opening_auction": (
+                [value.isoformat() for value in self.market.opening_auction]
+                if self.market.opening_auction is not None
+                else None
+            ),
             "segments": [
                 [start.isoformat(), end.isoformat()] for start, end in self.market.segments
             ],
