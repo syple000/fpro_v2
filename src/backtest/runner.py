@@ -7,7 +7,6 @@ from datetime import date, time, timedelta
 from pathlib import Path
 from typing import Any
 
-from backtest.clock import at_time
 from backtest.config import BacktestConfig, RunOptions
 from backtest.corporate_actions import CorporateActionProcessor
 from backtest.domain import BacktestResult
@@ -17,7 +16,6 @@ from backtest.metrics import calculate_metrics
 from backtest.output import write_results
 from backtest.strategy import Strategy
 from market_data import DataCatalog, DataReader, SourceConfig
-from strategies import MomentumConfig, MonthlyMomentumStrategy
 
 
 def default_source_config() -> SourceConfig:
@@ -69,7 +67,9 @@ def run_backtest(
     output_dir: Path | None = None,
 ) -> CompletedRun:
     """使用已有 DataReader 运行任意策略，适合测试或嵌入其他程序。"""
-    sessions, calendar = _load_sessions(reader, config)
+    sessions, calendar = _load_sessions(
+        reader, config, needs_next_session=strategy.schedule.needs_next_session
+    )
     engine = BacktestEngine(
         reader=reader,
         config=config,
@@ -89,19 +89,41 @@ def run_backtest(
 def _load_sessions(
     reader: DataReader,
     config: BacktestConfig,
+    *,
+    needs_next_session: bool = False,
 ) -> tuple[tuple[date, ...], tuple[date, ...]]:
-    """读取交易日历；额外读取未来一段仅用于判断区间末尾是否为月末。"""
-    calendar_end = config.end_date + timedelta(days=40)
-    rows = reader.at(at_time(calendar_end, time(23, 59, 59))).calendar.sessions(
-        start=config.start_date,
-        end=calendar_end + timedelta(days=1),
-        exchange="SSE",
-        fields=("is_open",),
-    ).table.to_pylist()
-    calendar = tuple(row["cal_date"] for row in rows if row["is_open"] is True)
-    sessions = tuple(session for session in calendar if session <= config.end_date)
+    """读取运行区间；只有周期末调度需要额外的下一交易日。"""
+    market = config.market
+    rows = (
+        reader.at(market.at(config.end_date, time.max))
+        .calendar.sessions(
+            start=config.start_date,
+            end=config.end_date + timedelta(days=1),
+            exchange=market.exchange,
+            fields=("is_open",),
+        )
+        .table.to_pylist()
+    )
+    sessions = tuple(row["cal_date"] for row in rows if row["is_open"] is True)
     if not sessions:
         raise DataError("回测区间内没有交易日")
+    calendar = sessions
+    if needs_next_session:
+        # 下一交易日是市场日历信息，不是未来行情或公告。
+        following = (
+            reader.at(market.at(date.max, time.min))
+            .calendar.sessions(
+                start=config.end_date + timedelta(days=1),
+                end=date.max,
+                exchange=market.exchange,
+                fields=("is_open",),
+            )
+            .table.to_pylist()
+        )
+        next_session = next((row["cal_date"] for row in following if row["is_open"] is True), None)
+        if next_session is None:
+            raise DataError(f"{config.end_date} 之后缺少下一交易日，无法判断周期末")
+        calendar = (*sessions, next_session)
     return sessions, calendar
 
 
@@ -125,22 +147,3 @@ def run_from_storage(
             strategy=strategy,
             output_dir=options.output_dir,
         )
-
-
-def run_monthly_momentum(
-    *,
-    config: BacktestConfig,
-    strategy_config: MomentumConfig | None = None,
-    options: RunOptions | None = None,
-) -> CompletedRun:
-    """创建内置月度动量策略并通过生产数据源运行。"""
-    if config.frequency != "1d":
-        raise ValueError("月度动量示例策略要求 frequency='1d'")
-    return run_from_storage(
-        config=config,
-        strategy=MonthlyMomentumStrategy(
-            strategy_config,
-            allowed_symbols=config.symbols,
-        ),
-        options=options,
-    )

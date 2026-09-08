@@ -8,8 +8,7 @@ from datetime import date
 from pathlib import Path
 
 from backtest.config import BacktestConfig, RunOptions
-from backtest.runner import run_monthly_momentum
-from strategies import MomentumConfig
+from strategies import MomentumConfig, run_monthly_momentum
 
 
 def main() -> None:

@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import math
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import date
 from pathlib import Path
 from typing import Any
 
+from backtest.clock import MarketHours
 from backtest.errors import ConfigurationError
 
 SUPPORTED_FREQUENCIES = frozenset({"1m", "5m", "15m", "30m", "60m", "1d"})
@@ -21,8 +22,10 @@ class BacktestConfig:
     start_date: date
     end_date: date
 
-    # K 线周期。日线来自 Tushare，分钟线默认来自 QMT。
+    # 撮合和估值的 K 线周期；策略调用周期单独由 Strategy.schedule 决定。
     frequency: str = "1d"
+
+    market: MarketHours = field(default_factory=MarketHours)
 
     # 限定证券池；None 表示让数据层读取全部证券。
     symbols: tuple[str, ...] | None = None
@@ -78,6 +81,16 @@ class BacktestConfig:
         result = asdict(self)
         result["start_date"] = self.start_date.isoformat()
         result["end_date"] = self.end_date.isoformat()
+        result["market"] = {
+            "exchange": self.market.exchange,
+            "timezone": self.market.timezone,
+            "session_start": self.market.session_start.isoformat(),
+            "session_end": self.market.session_end.isoformat(),
+            "daily_bar_at": self.market.daily_bar_at.isoformat(),
+            "segments": [
+                [start.isoformat(), end.isoformat()] for start, end in self.market.segments
+            ],
+        }
         return result
 
 

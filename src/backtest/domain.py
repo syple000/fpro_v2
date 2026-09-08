@@ -40,6 +40,7 @@ class OrderReason(StrEnum):
     CORPORATE_ACTION = "CORPORATE_ACTION"
     DELISTED = "DELISTED"
     END_OF_BACKTEST = "END_OF_BACKTEST"
+    STRATEGY = "STRATEGY"
 
 
 @dataclass(frozen=True, slots=True)
@@ -64,12 +65,12 @@ class MarketStatus:
 
 @dataclass(frozen=True, slots=True)
 class OrderRequest:
-    """目标权重转换后交给 Broker 的最小下单请求。"""
+    """数量订单；目标权重仅在组合调仓时填写。"""
 
     symbol: str
     side: Side
     quantity: int
-    target_weight: float
+    target_weight: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -81,7 +82,7 @@ class Order:
     side: Side
     quantity: int
     submitted_at: datetime
-    target_weight: float
+    target_weight: float | None = None
 
 
 @dataclass(frozen=True, slots=True)

@@ -6,11 +6,13 @@ import math
 from collections import defaultdict
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, time
 
 from backtest.clock import Event
-from backtest.domain import AccountSnapshot
-from backtest.strategy import Strategy
+from backtest.config import BacktestConfig, RunOptions
+from backtest.runner import CompletedRun, run_from_storage
+from backtest.schedule import Schedule
+from backtest.strategy import Strategy, StrategyContext
 from backtest.universe import select_stock_universe
 from market_data import DataView
 
@@ -110,7 +112,9 @@ def select_momentum_targets(
 
 
 class MonthlyMomentumStrategy(Strategy):
-    """仅在每月最后一个交易日的日线结束后进行一次等权调仓。"""
+    """月末日线可见后等权调仓，撮合可使用日线或分钟线。"""
+
+    schedule = Schedule("month", at=time(16, 5))
 
     def __init__(
         self,
@@ -120,25 +124,27 @@ class MonthlyMomentumStrategy(Strategy):
     ) -> None:
         """保存策略参数；allowed_symbols 可进一步限制候选范围。"""
         self.config = config or MomentumConfig()
-        self.allowed_symbols = (
-            tuple(allowed_symbols) if allowed_symbols is not None else None
-        )
+        self.allowed_symbols = tuple(allowed_symbols) if allowed_symbols is not None else None
 
-    def on_bar(
-        self,
-        data: DataView,
-        event: Event,
-        account: AccountSnapshot,
-    ) -> dict[str, float] | None:
-        """非月末返回 None；月末直接从当前 DataView 计算完整目标组合。"""
-        del account
-        if event.frequency != "1d":
-            raise ValueError("MonthlyMomentumStrategy 只按日线交易")
-        if not event.is_session_end or not event.is_month_end:
-            return None
+    def on_event(self, context: StrategyContext) -> dict[str, float]:
+        """调度已保证调用日期，策略只负责计算目标组合。"""
         return select_momentum_targets(
-            data,
-            event,
+            context.data,
+            context.event,
             self.config,
             allowed_symbols=self.allowed_symbols,
         )
+
+
+def run_monthly_momentum(
+    *,
+    config: BacktestConfig,
+    strategy_config: MomentumConfig | None = None,
+    options: RunOptions | None = None,
+) -> CompletedRun:
+    """示例策略的运行便捷入口；通用回测层不依赖具体策略。"""
+    return run_from_storage(
+        config=config,
+        strategy=MonthlyMomentumStrategy(strategy_config, allowed_symbols=config.symbols),
+        options=options,
+    )

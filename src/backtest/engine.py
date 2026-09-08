@@ -4,17 +4,17 @@ from __future__ import annotations
 
 import math
 from collections.abc import Sequence
-from datetime import date, datetime, time
+from datetime import date, datetime
 
 from backtest.broker import SimulatedBroker
-from backtest.clock import Clock, Event, at_time, market_timeline
+from backtest.clock import Clock, Event, market_timeline
 from backtest.config import BacktestConfig
 from backtest.corporate_actions import CorporateActionProcessor
 from backtest.domain import BacktestResult, Bar, EquitySnapshot, OrderReason
 from backtest.errors import DataError
-from backtest.orders import create_orders
+from backtest.orders import create_orders, validate_target_weights
 from backtest.portfolio import Portfolio
-from backtest.strategy import Strategy
+from backtest.strategy import Strategy, StrategyContext
 from backtest.universe import listed_symbols
 from market_data import ALL_SYMBOLS, DataReader, DataView
 
@@ -28,7 +28,7 @@ class BacktestEngine:
         reader: DataReader,
         config: BacktestConfig,
         sessions: Sequence[date],
-        calendar: Sequence[date],
+        calendar: Sequence[date] = (),
         strategy: Strategy,
         actions: CorporateActionProcessor | None = None,
     ) -> None:
@@ -38,7 +38,16 @@ class BacktestEngine:
         self.reader = reader
         self.config = config
         self.strategy = strategy
-        self.events = market_timeline(sessions, calendar, config.frequency)
+        market_events = market_timeline(sessions, config.frequency, config.market)
+        strategy_events = strategy.schedule.events(market_events, calendar, config.market)
+        # 同一时刻先处理市场，再调用策略，最后登记权益与净值。
+        priority = {"session_start": 0, "bar": 1, "strategy": 2, "session_end": 3}
+        self.events = tuple(
+            sorted(
+                (*market_events, *strategy_events),
+                key=lambda event: (event.at, priority[event.kind]),
+            )
+        )
         self.clock = Clock()
         self.portfolio = Portfolio(config.initial_cash)
         self.broker = SimulatedBroker(config)
@@ -47,16 +56,16 @@ class BacktestEngine:
 
     def run(self) -> BacktestResult:
         """逐个事件推进，最后返回订单、成交和每日净值。"""
-        active_session: date | None = None
         for event in self.events:
-            if event.session != active_session:
-                start_at = at_time(event.session, time(9, 25))
-                self.clock.move_to(start_at)
-                self._start_session(start_at, self.reader.at(start_at))
-                active_session = event.session
             self.clock.move_to(event.at)
-            self._process_bar(event, self.reader.at(event.at))
-            if event.is_session_end:
+            data = self.reader.at(event.at)
+            if event.kind == "session_start":
+                self._start_session(event.at, data)
+            elif event.kind == "bar":
+                self._process_bar(event, data)
+            elif event.kind == "strategy":
+                self._run_strategy(event, data)
+            elif event.kind == "session_end":
                 self._end_session(event)
             self.portfolio.assert_valid()
 
@@ -85,7 +94,7 @@ class BacktestEngine:
             self.portfolio.write_off(symbol)
 
     def _process_bar(self, event: Event, data: DataView) -> None:
-        """读取 Bar，然后依次撮合、估值、执行策略和提交订单。"""
+        """每根 Bar 都撮合和估值，与策略是否调用无关。"""
         bars = self._read_bars(event, data)
 
         # 先撮合旧订单，保证本次策略产生的订单只能使用下一根 Bar 的开盘价。
@@ -106,14 +115,30 @@ class BacktestEngine:
         }
         self.portfolio.mark_to_market(prices)
 
-        weights = self.strategy.on_bar(data, event, self.portfolio.account_snapshot())
+    def _run_strategy(self, event: Event, data: DataView) -> None:
+        """只在策略声明的时间调用；历史价格继续通过 DataView 查询。"""
+        account = self.portfolio.account_snapshot()
+        context = StrategyContext(data, event, account, self.broker)
+        weights = self.strategy.on_event(context)
         if weights is None:
             return
-        for order in create_orders(
-            weights,
-            self.portfolio.account_snapshot(),
-            prices,
-        ):
+        targets = validate_target_weights(weights)
+        if self.config.symbols is not None and set(targets) - set(self.config.symbols):
+            raise ValueError("目标组合包含本次回测 symbols 之外的证券")
+        symbols = tuple(symbol for symbol, weight in targets.items() if weight > 0)
+        rows = (
+            data.market.bars(
+                symbols=symbols,
+                frequency=self.config.frequency,
+                count=1,
+                fields=("close",),
+                adjustment="none",
+            ).table.to_pylist()
+            if symbols
+            else []
+        )
+        prices = {row["symbol"]: row["close"] for row in rows}
+        for order in create_orders(targets, account, prices):
             self.broker.submit(order, event.at)
 
     def _read_bars(self, event: Event, data: DataView) -> dict[str, Bar]:

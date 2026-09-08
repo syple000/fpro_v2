@@ -63,7 +63,6 @@ def _event(session: date) -> Event:
         session=session,
         interval_start=at_time(session, time(9, 30)),
         frequency="1d",
-        is_session_end=True,
     )
 
 
@@ -122,3 +121,29 @@ def test_limit_up_blocks_buy() -> None:
 def test_portfolio_rejects_overspending_fill() -> None:
     with pytest.raises(AccountError, match="超过可用现金"):
         Portfolio(1_000).apply_fill(_fill(Side.BUY, 1_000, 10))
+
+
+def test_order_submitted_after_bar_open_waits_for_next_bar() -> None:
+    day, following = date(2026, 1, 5), date(2026, 1, 6)
+    config = BacktestConfig(day, following, volume_limit=None)
+    broker = SimulatedBroker(config)
+    order = broker.submit(OrderRequest("000001.SZ", Side.BUY, 100), at_time(day, time(10)))
+    portfolio = Portfolio(100_000)
+
+    assert (
+        broker.match_bar(
+            event=_event(day),
+            bars={"000001.SZ": _bar(day, 10)},
+            account=portfolio.account_snapshot(),
+            data=_data(config),
+        )
+        == ()
+    )
+    assert broker.pending_orders == (order,)
+    fills = broker.match_bar(
+        event=_event(following),
+        bars={"000001.SZ": _bar(following, 10)},
+        account=portfolio.account_snapshot(),
+        data=_data(config),
+    )
+    assert fills[0].filled_at == at_time(following, time(9, 30))

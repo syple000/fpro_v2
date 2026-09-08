@@ -57,12 +57,26 @@ class SimulatedBroker:
         """仍在等待下一根 K 线的证券代码。"""
         return tuple(sorted({order.symbol for order in self._pending}))
 
-    def submit(self, request: OrderRequest, submitted_at: datetime) -> None:
+    @property
+    def pending_orders(self) -> tuple[Order, ...]:
+        return tuple(self._pending)
+
+    def submit(self, request: OrderRequest, submitted_at: datetime) -> Order:
         """接收订单并记录 SUBMITTED 状态。"""
+        if not request.symbol:
+            raise ValueError("证券代码不能为空")
+        if self.config.symbols is not None and request.symbol not in self.config.symbols:
+            raise ValueError(f"{request.symbol} 不在本次回测的 symbols 中")
+        if (
+            isinstance(request.quantity, bool)
+            or not isinstance(request.quantity, int)
+            or request.quantity <= 0
+        ):
+            raise ValueError("委托数量必须为正整数")
         order = Order(
             order_id=f"O{self._next_order_id:08d}",
             symbol=request.symbol,
-            side=request.side,
+            side=Side(request.side),
             quantity=request.quantity,
             submitted_at=submitted_at,
             target_weight=request.target_weight,
@@ -71,6 +85,18 @@ class SimulatedBroker:
         self._orders.append(order)
         self._pending.append(order)
         self._updates.append(OrderUpdate(order, OrderStatus.SUBMITTED, submitted_at))
+        return order
+
+    def cancel(self, order_id: str, at: datetime) -> bool:
+        """撤销仍待撮合的订单；已结束或不存在的订单返回 False。"""
+        for order in self._pending:
+            if order.order_id == order_id:
+                self._pending.remove(order)
+                self._updates.append(
+                    OrderUpdate(order, OrderStatus.CANCELED, at, reason=OrderReason.STRATEGY)
+                )
+                return True
+        return False
 
     def match_bar(
         self,
@@ -84,9 +110,13 @@ class SimulatedBroker:
         if not self._pending:
             return ()
 
-        # 当前策略尚未执行，所以 pending 全部来自更早的 K 线。
-        orders = self._pending
-        self._pending = []
+        # 只允许在开盘时已经提交的订单参与本根 Bar，不能回填过去的成交。
+        orders = [order for order in self._pending if order.submitted_at <= event.interval_start]
+        self._pending = [
+            order for order in self._pending if order.submitted_at > event.interval_start
+        ]
+        if not orders:
+            return ()
         orders.sort(key=lambda order: (order.side is Side.BUY, order.symbol, order.order_id))
         symbols = tuple(sorted({order.symbol for order in orders}))
         statuses = self._market_statuses(data, symbols)
@@ -99,9 +129,7 @@ class SimulatedBroker:
 
         # 同一批次先卖后买，卖出释放的现金可供随后买入。
         cash = account.cash
-        sellable = {
-            holding.symbol: holding.sellable_quantity for holding in account.holdings
-        }
+        sellable = {holding.symbol: holding.sellable_quantity for holding in account.holdings}
         fills: list[Fill] = []
         for order in orders:
             bar = bars.get(order.symbol)
@@ -134,9 +162,7 @@ class SimulatedBroker:
                 cash += fill.notional - fill.total_fee
                 sellable[order.symbol] = sellable.get(order.symbol, 0) - quantity
             status = (
-                OrderStatus.FILLED
-                if quantity == order.quantity
-                else OrderStatus.PARTIALLY_FILLED
+                OrderStatus.FILLED if quantity == order.quantity else OrderStatus.PARTIALLY_FILLED
             )
             self._updates.append(OrderUpdate(order, status, filled_at, quantity, reason))
 
@@ -148,9 +174,7 @@ class SimulatedBroker:
         remaining: list[Order] = []
         for order in self._pending:
             if order.symbol == symbol:
-                self._updates.append(
-                    OrderUpdate(order, OrderStatus.CANCELED, at, reason=reason)
-                )
+                self._updates.append(OrderUpdate(order, OrderStatus.CANCELED, at, reason=reason))
             else:
                 remaining.append(order)
         self._pending = remaining
@@ -235,9 +259,7 @@ class SimulatedBroker:
         assert open_price is not None
         if order.side is Side.BUY and _reaches_limit(open_price, status.up_limit, buy=True):
             return 0, OrderReason.LIMIT_UP, None
-        if order.side is Side.SELL and _reaches_limit(
-            open_price, status.down_limit, buy=False
-        ):
+        if order.side is Side.SELL and _reaches_limit(open_price, status.down_limit, buy=False):
             return 0, OrderReason.LIMIT_DOWN, None
 
         quantity = order.quantity
@@ -250,9 +272,7 @@ class SimulatedBroker:
             quantity = sellable
             reason = OrderReason.INSUFFICIENT_SELLABLE
         if order.side is Side.BUY:
-            affordable = self._affordable_quantity(
-                quantity, open_price, cash, trading_date
-            )
+            affordable = self._affordable_quantity(quantity, open_price, cash, trading_date)
             if affordable < quantity:
                 quantity = affordable
                 reason = OrderReason.INSUFFICIENT_CASH
@@ -267,13 +287,9 @@ class SimulatedBroker:
     ) -> Fill:
         """应用滑点和交易费用，生成成交记录。"""
         direction = 1 if order.side is Side.BUY else -1
-        execution_price = market_price * (
-            1 + direction * self.config.slippage_bps / 10_000
-        )
+        execution_price = market_price * (1 + direction * self.config.slippage_bps / 10_000)
         notional = execution_price * quantity
-        commission, stamp_tax, transfer_fee = self._fees(
-            order.side, notional, at.date()
-        )
+        commission, stamp_tax, transfer_fee = self._fees(order.side, notional, at.date())
         fill = Fill(
             fill_id=f"F{self._next_fill_id:08d}",
             order_id=order.order_id,
@@ -329,10 +345,7 @@ class SimulatedBroker:
             return None
         if previous_volume is None or not math.isfinite(previous_volume):
             return 0
-        return (
-            math.floor(previous_volume * self.config.volume_limit / LOT_SIZE)
-            * LOT_SIZE
-        )
+        return math.floor(previous_volume * self.config.volume_limit / LOT_SIZE) * LOT_SIZE
 
 
 def _valid_price(value: float | None) -> bool:

@@ -5,12 +5,13 @@ from typing import cast
 
 import pytest
 
-from backtest.clock import Event
 from backtest.config import BacktestConfig
-from backtest.domain import AccountSnapshot, BacktestResult, OrderStatus
+from backtest.corporate_actions import CorporateActionProcessor
+from backtest.domain import BacktestResult, CorporateAction, OrderStatus, Side
 from backtest.engine import BacktestEngine
-from backtest.strategy import Strategy
-from market_data import DataReader, DataView
+from backtest.schedule import Schedule
+from backtest.strategy import Strategy, StrategyContext
+from market_data import DataReader
 from tests.backtest.conftest import (
     MemoryDataReader,
     bar_table,
@@ -25,13 +26,8 @@ class OneShotStrategy(Strategy):
         self.events: list[str] = []
         self.quantities: list[int] = []
 
-    def on_bar(
-        self,
-        data: DataView,
-        event: Event,
-        account: AccountSnapshot,
-    ) -> dict[str, float] | None:
-        del data
+    def on_event(self, context: StrategyContext) -> dict[str, float] | None:
+        event, account = context.event, context.account
         self.events.append(f"bar:{event.at:%Y-%m-%d %H:%M}")
         holding = account.holding("000001.SZ")
         self.quantities.append(holding.quantity if holding is not None else 0)
@@ -152,3 +148,120 @@ def test_minute_signal_fills_on_next_bar_before_strategy_callback() -> None:
     assert result.fills[0].filled_at == timestamp(session, time(9, 31))
     assert result.fills[0].execution_price == 11
     assert result.equity[-1].total_equity == pytest.approx(104_999.45)
+
+
+@pytest.mark.parametrize("period", ["week", "month"])
+def test_slow_strategy_still_matches_and_values_every_day(period: str) -> None:
+    sessions = tuple(date(2026, 1, day) for day in (28, 29, 30)) + (date(2026, 2, 2),)
+    calendar = (*sessions, date(2026, 2, 3))
+    strategy = OneShotStrategy()
+    strategy.schedule = Schedule(period)
+    reader = MemoryDataReader(bar_table([daily_bar(day, 10) for day in sessions]), calendar)
+    result = _run(
+        BacktestConfig(sessions[0], sessions[-1], volume_limit=None),
+        reader,
+        sessions,
+        calendar,
+        strategy,
+    )
+
+    assert strategy.events == ["bar:2026-01-30 16:05"]
+    assert len(result.equity) == 4
+    assert len(result.fills) == 1
+    assert result.fills[0].filled_at == timestamp(date(2026, 2, 2), time(9, 30))
+
+
+def test_direct_orders_cancellation_and_dividends_between_strategy_calls() -> None:
+    sessions = tuple(date(2026, 1, day) for day in (5, 6, 7, 8))
+
+    class DirectStrategy(Strategy):
+        schedule = Schedule(
+            times=tuple(timestamp(day, time(16, 5)) for day in (sessions[0], sessions[-1]))
+        )
+
+        def __init__(self) -> None:
+            self.accounts = []
+
+        def on_event(self, context: StrategyContext) -> None:
+            self.accounts.append(context.account)
+            if len(self.accounts) == 1:
+                canceled = context.order("000001.SZ", Side.BUY, 200)
+                assert context.cancel(canceled.order_id) is True
+                assert context.cancel(canceled.order_id) is False
+                context.order("000001.SZ", Side.BUY, 100)
+                assert len(context.pending_orders) == 1
+
+    action = CorporateAction("CASH", "000001.SZ", sessions[1], None, sessions[2], None, 1, None, 0)
+    strategy = DirectStrategy()
+    config = BacktestConfig(
+        sessions[0],
+        sessions[-1],
+        initial_cash=10_000,
+        volume_limit=None,
+        slippage_bps=0,
+        commission_rate=0,
+        minimum_commission=0,
+    )
+    reader = MemoryDataReader(bar_table([daily_bar(day, 10) for day in sessions]), sessions)
+    result = BacktestEngine(
+        reader=cast(DataReader, reader),
+        config=config,
+        sessions=sessions,
+        strategy=strategy,
+        actions=CorporateActionProcessor((action,)),
+    ).run()
+
+    assert len(strategy.accounts) == 2
+    assert len(result.equity) == 4
+    assert len(result.fills) == 1
+    assert result.fills[0].quantity == 100
+    assert result.order_updates[1].status is OrderStatus.CANCELED
+    assert strategy.accounts[-1].cash == pytest.approx(9_099.99)
+    assert strategy.accounts[-1].holdings[0].sellable_quantity == 100
+    assert strategy.accounts[-1].dividend_receivable == 0
+
+
+def test_daily_schedule_on_minute_bars_keeps_next_bar_execution_and_t1() -> None:
+    sessions = (date(2026, 1, 5), date(2026, 1, 6))
+
+    class DailyStrategy(Strategy):
+        schedule = Schedule("day", at=time(9, 31))
+
+        def __init__(self) -> None:
+            self.contexts: list[StrategyContext] = []
+
+        def on_event(self, context: StrategyContext) -> None:
+            self.contexts.append(context)
+            if len(self.contexts) == 1:
+                context.order("000001.SZ", Side.BUY, 100)
+
+    rows = [
+        {
+            "symbol": "000001.SZ",
+            "interval_start": timestamp(day, time(9, minute)),
+            "interval_end": timestamp(day, time(9, minute + 1)),
+            "open": 10,
+            "close": 10,
+            "high": 10,
+            "low": 10,
+        }
+        for day in sessions
+        for minute in (30, 31)
+    ]
+    strategy = DailyStrategy()
+    reader = MemoryDataReader(bar_table(rows), sessions)
+    result = _run(
+        BacktestConfig(sessions[0], sessions[-1], frequency="1m", volume_limit=None),
+        reader,
+        sessions,
+        sessions,
+        strategy,
+    )
+
+    assert [context.data.as_of for context in strategy.contexts] == [
+        timestamp(day, time(9, 31)) for day in sessions
+    ]
+    assert len(result.equity) == 2
+    assert result.fills[0].filled_at == timestamp(sessions[0], time(9, 31))
+    assert strategy.contexts[0].account.holdings == ()
+    assert strategy.contexts[1].account.holdings[0].sellable_quantity == 100
