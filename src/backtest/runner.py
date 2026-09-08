@@ -106,6 +106,7 @@ def _load_sessions(
         )
         .table.to_pylist()
     )
+    _validate_calendar(rows, config.start_date, config.end_date, market.exchange)
     sessions = tuple(row["cal_date"] for row in rows if row["is_open"] is True)
     if not sessions:
         raise DataError("回测区间内没有交易日")
@@ -125,8 +126,25 @@ def _load_sessions(
         next_session = next((row["cal_date"] for row in following if row["is_open"] is True), None)
         if next_session is None:
             raise DataError(f"{config.end_date} 之后缺少下一交易日，无法判断周期末")
+        _validate_calendar(
+            following, config.end_date + timedelta(days=1), next_session, market.exchange
+        )
         calendar = (*sessions, next_session)
     return sessions, calendar
+
+
+def _validate_calendar(
+    rows: list[dict[str, Any]], start: date, end: date, exchange: str
+) -> None:
+    """每个自然日都必须有明确开休市状态，不能用缺行代表节假日。"""
+    states = {row["cal_date"]: row["is_open"] for row in rows}
+    day = start
+    while day <= end:
+        if day not in states:
+            raise DataError(f"{exchange} 日历覆盖不足：缺少 {day} 的开休市记录")
+        if states[day] is not True and states[day] is not False:
+            raise DataError(f"{exchange} 日历 {day} 的开休市状态未知")
+        day += timedelta(days=1)
 
 
 def run_from_storage(
