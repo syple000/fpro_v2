@@ -282,6 +282,76 @@ def test_future_settlement_outside_run_can_remain_receivable() -> None:
     assert portfolio.dividend_receivable == 500
 
 
+@pytest.mark.parametrize(
+    "changed",
+    [
+        {"cash_dividend": 0.2},
+        {"cash_dividend": 0.2, "end_date": date(2024, 12, 31)},
+        {"stock_dividend": 0.2, "listing_date": date(2026, 1, 6)},
+        {"pay_date": date(2026, 1, 7)},
+        {"record_date": date(2026, 1, 5)},
+        {"record_date": date(2026, 1, 8), "pay_date": date(2026, 1, 9)},
+    ],
+)
+@pytest.mark.parametrize("held", [False, True])
+def test_conflicting_implementation_versions_are_never_added_together(
+    changed: dict[str, object], held: bool
+) -> None:
+    """金额、比例和日期更正都不能重复执行；区间外修订也参与冲突识别。"""
+    original = _implemented_row()
+    rows = [original, {**original, **changed}]
+    processor = CorporateActionProcessor.load(
+        cast(DataReader, _ActionReader(rows)),
+        BacktestConfig(date(2026, 1, 2), date(2026, 1, 7)),
+    )
+    portfolio = _portfolio_with_shares(1_000) if held else Portfolio(100_000)
+    if held:
+        with pytest.raises(CorporateActionError, match="实施版本冲突"):
+            processor.on_session_end(at_time(date(2026, 1, 2), time(16, 5)), portfolio)
+    else:
+        for day in (2, 5, 6, 7):
+            at = at_time(date(2026, 1, day), time(9, 25))
+            processor.on_session_start(at, portfolio, _broker())
+            processor.on_session_end(at_time(at.date(), time(16, 5)), portfolio)
+    assert portfolio.cash == (90_000 if held else 100_000)
+    assert portfolio.dividend_receivable == 0
+
+
+@pytest.mark.parametrize("same_period", [False, True])
+def test_distinct_announcements_and_record_dates_execute_independently(same_period: bool) -> None:
+    first = _implemented_row()
+    second = {
+        **first,
+        "end_date": first["end_date"] if same_period else date(2026, 1, 1),
+        "ann_date": date(2026, 1, 1),
+        "record_date": date(2026, 1, 5),
+        "pay_date": date(2026, 1, 7),
+        "cash_dividend": 0.2,
+    }
+    processor = CorporateActionProcessor.load(
+        cast(DataReader, _ActionReader([first, second])),
+        BacktestConfig(date(2026, 1, 2), date(2026, 1, 7)),
+    )
+    portfolio = _portfolio_with_shares(1_000)
+    for day in (2, 5, 6, 7):
+        processor.on_session_start(at_time(date(2026, 1, day), time(9, 25)), portfolio, _broker())
+        processor.on_session_end(at_time(date(2026, 1, day), time(16, 5)), portfolio)
+    assert portfolio.cash == pytest.approx(90_300)
+
+
+def _implemented_row() -> dict[str, object]:
+    return {
+        "symbol": "000001.SZ",
+        "end_date": date(2025, 12, 31),
+        "ann_date": date(2025, 12, 30),
+        "div_proc": "实施",
+        "record_date": date(2026, 1, 2),
+        "pay_date": date(2026, 1, 6),
+        "cash_dividend": 0.1,
+        "stock_dividend": 0,
+    }
+
+
 def test_load_uses_final_implemented_facts_and_merges_business_duplicates() -> None:
     """账户加载最终实施事实；晚可见和来源报告期差异不造成漏发或重发。"""
     implemented = {

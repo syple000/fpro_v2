@@ -30,6 +30,7 @@ class CorporateActionProcessor:
         self._end_date = date.max
         self._record_before_start: list[CorporateAction] = []
         self._record_after_close: dict[date, list[CorporateAction]] = defaultdict(list)
+        self._conflicts: dict[str, str] = {}
         for action in actions:
             if action.record_date is not None:
                 self._record[action.record_date].append(action)
@@ -76,17 +77,12 @@ class CorporateActionProcessor:
 
         actions: list[CorporateAction] = []
         seen: set[tuple[object, ...]] = set()
+        versions: dict[tuple[object, ...], set[tuple[object, ...]]] = defaultdict(set)
         for row in rows:
             # market_data 保留预案和历史版本；账户只执行已经实施的事实。
             if row.get("div_proc") != "实施":
                 continue
             record_date = row.get("record_date")
-            if (
-                record_date is None
-                or not config.start_date <= record_date <= config.end_date
-            ):
-                continue
-
             stock_dividend = row.get("stock_dividend")
             if stock_dividend is None:
                 stock_dividend = (row.get("stock_bonus_rate") or 0.0) + (
@@ -94,6 +90,19 @@ class CorporateActionProcessor:
                 )
             stock_dividend = float(stock_dividend or 0.0)
             key = _business_key(row, stock_dividend)
+            # 当前来源没有稳定事件 ID；同登记日或同报告期公告的差异可能是更正，
+            # 也可能是独立分配。先保留候选版本，有权益时要求核实，不能自动累加。
+            security = _security_key(row)
+            if record_date is not None:
+                versions[(security, "登记日", record_date)].add(key)
+            if row.get("end_date") is not None and row.get("ann_date") is not None:
+                announcement = (row["end_date"], row["ann_date"])
+                versions[(security, "报告期与公告日", announcement)].add(key)
+            if (
+                record_date is None
+                or not config.start_date <= record_date <= config.end_date
+            ):
+                continue
             if key in seen:
                 continue
             seen.add(key)
@@ -111,7 +120,14 @@ class CorporateActionProcessor:
                     stock_dividend=stock_dividend,
                 )
             )
-        return cls(actions)
+        processor = cls(actions)
+        for identity, keys in versions.items():
+            if len(keys) <= 1:
+                continue
+            detail = f"证券 {identity[0]} 的同一{identity[1]} {identity[2]} 存在不同实施事实"
+            for key in keys:
+                processor._conflicts[_action_id(key)] = detail
+        return processor
 
     def on_session_start(
         self,
@@ -197,6 +213,11 @@ class CorporateActionProcessor:
 
     def _validate(self, action: CorporateAction) -> None:
         """只校验会实际影响当前账户的公司行动。"""
+        if action.action_id in self._conflicts:
+            raise CorporateActionError(
+                f"{action.action_id} 实施版本冲突：{self._conflicts[action.action_id]}；"
+                "请核实更正关系或独立事件身份，不能自动选择或累加"
+            )
         cash_per_share = _cash_per_share(action)
         if cash_per_share is not None and (
             not math.isfinite(cash_per_share) or cash_per_share < 0
@@ -272,7 +293,7 @@ def _cash_per_share(action: CorporateAction) -> float | None:
 def _business_key(row: dict[str, object], stock_dividend: float) -> tuple[object, ...]:
     """忽略报告期等来源差异，识别实际只会执行一次的公司行动。"""
     return (
-        row["symbol"],
+        _security_key(row),
         row.get("record_date"),
         row.get("ex_date"),
         row.get("pay_date"),
@@ -283,6 +304,11 @@ def _business_key(row: dict[str, object], stock_dividend: float) -> tuple[object
         row.get("base_date"),
         row.get("base_share"),
     )
+
+
+def _security_key(row: dict[str, object]) -> object:
+    """有稳定证券身份时优先使用，兼容尚未提供身份的来源。"""
+    return row["sid"] if row.get("sid") is not None else row["symbol"]
 
 
 def _action_id(key: tuple[object, ...]) -> str:
