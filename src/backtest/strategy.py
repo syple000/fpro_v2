@@ -39,6 +39,10 @@ class Strategy(ABC):
 
     schedule: Schedule = Schedule()
 
+    def parameters(self) -> Mapping[str, object]:
+        """记录运行前的策略参数；含复杂对象或使用 slots 时应显式覆盖此方法。"""
+        return vars(self).copy()
+
     @abstractmethod
     def on_event(self, context: StrategyContext) -> Mapping[str, float] | None:
         """只在 schedule 触发时调用，不接收所有市场事件。

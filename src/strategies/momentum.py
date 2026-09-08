@@ -135,6 +135,9 @@ class MonthlyMomentumStrategy(Strategy):
         self.config = config or MomentumConfig()
         self.allowed_symbols = tuple(allowed_symbols) if allowed_symbols is not None else None
 
+    def parameters(self) -> dict[str, object]:
+        return {"config": self.config, "allowed_symbols": self.allowed_symbols}
+
     def on_event(self, context: StrategyContext) -> dict[str, float]:
         """调度已保证调用日期，策略只负责计算目标组合。"""
         return select_momentum_targets(

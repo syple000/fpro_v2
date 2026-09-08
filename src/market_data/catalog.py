@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import copy
+import hashlib
 import json
 from collections.abc import Mapping
 from pathlib import Path
+from typing import Any
 
 import duckdb
 import pyarrow as pa
@@ -50,19 +53,46 @@ class DataCatalog:
 
     def refresh(self) -> None:
         """根据最新 Manifest 重新注册原始视图和小型参考表。"""
+        sources = {}
         for source, (root, schemas) in self._sources.items():
             self._unavailable[source] = _load_unavailable_datasets(root, schemas)
             self._connection.execute(f"CREATE SCHEMA IF NOT EXISTS {_quote_identifier(source)}")
+            datasets = {}
             for table, schema in schemas.items():
+                files = _active_files(root / table)
+                datasets[table] = [
+                    {
+                        "path": str(path.relative_to(root)),
+                        "size_bytes": (stat := path.stat()).st_size,
+                        "mtime_ns": stat.st_mtime_ns,
+                    }
+                    for path in files
+                ]
                 _register_parquet_view(
                     self._connection,
                     source=source,
                     table=table,
-                    files=_active_files(root / table),
+                    files=files,
                     schema=schema,
                 )
+            sources[source] = {
+                "root": str(root),
+                "datasets": datasets,
+                "unavailable_datasets": sorted(self._unavailable[source]),
+            }
         _refresh_reference_tables(self._connection)
         _refresh_qmt_sync_ranges(self._connection, self._sources["qmt"][0])
+        sync_ranges = self._connection.execute(
+            "SELECT * FROM data_internal.qmt_sync_ranges ORDER BY dataset, code, period, start_date"
+        ).to_arrow_table().to_pylist()
+        self._snapshot: dict[str, Any] = {"sources": sources, "qmt_sync_ranges": sync_ranges}
+        # 文件名由存储层 UUID 标识；保留注册顺序，匹配重复记录的版本优先级。
+        payload = json.dumps(self._snapshot, sort_keys=True, default=str).encode()
+        self._snapshot["snapshot_id"] = hashlib.sha256(payload).hexdigest()
+
+    def snapshot_metadata(self) -> dict[str, Any]:
+        """返回上次 refresh 实际加载的文件版本，不重新读取正在变化的 Manifest。"""
+        return copy.deepcopy(self._snapshot)
 
     def require_available(self, source: str, datasets: str | tuple[str, ...]) -> None:
         """要求最近一次全量检测确认底层数据集可用。"""

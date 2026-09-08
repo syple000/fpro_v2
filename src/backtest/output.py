@@ -70,11 +70,15 @@ def write_results(
     config: BacktestConfig,
     result: BacktestResult,
     metrics: dict[str, Any],
+    *,
+    metadata: dict[str, Any] | None = None,
 ) -> Path:
     """将一次回测拆成便于人读的 JSON 和便于分析的 Parquet。"""
     output_dir.mkdir(parents=True, exist_ok=True)
     _write_json(output_dir / "config.json", config.to_dict())
     _write_json(output_dir / "metrics.json", metrics)
+    if metadata is not None:
+        _write_json(output_dir / "run_metadata.json", metadata)
     _write_parquet(
         output_dir / "orders.parquet",
         [

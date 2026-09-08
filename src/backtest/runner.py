@@ -12,6 +12,7 @@ from backtest.corporate_actions import CorporateActionProcessor
 from backtest.domain import BacktestResult
 from backtest.engine import BacktestEngine
 from backtest.errors import DataError
+from backtest.metadata import capture_run_metadata
 from backtest.metrics import calculate_metrics
 from backtest.output import write_results
 from backtest.strategy import Strategy
@@ -67,6 +68,7 @@ def run_backtest(
     output_dir: Path | None = None,
 ) -> CompletedRun:
     """使用已有 DataReader 运行任意策略，适合测试或嵌入其他程序。"""
+    metadata = capture_run_metadata(reader, strategy) if output_dir is not None else None
     sessions, calendar = _load_sessions(
         reader, config, needs_next_session=strategy.schedule.needs_next_session
     )
@@ -82,7 +84,7 @@ def run_backtest(
     metrics = calculate_metrics(result, config)
     written = None
     if output_dir is not None:
-        written = write_results(output_dir, config, result, metrics)
+        written = write_results(output_dir, config, result, metrics, metadata=metadata)
     return CompletedRun(result, metrics, written)
 
 

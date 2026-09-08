@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from collections.abc import Mapping, Sequence
 from datetime import date, datetime, time, timedelta
-from typing import Literal, cast
+from typing import Any, Literal, cast
 from zoneinfo import ZoneInfo
 
 import pyarrow as pa
@@ -76,6 +76,7 @@ class DataReader:
                 raise DataSourceNotConfiguredError(f"路由 {route!r} 配置了未注册来源 {source_id!r}")
 
         self._sources = sources
+        self._catalog = catalog
         self._tushare_adapter = TushareAdapter(catalog)
         self._qmt_adapter = QmtAdapter(catalog)
         self._custom_adapters = custom_adapters
@@ -109,6 +110,21 @@ class DataReader:
                 f"实施分红记录超过内部上限 {self._max_result_rows} 行；请缩小 symbols"
             )
         return table
+
+    def snapshot_metadata(self) -> dict[str, Any]:
+        """提供固定路由及目录快照；自定义适配器需额外声明自身数据版本。"""
+        return {
+            "routes": dict(self._sources.routes),
+            "catalog": self._catalog.snapshot_metadata(),
+            "custom_adapters": {
+                source: {
+                    "type": f"{type(adapter).__module__}.{type(adapter).__qualname__}",
+                    "snapshot": adapter.snapshot_metadata(),
+                }
+                for source, adapter in self._custom_adapters.items()
+                if source in self._sources.routes.values()
+            },
+        }
 
     def at(self, as_of: datetime) -> DataView:
         """创建绑定带时区具体时间的数据视图。"""

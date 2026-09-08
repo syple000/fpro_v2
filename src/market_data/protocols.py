@@ -22,6 +22,10 @@ class DataAdapter:
             f"适配器 {type(self).__name__!r} 不支持方法 {method!r}"
         )
 
+    def snapshot_metadata(self) -> dict[str, object]:
+        """写回测结果时声明可定位的数据版本；不可复现时明确报告未实现。"""
+        self._not_supported("snapshot_metadata")
+
     def daily_bars(
         self,
         *,

@@ -35,6 +35,11 @@ def test_refresh_reloads_exact_manifest_file_set(tmp_path: Path) -> None:
         )
 
     with DataCatalog(tushare_root=tushare_root, qmt_root=tmp_path / "qmt") as catalog:
+        original_snapshot = catalog.snapshot_metadata()
+        original_files = original_snapshot["sources"]["tushare"]["datasets"]["daily"]
+        assert len(original_files) == 1
+        assert (tushare_root / original_files[0]["path"]).is_file()
+        assert original_files[0]["size_bytes"] > 0
         assert catalog.connection.execute("SELECT count(*) FROM tushare.daily").fetchone() == (1,)
         with TushareDataStore(tushare_root) as store:
             store.write(
@@ -44,7 +49,15 @@ def test_refresh_reloads_exact_manifest_file_set(tmp_path: Path) -> None:
                     {"ts_code": "000001.SZ", "trade_date": date(2024, 1, 3)},
                 ),
             )
+        # Manifest 已有新文件，但目录视图尚未 refresh，版本仍须对应实际读取的旧集合。
+        assert catalog.snapshot_metadata() == original_snapshot
+        assert catalog.connection.execute("SELECT count(*) FROM tushare.daily").fetchone() == (1,)
         catalog.refresh()
+        refreshed = catalog.snapshot_metadata()
+        assert refreshed["snapshot_id"] != original_snapshot["snapshot_id"]
+        assert len(refreshed["sources"]["tushare"]["datasets"]["daily"]) == 2
+        refreshed["sources"].clear()
+        assert catalog.snapshot_metadata()["sources"]
         count = catalog.connection.execute("SELECT count(*) FROM tushare.daily").fetchone()
 
     assert count == (2,)
