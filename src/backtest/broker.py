@@ -298,6 +298,10 @@ class SimulatedBroker:
             return 0, OrderReason.UNKNOWN_MARKET_STATUS, None
 
         assert open_price is not None
+        if (status.down_limit is not None and open_price < status.down_limit - 1e-9) or (
+            status.up_limit is not None and open_price > status.up_limit + 1e-9
+        ):
+            return 0, OrderReason.INVALID_OPEN, None
         if order.side is Side.BUY and _reaches_limit(open_price, status.up_limit, buy=True):
             return 0, OrderReason.LIMIT_UP, None
         if order.side is Side.SELL and _reaches_limit(open_price, status.down_limit, buy=False):

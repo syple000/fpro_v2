@@ -255,6 +255,33 @@ def test_affordability_uses_bounded_execution_price() -> None:
     assert fill.notional + fill.total_fee <= 10_006.2
 
 
+@pytest.mark.parametrize("side,opening_price", [(Side.BUY, 8), (Side.SELL, 12)])
+def test_invalid_open_is_not_made_valid_by_slippage_clamping(
+    side: Side, opening_price: float
+) -> None:
+    day = date(2026, 1, 5)
+    config = BacktestConfig(day, day, volume_limit=None)
+    broker = SimulatedBroker(config)
+    portfolio = Portfolio(100_000)
+    if side is Side.SELL:
+        portfolio.apply_fill(_fill(Side.BUY, 100, 10))
+        portfolio.unlock_t1()
+    broker.submit(OrderRequest("000001.SZ", side, 100), at_time(day, time(9, 30)))
+    before = portfolio.account_snapshot()
+    assert (
+        broker.match_bar(
+            event=_event(day),
+            bars={"000001.SZ": _bar(day, opening_price)},
+            account=before,
+            data=_data(config, up_limit=11, down_limit=9),
+        )
+        == ()
+    )
+    assert broker.fills == ()
+    assert broker.updates[-1].reason is OrderReason.INVALID_OPEN
+    assert portfolio.account_snapshot() == before
+
+
 def test_order_submitted_after_bar_open_waits_for_next_bar() -> None:
     day, following = date(2026, 1, 5), date(2026, 1, 6)
     config = BacktestConfig(day, following, volume_limit=None)
