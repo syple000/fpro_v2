@@ -185,10 +185,17 @@ class CorporateActionProcessor:
             raise CorporateActionError(f"{action.action_id} 缺少股权登记日")
         if action.ex_date is not None and action.ex_date <= action.record_date:
             raise CorporateActionError(f"{action.action_id} 除权日不晚于股权登记日")
-        if action.pay_date is not None and action.pay_date < action.record_date:
-            raise CorporateActionError(f"{action.action_id} 派息日早于股权登记日")
-        if action.listing_date is not None and action.listing_date < action.record_date:
-            raise CorporateActionError(f"{action.action_id} 红股上市日早于股权登记日")
+        # 登记在日终，结算在日初；同一登记日也无法先登记再结算。
+        if cash_per_share is not None and cash_per_share > 0 and action.pay_date is not None:
+            if action.pay_date <= action.record_date:
+                raise CorporateActionError(f"{action.action_id} 派息日不晚于股权登记日")
+            if action.ex_date is not None and action.pay_date < action.ex_date:
+                raise CorporateActionError(f"{action.action_id} 派息日早于除权日")
+        if action.stock_dividend > 0 and action.listing_date is not None:
+            if action.listing_date <= action.record_date:
+                raise CorporateActionError(f"{action.action_id} 红股上市日不晚于股权登记日")
+            if action.ex_date is not None and action.listing_date < action.ex_date:
+                raise CorporateActionError(f"{action.action_id} 红股上市日早于除权日")
 
     @staticmethod
     def _entitlement(action: CorporateAction, portfolio: Portfolio) -> int:

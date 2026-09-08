@@ -173,6 +173,57 @@ def test_held_action_requires_a_settlement_date() -> None:
         )
 
 
+@pytest.mark.parametrize("kind", ["cash", "stock"])
+@pytest.mark.parametrize("settlement", [date(2026, 1, 2), date(2026, 1, 5)])
+@pytest.mark.parametrize("held", [False, True])
+def test_settlement_cannot_precede_recognition(
+    kind: str, settlement: date, held: bool
+) -> None:
+    """有权益时在登记日就拒绝不可处理的顺序；无权益仍忽略异常记录。"""
+    portfolio = _portfolio_with_shares(1_000) if held else Portfolio(100_000)
+    action = CorporateAction(
+        action_id="EARLY",
+        symbol="000001.SZ",
+        record_date=date(2026, 1, 2),
+        ex_date=date(2026, 1, 6),
+        pay_date=settlement if kind == "cash" else None,
+        listing_date=settlement if kind == "stock" else None,
+        cash_dividend=0.5 if kind == "cash" else 0,
+        cash_dividend_before_tax=None,
+        stock_dividend=0.1 if kind == "stock" else 0,
+    )
+    processor = CorporateActionProcessor([action])
+    if held:
+        with pytest.raises(CorporateActionError, match="不晚于股权登记日|早于除权日"):
+            processor.on_session_end(at_time(date(2026, 1, 2), time(16, 5)), portfolio)
+    else:
+        processor.on_session_end(at_time(date(2026, 1, 2), time(16, 5)), portfolio)
+    assert portfolio.dividend_receivable == 0
+    assert portfolio.cash == (90_000 if held else 100_000)
+
+
+def test_cash_and_stock_can_settle_on_ex_date() -> None:
+    """除权日先确认应收及红股，再在同日日初完成派息和上市。"""
+    portfolio = _portfolio_with_shares(1_000)
+    action = CorporateAction(
+        action_id="SAME_DAY",
+        symbol="000001.SZ",
+        record_date=date(2026, 1, 2),
+        ex_date=date(2026, 1, 5),
+        pay_date=date(2026, 1, 5),
+        listing_date=date(2026, 1, 5),
+        cash_dividend=0.5,
+        cash_dividend_before_tax=None,
+        stock_dividend=0.1,
+    )
+    processor = CorporateActionProcessor([action])
+    processor.on_session_end(at_time(date(2026, 1, 2), time(16, 5)), portfolio)
+    processor.on_session_start(at_time(date(2026, 1, 5), time(9, 25)), portfolio, _broker())
+    assert portfolio.cash == pytest.approx(90_500)
+    assert portfolio.dividend_receivable == 0
+    assert portfolio.position("000001.SZ").sellable_quantity == 1_100
+
+
 def test_load_uses_final_implemented_facts_and_merges_business_duplicates() -> None:
     """账户加载最终实施事实；晚可见和来源报告期差异不造成漏发或重发。"""
     implemented = {
