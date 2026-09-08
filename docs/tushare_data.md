@@ -83,6 +83,11 @@ checkpoint，重跑 `sync_all` 只补未完成区间。
 in_date <= as_of AND (out_date IS NULL OR out_date > as_of)
 ```
 
+该条件只在来源支持的分类标准范围内成立：`in_date` 是成员纳入日期，不是分类标准的发布
+日期。当前数据未区分历史分类版本，统一 Reader 的 Tushare 行业查询仅支持
+`2021-08-02 09:25`（上海时间）起，更早请求明确报错；支持起点依据和可见性约定见
+[分类接口](market_data.md#分类接口-classification)。同步不改写这些原始日期。
+
 ## 证券主数据
 
 `stock_basic` 保留 Tushare 当前快照中的代码、交易所、市场、币种、上市状态、上市日和退市日等

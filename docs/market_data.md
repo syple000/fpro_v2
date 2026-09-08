@@ -86,7 +86,7 @@ DAILY_BASIC_READY 17:05
 | `fina_indicator` | `next_session(ann_date)` 09:25 | 按 Tushare 已定义的指标口径使用 |
 | 完整 `dividend` 实施记录 | `next_session(imp_ann_date)` 09:25 | 不用预案 `ann_date` 替补 |
 | `dividend` 预案、决案及其他非实施版本 | `next_session(ann_date)` 09:25 | 按本版本真实公告日；不返回实施日期字段 |
-| `sw_industry` 成员 | `in_date` 当日 09:25 | 只返回当前行业，不返回未来退出信息 |
+| `sw_industry` 成员 | 支持范围内的 `in_date` 当日 09:25 | Tushare 仅支持 2021-08-02 09:25 起，不返回未来退出信息 |
 | `stock_basic` 上市区间 | `list_date` 当日 09:25 | 用 `[list_date, delist_date)` 构造股票池，不返回未来退市日期 |
 | `trade_cal` | 不走普通 PIT 规则 | 作为回测引擎配置 |
 
@@ -205,8 +205,9 @@ Reader 只把 `adjustment` 语义传给当前行情适配器，不读取因子�
 `volume/amount` 保留平台规定的实际成交口径。数据源不能完整满足该语义时，Reader 明确报
 “数据源不支持前复权”，不能返回一张混合了复权和未复权行的表，也不能静默切换来源。
 
-行业成员可以用 `in_date <= D < out_date` 计算 D 日有效分类，但返回结果不能包含未来
-`out_date` 或当前数据中的 `is_new`。
+行业成员只有在来源支持的分类标准范围内，才能用 `in_date <= D < out_date` 计算 D 日有效
+分类。Tushare 的支持范围见下文“分类接口”；不能用成员日期证明新版分类在过去已存在。
+返回结果不包含未来 `out_date` 或当前数据中的 `is_new`。
 
 ### 交易日历
 
@@ -728,6 +729,22 @@ industry = data.classification.industry(
 
 每只股票返回 `as_of` 时有效的一个行业，固定按 `symbol ASC` 排序。`level` 只允许 `1/2/3`；
 返回类型不包含未来 `out_date` 和源表状态字段 `is_new`。
+
+内置 Tushare 行业源仅支持 **2021-08-02 09:25（上海时间）及之后**。更早查询抛出
+`DataSourceUnavailableError`，明确提示缺少旧版历史成员分类，不把现行分类回填给早期策略。
+有独立历史版本数据的自定义适配器不受这个 Tushare 限制。
+
+这个支持起点依据[申万 2021 版说明](https://wxweb.swsresearch.com/swsreport/2021_08/328340.pdf)：
+新版分类 2021-07-30 推出、7 月 31 日公告；项目保守采用公告后下一交易日盘前可见。
+该 PDF 本次通过官方搜索索引取得正文，直接下载受限。此处是明确的回测可见性约定，
+不是 Tushare 历史到达时间的实测结论，也不是配套行业指数的调整日期。
+
+当前同步的 [`index_member_all`](https://tushare.pro/document/2?doc_id=335) 不提供分类版本
+参数或公布时间。[`index_classify`](https://tushare.pro/document/2?doc_id=181) 虽能选择
+`SW2014/SW2021`，但仅有行业目录，不能替代旧版股票成员表。因此本次只限制查询支持范围，
+不猜测旧行业、不改写原始 `in_date/out_date`，也不删除在支持起点后仍有效的早期成员记录。
+支持范围内仍按来源成员区间查询；目前未保存供应商逐次修订及到达版本，不能宣称已验证
+每条历史成员记录在实盘的实际可见时刻。
 
 ## 证券主数据接口 `reference`
 

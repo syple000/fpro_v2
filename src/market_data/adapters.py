@@ -45,6 +45,10 @@ from tushare_data.suspensions import parse_suspension_timing
 
 _TZ = "Asia/Shanghai"
 _CALENDAR_COVERAGE_ERROR = "__FPRO_CALENDAR_COVERAGE_ERROR__"
+# 2021 版分类于 7 月 31 日公告，采用下一交易日盘前作为支持起点。
+# 当前同步未区分历史分类版本，不能用早期 in_date 反推旧标准。
+# 依据与可见性约定见 docs/market_data.md 的“分类接口”。
+_SW_INDUSTRY_SUPPORTED_FROM = datetime(2021, 8, 2, 9, 25, tzinfo=ZoneInfo(_TZ))
 _FORWARD_BAR_SCHEMA = pa.schema(
     [*BAR_SCHEMA, pa.field("__invalid_factor", pa.bool_(), nullable=False)]
 )
@@ -1322,6 +1326,12 @@ class TushareAdapter(DataAdapter):
         columns: tuple[str, ...] | None = None,
     ) -> pa.Table:
         self._catalog.require_available("tushare", "sw_industry")
+        as_of = as_of.astimezone(ZoneInfo(_TZ))
+        if as_of < _SW_INDUSTRY_SUPPORTED_FROM:
+            raise DataSourceUnavailableError(
+                "Tushare 行业源缺少旧版历史成员分类，"
+                "仅支持 2021-08-02 09:25（上海时间）及之后的行业查询"
+            )
         params = _query_parameters(
             as_of=as_of,
             as_of_date=as_of.date(),

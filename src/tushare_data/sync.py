@@ -502,7 +502,7 @@ def sync_sw_industry(
     start_date: str | date,
     end_date: str | date,
 ) -> int:
-    """分页获取全部申万三级行业成员原始区间。"""
+    """分页保留申万成员原始区间；成员日期不代表当时使用的分类标准版本。"""
     requested_start = _parse_date(start_date)
     requested_end = _parse_date(end_date)
     if requested_start > requested_end:
