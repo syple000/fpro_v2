@@ -8,7 +8,6 @@ from collections.abc import Iterable
 from datetime import date, datetime
 
 from backtest.broker import SimulatedBroker
-from backtest.clock import at_time
 from backtest.config import BacktestConfig
 from backtest.domain import CorporateAction, OrderReason
 from backtest.errors import CorporateActionError
@@ -46,14 +45,9 @@ class CorporateActionProcessor:
         策略通过 ``reader.at(clock.now)`` 读取 PIT 数据；这里读取的是账户需要
         回放的最终经济事实。两者使用同一份 market_data，但时间语义不同。
         """
-        latest_stored_at = at_time(date.max, datetime.max.time())
-        rows = (
-            reader.at(latest_stored_at)
-            .corporate_actions.dividends(
-                symbols=config.symbols or ALL_SYMBOLS,
-            )
-            .table.to_pylist()
-        )
+        rows = reader.implemented_dividends(
+            symbols=config.symbols or ALL_SYMBOLS,
+        ).to_pylist()
 
         actions: list[CorporateAction] = []
         seen: set[tuple[object, ...]] = set()

@@ -131,6 +131,11 @@ DIVIDEND_SCHEMA = pa.schema(
     ]
 )
 
+# 账户读取固定快照中的实施事实，无需公告可见时间。
+IMPLEMENTED_DIVIDEND_SCHEMA = pa.schema(
+    field for field in DIVIDEND_SCHEMA if field.name != "visible_at"
+)
+
 INDUSTRY_SCHEMA = pa.schema(
     [
         pa.field("symbol", pa.string(), nullable=False),

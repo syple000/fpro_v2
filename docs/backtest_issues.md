@@ -118,6 +118,8 @@
 
 ### BT-009：账户最终实施事实仍受公告过滤
 
+- **状态**：已修复（2026-09-08）。账户改走 `DataReader.implemented_dividends()` 固定快照入口，仅取实施记录，不再要求实施公告日期或公告可见性日历；策略仍使用 PIT 查询。新增真实 Tushare 存储与适配器回归验证：无公告日期的实施记录按业务日期支付 500 元，预案不执行。冲突版本处理另见 BT-018。
+
 - **位置**：[corporate_actions.py](../src/backtest/corporate_actions.py)，`load()`；[adapters.py](../src/market_data/adapters.py)，分红查询中的 `WHERE imp_ann_date IS NOT NULL`。
 - **现状**：账户虽然用 `date.max` 读取，但仍调用策略的公告查询接口。没有实施公告日期的记录，在到达账户前就被过滤。
 - **复现**：一条实施记录业务日期和金额完整，只有 `imp_ann_date` 为空，加载结果为零条，且无错误。

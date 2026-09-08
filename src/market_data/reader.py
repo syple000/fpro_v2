@@ -20,7 +20,7 @@ from market_data.errors import (
     DataSourceNotConfiguredError,
 )
 from market_data.protocols import DataAdapter
-from models import ROUTE_SCHEMAS, STATUS_SCHEMA, QueryResult
+from models import IMPLEMENTED_DIVIDEND_SCHEMA, ROUTE_SCHEMAS, STATUS_SCHEMA, QueryResult
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 SUPPORTED_FREQUENCIES = frozenset({"1m", "5m", "15m", "30m", "60m", "1d"})
@@ -80,6 +80,35 @@ class DataReader:
         self._qmt_adapter = QmtAdapter(catalog)
         self._custom_adapters = custom_adapters
         self._max_result_rows = max_result_rows
+
+    def implemented_dividends(self, *, symbols: Symbols) -> pa.Table:
+        """账户专用：读取固定快照的实施事实，不按策略时钟过滤公告。
+
+        返回值没有 ``visible_at``；该入口不提供给策略的 DataView。
+        金额、日期和版本关系仍须由账户业务层校验。
+        """
+        route = "corporate_actions.dividends"
+        source = self._sources.routes.get(route)
+        if source is None:
+            raise DataSourceNotConfiguredError(f"逻辑数据集 {route!r} 未配置来源")
+        if source == "tushare":
+            adapter: DataAdapter = self._tushare_adapter
+        elif source == "qmt":
+            adapter = self._qmt_adapter
+        else:
+            adapter = self._custom_adapters[source]
+        table = adapter.implemented_dividends(
+            symbols=_symbols(symbols), fetch_limit=self._max_result_rows + 1
+        )
+        if not isinstance(table, pa.Table):
+            raise DataAdapterError(f"来源 {source!r} 未返回 pyarrow.Table")
+        _exact_schema(table, IMPLEMENTED_DIVIDEND_SCHEMA, "implemented_dividends")
+        _validate_identity(table, ("symbol",))
+        if table.num_rows > self._max_result_rows:
+            raise DataResultTooLargeError(
+                f"实施分红记录超过内部上限 {self._max_result_rows} 行；请缩小 symbols"
+            )
+        return table
 
     def at(self, as_of: datetime) -> DataView:
         """创建绑定带时区具体时间的数据视图。"""

@@ -1437,6 +1437,34 @@ def test_dividend_uses_reader_visibility_policy(tmp_path: Path) -> None:
     assert after.table.to_pylist()[0]["div_proc"] == "实施"
 
 
+def test_implemented_dividends_filter_symbols_and_enforce_row_limit(tmp_path: Path) -> None:
+    """账户入口保留未知公告日期，遵守来源路由、证券选择及结果上限。"""
+    with TushareDataStore(tmp_path / "tushare") as store:
+        store.write(
+            "dividend",
+            _table(
+                "dividend",
+                *(
+                    {"ts_code": symbol, "end_date": date(2023, 12, 31), "div_proc": "实施"}
+                    for symbol in ("000001.SZ", "600000.SH")
+                ),
+            ),
+        )
+    with DataCatalog(tushare_root=tmp_path / "tushare", qmt_root=tmp_path / "qmt") as catalog:
+        reader = DataReader(
+            catalog,
+            sources=SourceConfig(routes={"corporate_actions.dividends": "tushare"}),
+            max_result_rows=1,
+        )
+        result = reader.implemented_dividends(symbols=("000001.SZ",))
+        assert result.column("symbol").to_pylist() == ["000001.SZ"]
+        assert result.column("implementation_ann_date").to_pylist() == [None]
+        assert "visible_at" not in result.column_names
+        assert not hasattr(reader.at(_as_of(3, 9, 25)), "implemented_dividends")
+        with pytest.raises(DataResultTooLargeError, match="实施分红记录"):
+            reader.implemented_dividends(symbols=ALL_SYMBOLS)
+
+
 def test_industry_reader_does_not_expose_future_membership_state(tmp_path: Path) -> None:
     tushare_root = tmp_path / "tushare"
     common = {

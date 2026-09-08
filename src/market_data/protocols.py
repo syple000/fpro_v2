@@ -176,6 +176,15 @@ class DataAdapter:
     ) -> pa.Table:
         self._not_supported("dividends")
 
+    def implemented_dividends(
+        self,
+        *,
+        symbols: tuple[str, ...] | None,
+        fetch_limit: int | None,
+    ) -> pa.Table:
+        """返回固定快照中的实施记录，不应用策略公告可见性。"""
+        self._not_supported("implemented_dividends")
+
     def adjustment_factors(
         self,
         *,

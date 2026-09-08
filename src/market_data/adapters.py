@@ -29,6 +29,7 @@ from models import (
     EXPRESS_SCHEMA,
     FINANCIAL_INDICATOR_SCHEMA,
     FORECAST_SCHEMA,
+    IMPLEMENTED_DIVIDEND_SCHEMA,
     INCOME_STATEMENT_SCHEMA,
     INDUSTRY_SCHEMA,
     MONEYFLOW_SCHEMA,
@@ -1254,6 +1255,35 @@ class TushareAdapter(DataAdapter):
             LIMIT $fetch_limit
         """
         return _fetch(self._connection, query, params, DIVIDEND_SCHEMA, columns)
+
+    def implemented_dividends(
+        self,
+        *,
+        symbols: tuple[str, ...] | None,
+        fetch_limit: int | None,
+    ) -> pa.Table:
+        """保留实施事实的全部版本，交由账户层校验和去重。"""
+        self._catalog.require_available("tushare", "dividend")
+        query = """
+            SELECT ts_code AS symbol, end_date, ann_date, div_proc,
+                   stk_div AS stock_dividend, stk_bo_rate AS stock_bonus_rate,
+                   stk_co_rate AS stock_conversion_rate, cash_div AS cash_dividend,
+                   cash_div_tax AS cash_dividend_before_tax, record_date, ex_date, pay_date,
+                   div_listdate AS listing_date, imp_ann_date AS implementation_ann_date,
+                   base_date, base_share * 10000.0 AS base_share
+            FROM tushare.dividend
+            WHERE div_proc = '实施'
+              AND ($symbols IS NULL OR ts_code IN (SELECT unnest($symbols)))
+            ORDER BY symbol, record_date, ex_date, end_date, ann_date,
+                     implementation_ann_date
+            LIMIT $fetch_limit
+        """
+        return _fetch(
+            self._connection,
+            query,
+            _query_parameters(symbols=symbols, fetch_limit=fetch_limit),
+            IMPLEMENTED_DIVIDEND_SCHEMA,
+        )
 
     def adjustment_factors(
         self,

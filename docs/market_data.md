@@ -671,6 +671,11 @@ visible_at ASC, symbol ASC, period_end ASC, announcement_date ASC
 
 ## 公司行动接口 `corporate_actions`
 
+账户回放使用 `reader.implemented_dividends(symbols=...)`，返回固定数据快照中的
+全部“实施”记录（`pyarrow.Table`），不要求实施公告日期，也不查询公告可见性日历。
+该入口不在策略的 `DataView` 上，返回字段不含 `visible_at`。它与策略分红查询共用
+`corporate_actions.dividends` 数据来源；账户处理器负责业务日期校验、去重和冲突处理。
+
 ```python
 dividends = data.corporate_actions.dividends(
     symbols=("000001.SZ",),

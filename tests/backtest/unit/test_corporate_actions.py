@@ -1,7 +1,8 @@
-from datetime import date, datetime, time
-from types import SimpleNamespace
+from datetime import date, time
+from pathlib import Path
 from typing import cast
 
+import pyarrow as pa
 import pytest
 
 from backtest.broker import SimulatedBroker
@@ -11,7 +12,9 @@ from backtest.corporate_actions import CorporateActionProcessor
 from backtest.domain import CorporateAction, Fill, Side
 from backtest.errors import CorporateActionError
 from backtest.portfolio import Portfolio
-from market_data import DataReader
+from market_data import DataCatalog, DataReader, SourceConfig
+from models import IMPLEMENTED_DIVIDEND_SCHEMA
+from tushare_data import TABLE_SCHEMAS, TushareDataStore
 
 
 def test_cash_and_stock_dividend_follow_record_ex_pay_and_listing_dates() -> None:
@@ -206,9 +209,39 @@ def test_load_uses_final_implemented_facts_and_merges_business_duplicates() -> N
         at_time(date(2026, 1, 6), time(9, 25)), portfolio, _broker()
     )
 
-    assert reader.requested_at is not None
-    assert reader.requested_at.date() == date.max
     assert portfolio.cash == pytest.approx(90_500)
+
+
+def test_implemented_fact_without_announcement_is_paid(tmp_path: Path) -> None:
+    """真实适配路径不依赖公告日期或公告可见性日历，且不把预案入账。"""
+    rows = [
+        {
+            "ts_code": "000001.SZ",
+            "end_date": date(2025, 12, 31),
+            "div_proc": status,
+            "record_date": date(2026, 1, 2),
+            "ex_date": date(2026, 1, 5),
+            "pay_date": date(2026, 1, 6),
+            "cash_div": amount,
+        }
+        for status, amount in (("实施", 0.5), ("预案", 9.0))
+    ]
+    with TushareDataStore(tmp_path / "tushare") as store:
+        store.write("dividend", pa.Table.from_pylist(rows, schema=TABLE_SCHEMAS["dividend"]))
+    with DataCatalog(tushare_root=tmp_path / "tushare", qmt_root=tmp_path / "qmt") as catalog:
+        reader = DataReader(
+            catalog, sources=SourceConfig(routes={"corporate_actions.dividends": "tushare"})
+        )
+        processor = CorporateActionProcessor.load(
+            reader, BacktestConfig(date(2026, 1, 2), date(2026, 1, 7))
+        )
+    portfolio = _portfolio_with_shares(1_000)
+    processor.on_session_end(at_time(date(2026, 1, 2), time(16, 5)), portfolio)
+    processor.on_session_start(at_time(date(2026, 1, 5), time(9, 25)), portfolio, _broker())
+    assert portfolio.dividend_receivable == 500
+    processor.on_session_start(at_time(date(2026, 1, 6), time(9, 25)), portfolio, _broker())
+    assert portfolio.cash == pytest.approx(90_500)
+    assert portfolio.dividend_receivable == 0
 
 
 def _portfolio_with_shares(quantity: int) -> Portfolio:
@@ -244,13 +277,7 @@ class _ActionReader:
     """只实现 CorporateActionProcessor.load 所需形状的测试读取器。"""
 
     def __init__(self, rows: list[dict[str, object]]) -> None:
-        self.requested_at: datetime | None = None
-        table = SimpleNamespace(to_pylist=lambda: rows)
-        corporate_actions = SimpleNamespace(
-            dividends=lambda **_: SimpleNamespace(table=table)
-        )
-        self._view = SimpleNamespace(corporate_actions=corporate_actions)
+        self._table = pa.Table.from_pylist(rows, schema=IMPLEMENTED_DIVIDEND_SCHEMA)
 
-    def at(self, as_of: datetime) -> object:
-        self.requested_at = as_of
-        return self._view
+    def implemented_dividends(self, *, symbols: object) -> pa.Table:
+        return self._table
