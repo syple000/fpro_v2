@@ -77,6 +77,12 @@ def calculate_metrics(
         "blocked_order_reasons": dict(sorted(blocked_reasons.items())),
         "total_fees": sum(fill.total_fee for fill in result.fills),
         "slippage_cost": sum(fill.slippage_cost for fill in result.fills),
+        "corporate_action_scope": {
+            "supported": ["现金分红", "送转股"],
+            "unsupported": ["吸收合并", "换股", "配股", "现金选择权", "退市后回收"],
+            "delisting_policy": config.delisting_policy,
+            "coverage": "分红源不能保证发现其它经济事件；结果不代表完整经济结算",
+        },
     }
     coverage = result.market_data_coverage
     if coverage is not None:

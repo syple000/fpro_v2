@@ -11,7 +11,7 @@ from backtest.clock import Clock, Event, market_timeline
 from backtest.config import BacktestConfig
 from backtest.corporate_actions import CorporateActionProcessor
 from backtest.domain import BacktestResult, Bar, EquitySnapshot, MarketDataCoverage, OrderReason
-from backtest.errors import DataError
+from backtest.errors import CorporateActionError, DataError
 from backtest.orders import create_orders, validate_target_weights
 from backtest.portfolio import Portfolio
 from backtest.strategy import Strategy, StrategyContext
@@ -132,6 +132,11 @@ class BacktestEngine:
             delisting_date = lifecycle["delisting_date"]
             if delisting_date is None or delisting_date > at.date():
                 raise DataError(f"{symbol} 不在上市集合中，但没有已生效的退市事实")
+            if symbol in held and self.config.delisting_policy == "error":
+                raise CorporateActionError(
+                    f"{symbol} 于 {delisting_date} 退市，当前未实现退市经济结算；"
+                    "如接受零价值核销假设，请显式配置 delisting_policy='write_off'"
+                )
             self.broker.cancel_symbol(symbol, OrderReason.DELISTED, at)
             self.portfolio.write_off(symbol)
 

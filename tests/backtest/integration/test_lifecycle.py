@@ -1,5 +1,6 @@
 from datetime import date, time
 from pathlib import Path
+from typing import Literal
 
 import pyarrow as pa
 import pytest
@@ -9,7 +10,7 @@ from backtest.config import BacktestConfig
 from backtest.corporate_actions import CorporateActionProcessor
 from backtest.domain import OrderReason, OrderRequest, Side
 from backtest.engine import BacktestEngine
-from backtest.errors import DataError
+from backtest.errors import CorporateActionError, DataError
 from backtest.strategy import Strategy, StrategyContext
 from market_data import DataCatalog, DataReader, SourceConfig
 from tushare_data import TABLE_SCHEMAS, TushareDataStore
@@ -20,11 +21,19 @@ class IdleStrategy(Strategy):
         pass
 
 
-@pytest.mark.parametrize("source_code,delisted", [("920047.BJ", False), ("430047.BJ", True)])
+@pytest.mark.parametrize(
+    "source_code,delisted,policy",
+    [
+        ("920047.BJ", False, "error"),
+        ("430047.BJ", True, "write_off"),
+        ("430047.BJ", True, "error"),
+    ],
+)
 def test_only_explicit_delisting_can_remove_a_position(
     tmp_path: Path,
     source_code: str,
     delisted: bool,
+    policy: Literal["error", "write_off"],
 ) -> None:
     day = date(2026, 1, 5)
     with TushareDataStore(tmp_path / "tushare") as store:
@@ -47,7 +56,7 @@ def test_only_explicit_delisting_can_remove_a_position(
         reader = DataReader(catalog, sources=SourceConfig(routes={"reference.stocks": "tushare"}))
         engine = BacktestEngine(
             reader=reader,
-            config=BacktestConfig(day, day),
+            config=BacktestConfig(day, day, delisting_policy=policy),
             sessions=(day,),
             strategy=IdleStrategy(),
             actions=CorporateActionProcessor(()),
@@ -58,9 +67,15 @@ def test_only_explicit_delisting_can_remove_a_position(
         at = at_time(day, time(9, 25))
         engine.broker.submit(OrderRequest("430047.BJ", Side.SELL, 1_000), at)
         if delisted:
-            engine._start_session(at, reader.at(at))
-            assert position.quantity == 0
-            assert engine.broker.updates[-1].reason is OrderReason.DELISTED
+            if policy == "write_off":
+                engine._start_session(at, reader.at(at))
+                assert position.quantity == 0
+                assert engine.broker.updates[-1].reason is OrderReason.DELISTED
+            else:
+                with pytest.raises(CorporateActionError, match="未实现退市经济结算"):
+                    engine._start_session(at, reader.at(at))
+                assert position.quantity == 1_000
+                assert len(engine.broker.pending_orders) == 1
         else:
             before = engine.portfolio.total_equity
             with pytest.raises(DataError, match="主数据缺失.*代码映射"):

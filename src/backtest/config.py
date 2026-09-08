@@ -6,7 +6,7 @@ import math
 from dataclasses import asdict, dataclass, field
 from datetime import date
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from backtest.clock import MarketHours
 from backtest.errors import ConfigurationError
@@ -43,11 +43,15 @@ class BacktestConfig:
     commission_rate: float = 0.0003
     # 每笔订单的最低佣金，单位为元。
     minimum_commission: float = 5.0
+    # 当前没有完整退市结算模型；只有显式选择 write_off 才按零价值核销。
+    delisting_policy: Literal["error", "write_off"] = "error"
 
     def __post_init__(self) -> None:
         """在程序读取大量历史数据之前尽早拒绝无效配置。"""
         if self.start_date > self.end_date:
             raise ConfigurationError("start_date 不能晚于 end_date")
+        if self.delisting_policy not in {"error", "write_off"}:
+            raise ConfigurationError("delisting_policy 必须为 error 或 write_off")
         if self.frequency not in SUPPORTED_FREQUENCIES:
             raise ConfigurationError(f"不支持的 frequency: {self.frequency!r}")
         if self.symbols is not None:
