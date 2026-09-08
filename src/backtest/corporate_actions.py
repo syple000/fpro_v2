@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import math
+from bisect import bisect_left
 from collections import defaultdict
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from datetime import date, datetime
 
 from backtest.broker import SimulatedBroker
@@ -24,6 +25,11 @@ class CorporateActionProcessor:
         self._ex: dict[date, list[CorporateAction]] = defaultdict(list)
         self._pay: dict[date, list[CorporateAction]] = defaultdict(list)
         self._listing: dict[date, list[CorporateAction]] = defaultdict(list)
+        self._sessions: frozenset[date] | None = None
+        self._start_date = date.min
+        self._end_date = date.max
+        self._record_before_start: list[CorporateAction] = []
+        self._record_after_close: dict[date, list[CorporateAction]] = defaultdict(list)
         for action in actions:
             if action.record_date is not None:
                 self._record[action.record_date].append(action)
@@ -33,6 +39,25 @@ class CorporateActionProcessor:
                 self._pay[action.pay_date].append(action)
             if action.listing_date is not None:
                 self._listing[action.listing_date].append(action)
+
+    def set_sessions(
+        self, sessions: Sequence[date], *, start_date: date, end_date: date
+    ) -> None:
+        """绑定实际回放日历；超出回放区间的未来结算无需在本次执行。"""
+        ordered = sorted(set(sessions))
+        self._sessions = frozenset(ordered)
+        self._start_date, self._end_date = start_date, end_date
+        self._record_before_start.clear()
+        self._record_after_close.clear()
+        for record_date, actions in self._record.items():
+            if not start_date <= record_date <= end_date or record_date in self._sessions:
+                continue
+            index = bisect_left(ordered, record_date)
+            if index == 0:
+                self._record_before_start.extend(actions)
+            else:
+                # 空档内没有成交；前一交易日收盘后即可检查登记日异常。
+                self._record_after_close[ordered[index - 1]].extend(actions)
 
     @classmethod
     def load(
@@ -95,6 +120,9 @@ class CorporateActionProcessor:
         broker: SimulatedBroker,
     ) -> None:
         """日初依次处理除权、派息和红股上市。"""
+        for action in self._record_before_start:
+            self._capture_entitlement(action, portfolio)
+        self._record_before_start.clear()
         for action in self._ex.get(at.date(), ()):
             broker.cancel_symbol(
                 action.symbol,
@@ -127,11 +155,17 @@ class CorporateActionProcessor:
 
     def on_session_end(self, at: datetime, portfolio: Portfolio) -> None:
         """日终按收盘持仓记录权益；该内部快照不会暴露给策略。"""
-        for action in self._record.get(at.date(), ()):
-            entitlement = portfolio.capture_entitlement(action.action_id, action.symbol)
-            # 无持仓的公司行动与账户无关，不因缺少后续日期而中断回测。
-            if entitlement > 0:
-                self._validate(action)
+        for action in (
+            *self._record.get(at.date(), ()),
+            *self._record_after_close.get(at.date(), ()),
+        ):
+            self._capture_entitlement(action, portfolio)
+
+    def _capture_entitlement(self, action: CorporateAction, portfolio: Portfolio) -> None:
+        entitlement = portfolio.capture_entitlement(action.action_id, action.symbol)
+        # 无持仓的公司行动与账户无关；记住零权益，避免后来买入补得旧权益。
+        if entitlement > 0:
+            self._validate(action)
 
     @staticmethod
     def _recognize_cash(
@@ -161,8 +195,7 @@ class CorporateActionProcessor:
                 action.stock_dividend,
             )
 
-    @staticmethod
-    def _validate(action: CorporateAction) -> None:
+    def _validate(self, action: CorporateAction) -> None:
         """只校验会实际影响当前账户的公司行动。"""
         cash_per_share = _cash_per_share(action)
         if cash_per_share is not None and (
@@ -196,6 +229,22 @@ class CorporateActionProcessor:
                 raise CorporateActionError(f"{action.action_id} 红股上市日不晚于股权登记日")
             if action.ex_date is not None and action.listing_date < action.ex_date:
                 raise CorporateActionError(f"{action.action_id} 红股上市日早于除权日")
+
+        if self._sessions is not None:
+            dates = [("股权登记日", action.record_date), ("除权日", action.ex_date)]
+            if cash_per_share is not None and cash_per_share > 0:
+                dates.append(("派息日", action.pay_date))
+            if action.stock_dividend > 0:
+                dates.append(("红股上市日", action.listing_date))
+            for label, business_date in dates:
+                if (
+                    business_date is not None
+                    and self._start_date <= business_date <= self._end_date
+                    and business_date not in self._sessions
+                ):
+                    raise CorporateActionError(
+                        f"{action.action_id} {label} {business_date} 不在回放交易日历中"
+                    )
 
     @staticmethod
     def _entitlement(action: CorporateAction, portfolio: Portfolio) -> int:

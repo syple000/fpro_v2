@@ -9,6 +9,7 @@ from backtest.config import BacktestConfig
 from backtest.corporate_actions import CorporateActionProcessor
 from backtest.domain import BacktestResult, CorporateAction, OrderStatus, Side
 from backtest.engine import BacktestEngine
+from backtest.errors import CorporateActionError
 from backtest.schedule import Schedule
 from backtest.strategy import Strategy, StrategyContext
 from market_data import DataReader
@@ -49,6 +50,33 @@ def _run(
         calendar=calendar,
         strategy=strategy,
     ).run()
+
+
+@pytest.mark.parametrize("invalid_record", [False, True])
+def test_engine_rejects_non_session_dividend_dates(invalid_record: bool) -> None:
+    """持仓登记或派息落在回测末尾周日时，交易日回放也必须明确报错。"""
+    sessions = (date(2026, 1, 8), date(2026, 1, 9))
+    action = CorporateAction(
+        action_id="SUNDAY",
+        symbol="000001.SZ",
+        record_date=date(2026, 1, 11) if invalid_record else date(2026, 1, 9),
+        ex_date=None,
+        pay_date=date(2026, 1, 12) if invalid_record else date(2026, 1, 11),
+        listing_date=None,
+        cash_dividend=0.5,
+        cash_dividend_before_tax=None,
+        stock_dividend=0,
+    )
+    reader = MemoryDataReader(bar_table([daily_bar(day, 10) for day in sessions]), sessions)
+    engine = BacktestEngine(
+        reader=cast(DataReader, reader),
+        config=BacktestConfig(sessions[0], date(2026, 1, 11), volume_limit=None),
+        sessions=sessions,
+        strategy=OneShotStrategy(),
+        actions=CorporateActionProcessor([action]),
+    )
+    with pytest.raises(CorporateActionError, match="2026-01-11 不在回放交易日历中"):
+        engine.run()
 
 
 def test_daily_signal_fills_at_next_session_open() -> None:

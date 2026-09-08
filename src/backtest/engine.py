@@ -52,6 +52,9 @@ class BacktestEngine:
         self.portfolio = Portfolio(config.initial_cash)
         self.broker = SimulatedBroker(config)
         self.actions = actions or CorporateActionProcessor(())
+        self.actions.set_sessions(
+            sessions, start_date=config.start_date, end_date=config.end_date
+        )
         self._equity: list[EquitySnapshot] = []
 
     def run(self) -> BacktestResult:

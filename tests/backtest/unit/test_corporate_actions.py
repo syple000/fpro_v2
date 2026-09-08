@@ -1,3 +1,4 @@
+from dataclasses import replace
 from datetime import date, time
 from pathlib import Path
 from typing import cast
@@ -222,6 +223,63 @@ def test_cash_and_stock_can_settle_on_ex_date() -> None:
     assert portfolio.cash == pytest.approx(90_500)
     assert portfolio.dividend_receivable == 0
     assert portfolio.position("000001.SZ").sellable_quantity == 1_100
+
+
+@pytest.mark.parametrize("field", ["record_date", "ex_date", "pay_date", "listing_date"])
+@pytest.mark.parametrize("held", [False, True])
+def test_non_session_business_date_is_rejected_only_with_entitlement(
+    field: str, held: bool
+) -> None:
+    """周日业务日期不能静默错过；无持仓记录仍不阻断回放。"""
+    action = CorporateAction(
+        action_id="OFF_CALENDAR",
+        symbol="000001.SZ",
+        record_date=date(2026, 1, 2),
+        ex_date=None,
+        pay_date=date(2026, 1, 5),
+        listing_date=date(2026, 1, 5),
+        cash_dividend=0.5,
+        cash_dividend_before_tax=None,
+        stock_dividend=0.1,
+    )
+    action = replace(action, **{field: date(2026, 1, 4)})
+    processor = CorporateActionProcessor([action])
+    processor.set_sessions(
+        [date(2026, 1, 2), date(2026, 1, 5)],
+        start_date=date(2026, 1, 2),
+        end_date=date(2026, 1, 5),
+    )
+    portfolio = _portfolio_with_shares(1_000) if held else Portfolio(100_000)
+    if held:
+        with pytest.raises(CorporateActionError, match="2026-01-04 不在回放交易日历中"):
+            processor.on_session_end(at_time(date(2026, 1, 2), time(16, 5)), portfolio)
+    else:
+        processor.on_session_end(at_time(date(2026, 1, 2), time(16, 5)), portfolio)
+        assert portfolio.entitlement("OFF_CALENDAR") == 0
+
+
+def test_future_settlement_outside_run_can_remain_receivable() -> None:
+    action = CorporateAction(
+        action_id="FUTURE",
+        symbol="000001.SZ",
+        record_date=date(2026, 1, 2),
+        ex_date=date(2026, 1, 5),
+        pay_date=date(2026, 1, 6),
+        listing_date=None,
+        cash_dividend=0.5,
+        cash_dividend_before_tax=None,
+        stock_dividend=0,
+    )
+    processor = CorporateActionProcessor([action])
+    processor.set_sessions(
+        [date(2026, 1, 2), date(2026, 1, 5)],
+        start_date=date(2026, 1, 2),
+        end_date=date(2026, 1, 5),
+    )
+    portfolio = _portfolio_with_shares(1_000)
+    processor.on_session_end(at_time(date(2026, 1, 2), time(16, 5)), portfolio)
+    processor.on_session_start(at_time(date(2026, 1, 5), time(9, 25)), portfolio, _broker())
+    assert portfolio.dividend_receivable == 500
 
 
 def test_load_uses_final_implemented_facts_and_merges_business_duplicates() -> None:
