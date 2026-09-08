@@ -1,5 +1,11 @@
 # 回测引擎
 
+现金分红采用 `cash_dividend_model="source_cash_then_gross"`：优先取来源现金字段，
+缺失时退回税前字段；不按买入批次或持有期限结算红利税。送转股采用
+`fractional_share_model="floor"`：登记股数乘比例后向下取整，不包含零碎股分配或补偿。
+这是当前唯一支持的简化模型，配置和 `metrics.json.dividend_model` 都会明确记录；
+请求其它模型会报配置错误，不能把输出解释为个人账户精确税后实得。
+
 公司行动目前支持现金分红和送转股。真实退市影响持仓时默认报错并保留账户状态；
 只有显式设置 `BacktestConfig(delisting_policy="write_off", ...)` 才按零价值核销。
 `metrics.json` 的 `corporate_action_scope` 记录口径。吸收合并、换股、配股、现金选择权和

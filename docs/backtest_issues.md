@@ -253,6 +253,7 @@
 
 ### BT-024：红利税与零碎股采用简化处理
 
+- **状态**：已明确模型口径。配置和指标分别记录 `source_cash_then_gross` 与 `floor`，报告说明不按持有期精算红利税、不含零碎股分配或补偿；不支持的模型在启动前拒绝。原记账公式保留，此项并未实现精确税务或零碎股经济结算。
 - **位置**：[corporate_actions.py](../src/backtest/corporate_actions.py)，`_cash_per_share()`；[portfolio.py](../src/backtest/portfolio.py)，送股数量计算。
 - **现状**：现金分红优先使用提供的现金字段，缺失时退回税前字段；没有按买入批次和持有期限维护税务结算。送股数量按 `floor(entitlement * ratio)` 取整，没有完整的零碎股分配或补偿模型。
 - **性质**：这是模型精度限制，不能仅凭字段名认定已精确模拟每个账户的税后实得金额。

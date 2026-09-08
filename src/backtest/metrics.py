@@ -83,6 +83,12 @@ def calculate_metrics(
             "delisting_policy": config.delisting_policy,
             "coverage": "分红源不能保证发现其它经济事件；结果不代表完整经济结算",
         },
+        "dividend_model": {
+            "cash": config.cash_dividend_model,
+            "cash_description": "优先使用来源现金字段，缺失时使用税前字段；未模拟持有期红利税",
+            "fractional_shares": config.fractional_share_model,
+            "fractional_description": "登记数量乘送转比例后向下取整；未模拟零碎股分配或补偿",
+        },
     }
     coverage = result.market_data_coverage
     if coverage is not None:

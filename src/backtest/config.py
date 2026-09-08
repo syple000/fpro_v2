@@ -45,6 +45,9 @@ class BacktestConfig:
     minimum_commission: float = 5.0
     # 当前没有完整退市结算模型；只有显式选择 write_off 才按零价值核销。
     delisting_policy: Literal["error", "write_off"] = "error"
+    # 当前唯一支持的分红模型；名称随配置输出，不冒充按持有批次精算税费。
+    cash_dividend_model: Literal["source_cash_then_gross"] = "source_cash_then_gross"
+    fractional_share_model: Literal["floor"] = "floor"
 
     def __post_init__(self) -> None:
         """在程序读取大量历史数据之前尽早拒绝无效配置。"""
@@ -52,6 +55,10 @@ class BacktestConfig:
             raise ConfigurationError("start_date 不能晚于 end_date")
         if self.delisting_policy not in {"error", "write_off"}:
             raise ConfigurationError("delisting_policy 必须为 error 或 write_off")
+        if self.cash_dividend_model != "source_cash_then_gross":
+            raise ConfigurationError("当前仅支持 cash_dividend_model='source_cash_then_gross'")
+        if self.fractional_share_model != "floor":
+            raise ConfigurationError("当前仅支持 fractional_share_model='floor'")
         if self.frequency not in SUPPORTED_FREQUENCIES:
             raise ConfigurationError(f"不支持的 frequency: {self.frequency!r}")
         if self.symbols is not None:
