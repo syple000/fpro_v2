@@ -160,7 +160,10 @@ def run_from_storage(
         tushare_root=options.tushare_root,
         qmt_root=options.qmt_root,
     ) as catalog:
-        reader = DataReader(catalog, sources=routes, max_result_rows=50_000_000)
+        reader = DataReader(
+            catalog, sources=routes, max_result_rows=50_000_000,
+            bar_availability=config.bar_availability,
+        )
         return run_backtest(
             reader=reader,
             config=config,

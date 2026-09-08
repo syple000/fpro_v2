@@ -1504,8 +1504,12 @@ class QmtAdapter(DataAdapter):
         *,
         history_time_label: Literal["start", "end"] = "end",
         realtime_time_label: Literal["start", "end"] = "start",
+        bar_availability: Literal["historical", "received"] = "historical",
     ) -> None:
         self._connection = catalog.connection
+        if bar_availability not in {"historical", "received"}:
+            raise ValueError("bar_availability 必须为 historical 或 received")
+        self.bar_availability: Literal["historical", "received"] = bar_availability
         if history_time_label not in {"start", "end"} or realtime_time_label not in {
             "start",
             "end",
@@ -1642,6 +1646,7 @@ class QmtAdapter(DataAdapter):
             as_of_us=as_of_us,
             history_time_label=self.history_time_label,
             realtime_time_label=self.realtime_time_label,
+            historical=self.bar_availability == "historical",
             symbols=symbols,
             start=start,
             end=end,
@@ -1661,7 +1666,8 @@ class QmtAdapter(DataAdapter):
                        CAST(NULL AS BIGINT) AS received_at,
                        CAST(0 AS BIGINT) AS seq
                 FROM qmt.intraday
-                WHERE period = $period
+                WHERE $historical
+                  AND period = $period
                   AND adjustment = $adjustment
                   AND trading_date <= $as_of_date
                   AND ($symbols IS NULL OR code IN (SELECT unnest($symbols)))
@@ -1685,7 +1691,7 @@ class QmtAdapter(DataAdapter):
                   AND ($start_date IS NULL OR trading_date >= $start_date)
                   AND trading_date <= $end_date
                   AND event_time IS NOT NULL
-                  AND received_at <= $as_of_us
+                  AND ($historical OR received_at <= $as_of_us)
             ), platform_bars AS (
                 SELECT code AS symbol,
                        {start_expr} AS interval_start,
@@ -1712,7 +1718,7 @@ class QmtAdapter(DataAdapter):
               AND ($start IS NULL OR interval_start >= $start)
               AND ($end IS NULL OR interval_start < $end)
             QUALIFY $count IS NULL OR row_number() OVER (
-                PARTITION BY symbol ORDER BY event_time DESC
+                PARTITION BY symbol ORDER BY interval_end DESC, interval_start DESC
             ) <= $count
             ORDER BY interval_end {direction}, symbol, interval_start {direction}
             LIMIT $fetch_limit

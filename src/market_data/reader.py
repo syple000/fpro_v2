@@ -56,6 +56,9 @@ class DataReader:
         sources: SourceConfig,
         adapters: Mapping[str, DataAdapter] | None = None,
         max_result_rows: int = 1_000_000,
+        bar_availability: Literal["historical", "received"] = "historical",
+        qmt_history_time_label: Literal["start", "end"] = "end",
+        qmt_realtime_time_label: Literal["start", "end"] = "start",
     ) -> None:
         if (
             isinstance(max_result_rows, bool)
@@ -84,9 +87,18 @@ class DataReader:
         self._sources = sources
         self._catalog = catalog
         self._tushare_adapter = TushareAdapter(catalog)
-        self._qmt_adapter = QmtAdapter(catalog)
+        self._qmt_adapter = QmtAdapter(
+            catalog, bar_availability=bar_availability,
+            history_time_label=qmt_history_time_label,
+            realtime_time_label=qmt_realtime_time_label,
+        )
         self._custom_adapters = custom_adapters
         self._max_result_rows = max_result_rows
+
+    @property
+    def bar_availability(self) -> Literal["historical", "received"]:
+        """当前 Reader 固定使用的分钟 Bar 可见性规则。"""
+        return self._qmt_adapter.bar_availability
 
     def implemented_dividends(self, *, symbols: Symbols) -> pa.Table:
         """账户专用：读取固定快照的实施事实，不按策略时钟过滤公告。
@@ -142,6 +154,11 @@ class DataReader:
         return {
             "routes": dict(self._sources.routes),
             "catalog": self._catalog.snapshot_metadata(),
+            "qmt": {
+                "bar_availability": self.bar_availability,
+                "history_time_label": self._qmt_adapter.history_time_label,
+                "realtime_time_label": self._qmt_adapter.realtime_time_label,
+            },
             "custom_adapters": {
                 source: {
                     "type": f"{type(adapter).__module__}.{type(adapter).__qualname__}",

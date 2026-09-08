@@ -142,6 +142,18 @@ Broker 和 Portfolio 需要明确的业务字段。这个对象不读取数据�
 调用策略；配置时直接报错，需要改为 `1m` 撮合。这样避免 Bar 中途下单或撤单影响更早的开盘成交。
 Broker 也会检查委托时间，开盘之后提交的订单不会回填到该根 Bar 的开盘。
 
+`BacktestConfig.bar_availability` 默认 `"historical"`：使用固定快照中完整的 Bar，
+忽略原始接收延迟，但仍在 Bar 结束后才让策略看到。需要重放接收延迟时设置为 `"received"`，
+该模式仅用于分钟撮合；QMT 只读取带 `received_at` 的持久化 `bars`，下载的 `intraday`
+没有接收时间，不能混入该模式。`run_from_storage` 自动配置 Reader；自行构造 DataReader
+时须传入一致的 `bar_availability`。
+
+接收模式在后续市场、策略及日终时点使用最新已到达的价格。迟到 Bar 只改变当前估值，
+不补记历史开盘成交，也不改写之前的净值；旧区间价格会标为 stale。更旧行情到达时，
+不会覆盖已经可见的更新价格。QMT 历史标签默认是结束时刻、实时标签默认是开始时刻，
+可通过 DataReader 的 `qmt_history_time_label` / `qmt_realtime_time_label` 显式指定。
+模式和时间标签都会写入运行元数据。
+
 ## 文件职责
 
 | 文件 | 内容 |

@@ -49,6 +49,9 @@ class BacktestConfig:
     cash_dividend_model: Literal["source_cash_then_gross"] = "source_cash_then_gross"
     fractional_share_model: Literal["floor"] = "floor"
 
+    # historical 按固定快照回测；received 按持久化分钟 Bar 的实际接收时间回放。
+    bar_availability: Literal["historical", "received"] = "historical"
+
     def __post_init__(self) -> None:
         """在程序读取大量历史数据之前尽早拒绝无效配置。"""
         if self.start_date > self.end_date:
@@ -61,6 +64,10 @@ class BacktestConfig:
             raise ConfigurationError("当前仅支持 fractional_share_model='floor'")
         if self.frequency not in SUPPORTED_FREQUENCIES:
             raise ConfigurationError(f"不支持的 frequency: {self.frequency!r}")
+        if self.bar_availability not in {"historical", "received"}:
+            raise ConfigurationError("bar_availability 必须为 historical 或 received")
+        if self.bar_availability == "received" and self.frequency == "1d":
+            raise ConfigurationError("received 模式仅支持带接收时间的分钟 Bar")
         if self.symbols is not None:
             if not self.symbols or any(not symbol for symbol in self.symbols):
                 raise ConfigurationError("symbols 必须包含有效证券代码")

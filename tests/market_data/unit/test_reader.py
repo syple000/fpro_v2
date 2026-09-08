@@ -729,7 +729,7 @@ def test_qmt_current_and_completed_intraday_bar_use_received_boundary(tmp_path: 
         }
     )
     with DataCatalog(tushare_root=tmp_path / "tushare", qmt_root=qmt_root) as catalog:
-        reader = DataReader(catalog, sources=config)
+        reader = DataReader(catalog, sources=config, bar_availability="received")
         before = reader.at(datetime(2024, 1, 2, 9, 30, 30, tzinfo=SHANGHAI)).market.bars(
             symbols=("000001.SZ",),
             frequency="1m",
