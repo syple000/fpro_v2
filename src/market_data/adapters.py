@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+from collections import defaultdict
 from collections.abc import Mapping
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time, timedelta
 from typing import Literal
 from zoneinfo import ZoneInfo
 
@@ -40,10 +41,10 @@ from models import (
     STOCK_SCHEMA,
     SUSPENSION_SCHEMA,
 )
+from tushare_data.suspensions import parse_suspension_timing
 
 _TZ = "Asia/Shanghai"
 _CALENDAR_COVERAGE_ERROR = "__FPRO_CALENDAR_COVERAGE_ERROR__"
-_SUSPENSION_TIMING_ERROR = "__FPRO_SUSPENSION_TIMING_ERROR__"
 _FORWARD_BAR_SCHEMA = pa.schema(
     [*BAR_SCHEMA, pa.field("__invalid_factor", pa.bool_(), nullable=False)]
 )
@@ -593,82 +594,47 @@ class TushareAdapter(DataAdapter):
         columns: tuple[str, ...] | None = None,
     ) -> pa.Table:
         self._catalog.require_available("tushare", "suspend_d")
-        params = _query_parameters(
-            as_of=as_of,
-            trade_date=as_of.date(),
-            symbols=symbols,
-            fetch_limit=fetch_limit,
-        )
-        query = f"""
-            WITH source AS MATERIALIZED (
-                SELECT *
+        if symbols is not None and self._catalog.identities is not None:
+            symbols = self._catalog.identities.canonical_symbols(symbols)
+        local_time = as_of.astimezone(ZoneInfo(_TZ))
+        source = _fetch(
+            self._connection,
+            """
+                SELECT ts_code, suspend_type, suspend_timing
                 FROM tushare.suspend_d
                 WHERE trade_date = $trade_date
                   AND ($symbols IS NULL OR ts_code IN (SELECT unnest($symbols)))
-            ), suspensions AS (
-                SELECT *,
-                       CASE WHEN suspend_timing IS NOT NULL THEN coalesce(
-                           timezone(
-                               '{_TZ}',
-                               CAST(trade_date AS DATE) + CAST(try_strptime(
-                                   regexp_extract(
-                                       suspend_timing,
-                                       '([0-2][0-9]:[0-5][0-9])',
-                                       1
-                                   ),
-                                   '%H:%M'
-                               ) AS TIME)
-                           ),
-                           CAST(error('{_SUSPENSION_TIMING_ERROR}') AS TIMESTAMPTZ)
-                       ) END AS interval_start,
-                       CASE WHEN suspend_timing IS NOT NULL THEN coalesce(
-                           timezone(
-                               '{_TZ}',
-                               CAST(trade_date AS DATE) + CAST(try_strptime(
-                                   regexp_extract(
-                                       suspend_timing,
-                                       '[0-2][0-9]:[0-5][0-9][^0-2]*([0-2][0-9]:[0-5][0-9])',
-                                       1
-                                   ),
-                                   '%H:%M'
-                               ) AS TIME)
-                           ),
-                           CAST(error('{_SUSPENSION_TIMING_ERROR}') AS TIMESTAMPTZ)
-                       ) END AS interval_end
-                FROM source
-            ), latest AS (
-                SELECT ts_code AS symbol,
-                       CASE
-                           WHEN suspend_type = 'S' AND suspend_timing IS NULL THEN TRUE
-                           WHEN suspend_type = 'S' AND interval_end > $as_of THEN TRUE
-                           WHEN suspend_type IN ('S', 'R') THEN FALSE
-                       END AS suspended
-                FROM suspensions
-                WHERE (
-                      (suspend_timing IS NULL AND {_day_time("trade_date", "09:25")} <= $as_of)
-                      OR (suspend_timing IS NOT NULL AND interval_start <= $as_of)
-                  )
-                QUALIFY row_number() OVER (
-                    PARTITION BY ts_code ORDER BY interval_start DESC NULLS LAST, suspend_type
-                ) = 1
-            ), requested AS (
-                SELECT unnest($symbols) AS symbol
-                UNION SELECT ts_code AS symbol FROM source WHERE $symbols IS NULL
-            )
-            SELECT requested.symbol,
-                   CASE
-                       WHEN latest.symbol IS NOT NULL THEN latest.suspended
-                       WHEN {_day_time("$trade_date", "09:25")} <= $as_of AND EXISTS (
-                           SELECT 1 FROM data_internal.tushare_sync_ranges
-                           WHERE dataset = 'suspend_d'
-                             AND start_date <= $trade_date AND end_date >= $trade_date
-                       ) THEN FALSE
-                   END AS suspended
-            FROM requested LEFT JOIN latest USING (symbol)
-            ORDER BY symbol
-            LIMIT $fetch_limit
-        """
-        return _fetch(self._connection, query, params, SUSPENSION_SCHEMA, columns)
+            """,
+            _query_parameters(trade_date=local_time.date(), symbols=symbols),
+        )
+        coverage = _fetch(
+            self._connection,
+            """
+                SELECT EXISTS (
+                    SELECT 1 FROM data_internal.tushare_sync_ranges
+                    WHERE dataset = 'suspend_d'
+                      AND start_date <= $trade_date AND end_date >= $trade_date
+                ) AS complete
+            """,
+            {"trade_date": local_time.date()},
+        )
+        complete = coverage["complete"][0].as_py() and local_time.time() >= time(9, 25)
+        default = False if complete else None
+        by_symbol: dict[str, list[dict[str, object]]] = defaultdict(list)
+        for row in source.to_pylist():
+            by_symbol[row["ts_code"]].append(row)
+        requested = sorted(by_symbol if symbols is None else set(symbols))[:fetch_limit]
+        result = pa.Table.from_pylist(
+            [
+                {
+                    "symbol": symbol,
+                    "suspended": _suspension_status(by_symbol[symbol], local_time.time(), default),
+                }
+                for symbol in requested
+            ],
+            schema=SUSPENSION_SCHEMA,
+        )
+        return _project_table(result, columns)
 
     def price_limits(
         self,
@@ -1816,6 +1782,47 @@ class QmtAdapter(DataAdapter):
         return _fetch(self._connection, query, params, CURRENT_SCHEMA, columns)
 
 
+def _suspension_status(
+    rows: list[dict[str, object]], at: time, default: bool | None,
+) -> bool | None:
+    """只看已经开始的事件；任一日内停牌段仍有效，就不能放行。"""
+    events: list[tuple[time, bool | None]] = []
+    active_interval = False
+    for row in rows:
+        timing = row["suspend_timing"]
+        try:
+            if timing is not None and not isinstance(timing, str):
+                raise ValueError("停牌时段必须为字符串或空值")
+            intervals = parse_suspension_timing(timing)
+        except ValueError as exc:
+            raise DataSourceUnavailableError("Tushare 停牌时段格式无效") from exc
+        kind = row["suspend_type"]
+        if not intervals:
+            if at >= time(9, 25):
+                events.append((time(9, 25), kind == "S" if kind in {"S", "R"} else None))
+            continue
+        for start, end in intervals:
+            if start > at:
+                continue
+            if kind == "S":
+                suspended = at < end
+            elif kind == "R":
+                suspended = False
+            else:
+                suspended = None
+            if suspended is True:
+                active_interval = True
+            events.append((start, suspended))
+    if active_interval:
+        return True
+    if not events:
+        return default
+    latest = max(start for start, _ in events)
+    states = {state for start, state in events if start == latest}
+    # 同时刻的事件相互矛盾时保留未知，不按 S/R 字母顺序猜测。
+    return states.pop() if len(states) == 1 else None
+
+
 def _fetch(
     connection: duckdb.DuckDBPyConnection | _IdentityConnection,
     query: str,
@@ -1839,8 +1846,6 @@ def _fetch(
         message = str(exc)
         if _CALENDAR_COVERAGE_ERROR in message:
             raise DataSourceUnavailableError("交易日历未覆盖计算可见时间所需的下一交易日") from exc
-        if _SUSPENSION_TIMING_ERROR in message:
-            raise DataSourceUnavailableError("Tushare 停牌时段格式无效") from exc
         raise DataSourceUnavailableError("读取已检测数据失败") from exc
     return _coerce_schema(table, output_schema) if output_schema is not None else table
 

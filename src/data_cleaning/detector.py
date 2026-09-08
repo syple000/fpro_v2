@@ -19,6 +19,7 @@ import pyarrow.parquet as pq
 
 from data_cleaning.models import CheckResult, DetectionReport, Issue
 from tushare_data.schemas import TABLE_PARTITION_BY, TABLE_PRIMARY_KEY, TABLE_SCHEMAS
+from tushare_data.suspensions import parse_suspension_timing
 
 _DENSE_MARKET_DATASETS = frozenset({"daily", "daily_basic", "adj_factor", "stk_limit", "moneyflow"})
 _MARKET_DATE_DATASETS = _DENSE_MARKET_DATASETS | {"suspend_d", "trade_cal"}
@@ -1031,6 +1032,14 @@ def check_suspend_d(partition: str, partition_date: date | None, rows: Rows) -> 
     issues: list[Issue] = []
     for row in rows:
         invalid = row["suspend_type"] not in {"S", "R"}
+        timing = row["suspend_timing"]
+        if timing is not None and not isinstance(timing, str):
+            invalid = True
+        else:
+            try:
+                parse_suspension_timing(timing)
+            except ValueError:
+                invalid = True
         if invalid:
             issues.append(
                 _manual(

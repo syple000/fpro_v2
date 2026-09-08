@@ -22,7 +22,11 @@ class IdleStrategy(Strategy):
         pass
 
 
-@pytest.mark.parametrize("timing,expected_fills", [("09:31-10:00", 1), ("09:30-09:31", 0)])
+@pytest.mark.parametrize(
+    "timing,expected_fills",
+    [("09:31-10:00", 1), ("09:30-09:31", 0),
+     ("09:20-09:25,09:30-09:31", 0), ("9:30-9:31", 0)],
+)
 def test_matching_uses_opening_status_even_when_it_changes_before_bar_end(
     tmp_path: Path,
     timing: str,
