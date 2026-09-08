@@ -211,6 +211,8 @@
 
 ### BT-019：低层引擎默认公司行动为空
 
+- **状态**：已修复（2026-09-08）。`BacktestEngine.actions` 改为必填参数，省略或传 `None` 均在构造时失败；低层调用必须提供已加载的处理器，测试用空事件显式传 `CorporateActionProcessor(())`。正常运行入口继续自动加载。新增回归验证遗漏参数不会开始无分红回放。
+
 - **位置**：[engine.py](../src/backtest/engine.py)，构造函数；[runner.py](../src/backtest/runner.py)，`run_backtest()`。
 - **现状**：直接使用 `BacktestEngine` 且省略 `actions` 时，会创建空的 `CorporateActionProcessor`。常规 `run_backtest`、`run_from_storage` 入口会显式加载，因此不能说正常入口都漏掉分红。
 - **修复方向**：让公司行动依赖在公共引擎接口中明确，或统一由入口负责构造并限制低层接口误用；测试中需要空处理器时显式传入。

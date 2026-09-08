@@ -171,6 +171,10 @@ Python 和依赖版本、来源路由、实际加载的数据文件版本，以�
 
 ## 公司行动时间语义
 
+`run_backtest()` 和 `run_from_storage()` 会加载固定数据快照中的实施事实。
+直接构造低层 `BacktestEngine` 时，必须显式传入 `actions=CorporateActionProcessor.load(reader, config)`；
+测试确实没有公司行动时使用 `actions=CorporateActionProcessor(())`，不能省略或传入 `None`。
+
 公司行动同时包含两类时间，职责不能混用：
 
 - `visible_at` 只决定策略何时能从 `DataView` 查到公告；

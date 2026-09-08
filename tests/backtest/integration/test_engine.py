@@ -88,7 +88,21 @@ def _run(
         sessions=sessions,
         calendar=calendar,
         strategy=strategy,
+        actions=CorporateActionProcessor(()),
     ).run()
+
+
+def test_engine_requires_an_explicit_corporate_action_processor() -> None:
+    """低层构造遗漏公司行动时立即失败，不能静默跑出不含分红的收益。"""
+    session = date(2026, 1, 5)
+    reader = MemoryDataReader(bar_table([daily_bar(session, 10)]), (session,))
+    with pytest.raises(TypeError, match="actions"):
+        BacktestEngine(  # pyright: ignore[reportCallIssue]
+            reader=cast(DataReader, reader),
+            config=BacktestConfig(session, session),
+            sessions=(session,),
+            strategy=OneShotStrategy(),
+        )
 
 
 @pytest.mark.parametrize("invalid_record", [False, True])

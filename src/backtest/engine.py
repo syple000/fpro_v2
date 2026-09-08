@@ -30,11 +30,16 @@ class BacktestEngine:
         sessions: Sequence[date],
         calendar: Sequence[date] = (),
         strategy: Strategy,
-        actions: CorporateActionProcessor | None = None,
+        actions: CorporateActionProcessor,
     ) -> None:
         """创建回测所需的时钟、账户和模拟 Broker。"""
         if not sessions:
             raise DataError("回测区间内没有交易日")
+        if actions is None:
+            raise TypeError(
+                "actions 必须显式传入公司行动处理器；"
+                "空事件请使用 CorporateActionProcessor(())"
+            )
         self.reader = reader
         self.config = config
         self.strategy = strategy
@@ -51,7 +56,7 @@ class BacktestEngine:
         self.clock = Clock()
         self.portfolio = Portfolio(config.initial_cash)
         self.broker = SimulatedBroker(config)
-        self.actions = actions or CorporateActionProcessor(())
+        self.actions = actions
         self.actions.set_sessions(
             sessions, start_date=config.start_date, end_date=config.end_date
         )
