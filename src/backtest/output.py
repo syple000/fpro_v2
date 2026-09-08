@@ -22,6 +22,7 @@ _ORDER_SCHEMA = pa.schema(
         pa.field("quantity", pa.int64(), nullable=False),
         pa.field("submitted_at", _TIMESTAMP, nullable=False),
         pa.field("target_weight", pa.float64()),
+        pa.field("sid", pa.int64()),
     ]
 )
 _ORDER_UPDATE_SCHEMA = pa.schema(
@@ -49,6 +50,7 @@ _FILL_SCHEMA = pa.schema(
         pa.field("stamp_tax", pa.float64(), nullable=False),
         pa.field("transfer_fee", pa.float64(), nullable=False),
         pa.field("slippage_cost", pa.float64(), nullable=False),
+        pa.field("sid", pa.int64()),
     ]
 )
 _EQUITY_SCHEMA = pa.schema(

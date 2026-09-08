@@ -118,6 +118,7 @@ class CorporateActionProcessor:
                     cash_dividend=row.get("cash_dividend"),
                     cash_dividend_before_tax=row.get("cash_dividend_before_tax"),
                     stock_dividend=stock_dividend,
+                    sid=row.get("sid"),
                 )
             )
         processor = cls(actions)
@@ -141,7 +142,7 @@ class CorporateActionProcessor:
         self._record_before_start.clear()
         for action in self._ex.get(at.date(), ()):
             broker.cancel_symbol(
-                action.symbol,
+                action.sid if action.sid is not None else action.symbol,
                 OrderReason.CORPORATE_ACTION,
                 at,
             )
@@ -178,7 +179,9 @@ class CorporateActionProcessor:
             self._capture_entitlement(action, portfolio)
 
     def _capture_entitlement(self, action: CorporateAction, portfolio: Portfolio) -> None:
-        entitlement = portfolio.capture_entitlement(action.action_id, action.symbol)
+        entitlement = portfolio.capture_entitlement(
+            action.action_id, action.sid if action.sid is not None else action.symbol
+        )
         # 无持仓的公司行动与账户无关；记住零权益，避免后来买入补得旧权益。
         if entitlement > 0:
             self._validate(action)
@@ -206,7 +209,7 @@ class CorporateActionProcessor:
         if action.stock_dividend > 0:
             portfolio.add_stock_dividend(
                 action.action_id,
-                action.symbol,
+                action.sid if action.sid is not None else action.symbol,
                 entitlement,
                 action.stock_dividend,
             )
@@ -273,7 +276,9 @@ class CorporateActionProcessor:
         entitlement = portfolio.entitlement(action.action_id)
         if entitlement is not None:
             return entitlement
-        holding = portfolio.account_snapshot().holding(action.symbol)
+        holding = portfolio.account_snapshot().holding(
+            action.sid if action.sid is not None else action.symbol
+        )
         if holding is not None and holding.quantity > 0:
             raise CorporateActionError(
                 f"{action.action_id} 缺少股权登记日持仓快照"

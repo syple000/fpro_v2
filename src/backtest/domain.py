@@ -73,6 +73,7 @@ class OrderRequest:
     side: Side
     quantity: int
     target_weight: float | None = None
+    sid: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -85,6 +86,7 @@ class Order:
     quantity: int
     submitted_at: datetime
     target_weight: float | None = None
+    sid: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -120,6 +122,7 @@ class Fill:
     stamp_tax: float
     transfer_fee: float
     slippage_cost: float
+    sid: int | None = None
 
     @property
     def total_fee(self) -> float:
@@ -135,6 +138,7 @@ class Holding:
     quantity: int
     sellable_quantity: int
     market_value: float
+    sid: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -147,9 +151,10 @@ class AccountSnapshot:
     total_equity: float
     holdings: tuple[Holding, ...]
 
-    def holding(self, symbol: str) -> Holding | None:
+    def holding(self, symbol: str | int) -> Holding | None:
         """按证券代码读取持仓；没有持仓时返回 None。"""
-        return next((holding for holding in self.holdings if holding.symbol == symbol), None)
+        return next((holding for holding in self.holdings
+                     if holding.symbol == symbol or holding.sid == symbol), None)
 
 
 @dataclass(frozen=True, slots=True)
@@ -179,6 +184,7 @@ class CorporateAction:
     cash_dividend: float | None
     cash_dividend_before_tax: float | None
     stock_dividend: float
+    sid: int | None = None
 
 
 @dataclass(frozen=True, slots=True)

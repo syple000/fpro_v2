@@ -266,6 +266,8 @@
 
 ### BT-025：更码没有稳定证券身份
 
+- **状态**：已实现并回归验证（2026-09-08）。通过可选本地 Parquet 启用持久 `sid`；日线、分钟、因子、财报、分红及生命周期先归一来源别名，账户使用稳定身份，策略与成交输出按模拟日期显示代码。兼容的未配置模式不猜更码；真实映射及官方生效日仍须由数据维护者提供，本次未生成推测的真实证券映射。
+- **验证**：`test_security_identity.py` 的 18 项回归覆盖全旧/全新/混合来源、纯更码权益不变、跨更码成交、旧新重复配置、跨更码派息及红股、重复事件稳定 ID、财报 PIT、Tushare/QMT 复权跨别名连接、未来冲突不影响较早 PIT 查询、真实退市、冲突记录及缺映射错误。本项完成时全库 491 项通过，Ruff 与定向 Pyright 通过。
 - **位置**：[domain.py](../src/backtest/domain.py)、[portfolio.py](../src/backtest/portfolio.py)、[orders.py](../src/backtest/orders.py)、[engine.py](../src/backtest/engine.py)、[corporate_actions.py](../src/backtest/corporate_actions.py) 和 [adapters.py](../src/market_data/adapters.py)。
 - **现状**：行情、目标权重、订单、持仓、权益及公司行动使用代码字符串关联；没有稳定证券 ID、历史代码映射和跨代码关联机制。
 - **构造复现**：持有 `430047.BJ` 1,000 股，每股 10 元；主数据只返回 `920047.BJ`。日初旧代码订单以 `DELISTED` 撤销，旧持仓归零，新代码没有承接持仓，总权益从 10,000,000 降为 9,990,000。这证明当前代码路径可以误核销，不证明本地真实回测已经发生该损失。
@@ -288,7 +290,7 @@
 
 ## 4. 证券更码的简化方案
 
-方案状态：**本轮讨论确定的修复方向，尚未实施**。采用“稳定整数 `sid` + 一张本地 Parquet 代码历史表 + 一个映射模块”，继续使用现有数据读取与回测流水线。
+方案状态：**已实施（2026-09-08），通过本地映射显式启用**。采用“稳定整数 `sid` + 一张本地 Parquet 代码历史表 + 一个映射模块”，继续使用现有数据读取与回测流水线。启用方式见 [证券代码历史](market_data.md#证券代码历史)；实际映射和官方生效日不从源行情或代码前缀猜测。
 
 核心原则与 LEAN 的稳定证券标识、Zipline 的持久整数 `sid` 一致：证券身份保持稳定，交易代码可以随时间变化。这里借鉴的是身份模型，不要求照搬这些框架的全部数据架构。参见 [LEAN Security Identifiers](https://www.quantconnect.com/docs/v2/writing-algorithms/key-concepts/security-identifiers) 和 [Zipline API](https://zipline.ml4trading.io/appendix.html)。
 

@@ -17,6 +17,7 @@ from backtest.metrics import calculate_metrics
 from backtest.output import write_results
 from backtest.strategy import Strategy
 from market_data import DataCatalog, DataReader, SourceConfig
+from market_data.identity import SecurityCodeHistory
 
 
 def default_source_config() -> SourceConfig:
@@ -159,6 +160,8 @@ def run_from_storage(
     with DataCatalog(
         tushare_root=options.tushare_root,
         qmt_root=options.qmt_root,
+        identities=(SecurityCodeHistory.load(options.security_code_history)
+                    if options.security_code_history is not None else None),
     ) as catalog:
         reader = DataReader(
             catalog, sources=routes, max_result_rows=50_000_000,

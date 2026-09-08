@@ -39,10 +39,12 @@ class BacktestEngine:
             raise ConfigurationError("DataReader 与 BacktestConfig 的 bar_availability 必须一致")
         if actions is None:
             raise TypeError(
-                "actions 必须显式传入公司行动处理器；"
-                "空事件请使用 CorporateActionProcessor(())"
+                "actions 必须显式传入公司行动处理器；空事件请使用 CorporateActionProcessor(())"
             )
         self.reader = reader
+        self.identities = getattr(reader, "identities", None)
+        if self.identities is not None and config.symbols is not None:
+            self.identities.canonical_symbols(config.symbols)
         self.config = config
         self.strategy = strategy
         market_events = market_timeline(sessions, config.frequency, config.market)
@@ -56,18 +58,16 @@ class BacktestEngine:
             )
         )
         self.clock = Clock()
-        self.portfolio = Portfolio(config.initial_cash)
-        self.broker = SimulatedBroker(config)
+        self.portfolio = Portfolio(config.initial_cash, identities=self.identities)
+        self.broker = SimulatedBroker(config, identities=self.identities)
         self.actions = actions
-        self.actions.set_sessions(
-            sessions, start_date=config.start_date, end_date=config.end_date
-        )
+        self.actions.set_sessions(sessions, start_date=config.start_date, end_date=config.end_date)
         self._equity: list[EquitySnapshot] = []
         self._bar_count = 0
         self._events_with_bars = 0
         self._sessions_with_bars: set[date] = set()
         self._symbols_with_bars: set[str] = set()
-        self._last_bar_starts: dict[str, datetime] = {}
+        self._last_bar_starts: dict[str | int, datetime] = {}
         self._last_market_interval_start: datetime | None = None
         self._last_price_check: datetime | None = None
 
@@ -119,9 +119,7 @@ class BacktestEngine:
                 sessions_without_bars=tuple(
                     row.session for row in equity if row.session not in self._sessions_with_bars
                 ),
-                requested_symbols_without_bars=tuple(
-                    sorted(set(self.config.symbols or ()) - self._symbols_with_bars)
-                ),
+                requested_symbols_without_bars=self._missing_requested_symbols(),
             ),
         )
 
@@ -129,32 +127,49 @@ class BacktestEngine:
         """日初解锁 T+1，处理公司行动，并核销退市持仓。"""
         self.portfolio.unlock_t1()
         self.actions.on_session_start(at, self.portfolio, self.broker)
+        self._check_lifecycles(at, data)
+        self.portfolio.set_session(at.date())
+        self.broker.set_session(at.date())
 
-        held = {holding.symbol for holding in self.portfolio.account_snapshot().holdings}
-        managed = set(self.broker.pending_symbols) | held
+    def _check_lifecycles(self, at: datetime, data: DataView) -> None:
+        """先以稳定身份确认生命周期，再解析当日展示代码。"""
+        identity = self.portfolio.identity
+        held = {identity(holding.symbol) for holding in self.portfolio.account_snapshot().holdings}
+        managed = {identity(order.symbol) for order in self.broker.pending_orders} | held
         if not managed:
             return
-        missing = managed - listed_symbols(data)
+        missing = managed - {identity(symbol) for symbol in listed_symbols(data)}
         if not missing:
             return
-        rows = self.reader.security_lifecycles(symbols=tuple(sorted(missing))).to_pylist()
-        lifecycles = {row["symbol"]: row for row in rows}
+        symbols = tuple(
+            self.identities.aliases(key)[0] if self.identities is not None else str(key)
+            for key in sorted(missing)
+        )
+        rows = self.reader.security_lifecycles(symbols=symbols).to_pylist()
+        lifecycles = {identity(row["symbol"]): row for row in rows}
         if len(lifecycles) != len(rows):
             raise DataError("证券生命周期存在冲突记录")
-        for symbol in sorted(missing):
-            lifecycle = lifecycles.get(symbol)
+        for key in sorted(missing):
+            symbol = self.identities.aliases(key)[-1] if self.identities is not None else str(key)
+            lifecycle = lifecycles.get(key)
             if lifecycle is None:
                 raise DataError(f"{symbol} 主数据缺失，无法确认退市；请检查证券代码映射")
             delisting_date = lifecycle["delisting_date"]
             if delisting_date is None or delisting_date > at.date():
                 raise DataError(f"{symbol} 不在上市集合中，但没有已生效的退市事实")
-            if symbol in held and self.config.delisting_policy == "error":
+            if key in held and self.config.delisting_policy == "error":
                 raise CorporateActionError(
                     f"{symbol} 于 {delisting_date} 退市，当前未实现退市经济结算；"
                     "如接受零价值核销假设，请显式配置 delisting_policy='write_off'"
                 )
-            self.broker.cancel_symbol(symbol, OrderReason.DELISTED, at)
-            self.portfolio.write_off(symbol)
+            self.broker.cancel_symbol(key, OrderReason.DELISTED, at)
+            self.portfolio.write_off(key)
+
+    def _missing_requested_symbols(self) -> tuple[str, ...]:
+        identity = self.portfolio.identity
+        observed = {identity(symbol) for symbol in self._symbols_with_bars}
+        requested = {identity(symbol): symbol for symbol in self.config.symbols or ()}
+        return tuple(sorted(symbol for key, symbol in requested.items() if key not in observed))
 
     def _process_bar(self, event: Event, data: DataView) -> None:
         """每根 Bar 都撮合和估值，与策略是否调用无关。"""
@@ -162,17 +177,19 @@ class BacktestEngine:
             self._last_market_interval_start = event.interval_start
         bars = self._read_bars(event, data)
         new_bars = {
-            symbol: bar for symbol, bar in bars.items()
-            if symbol not in self._last_bar_starts
-            or bar.interval_start > self._last_bar_starts[symbol]
+            symbol: bar
+            for symbol, bar in bars.items()
+            if self.portfolio.identity(symbol) not in self._last_bar_starts
+            or bar.interval_start > self._last_bar_starts[self.portfolio.identity(symbol)]
         }
         if new_bars:
             self._bar_count += len(new_bars)
             self._events_with_bars += 1
-            self._sessions_with_bars.add(event.session)
+            self._sessions_with_bars.update(bar.interval_start.date() for bar in new_bars.values())
             self._symbols_with_bars.update(new_bars)
             self._last_bar_starts.update(
-                (symbol, bar.interval_start) for symbol, bar in new_bars.items()
+                (self.portfolio.identity(symbol), bar.interval_start)
+                for symbol, bar in new_bars.items()
             )
         prices: dict[str, float] = {}
         for symbol, bar in bars.items():
@@ -187,7 +204,8 @@ class BacktestEngine:
             fills = self.broker.match_bar(
                 event=event,
                 bars={
-                    symbol: bar for symbol, bar in bars.items()
+                    symbol: bar
+                    for symbol, bar in bars.items()
                     if bar.interval_start == event.interval_start
                 },
                 account=self.portfolio.account_snapshot(),
@@ -198,7 +216,8 @@ class BacktestEngine:
 
         self.portfolio.mark_to_market(prices)
         self._last_price_check = event.at
-        for symbol, position in self.portfolio.positions.items():
+        for position in self.portfolio.positions.values():
+            symbol = position.symbol
             if (
                 symbol in bars
                 and self._last_market_interval_start is not None
@@ -213,8 +232,23 @@ class BacktestEngine:
         weights = self.strategy.on_event(context)
         if weights is None:
             return
+        if self.identities is not None:
+            normalized: dict[int, float] = {}
+            for symbol, weight in weights.items():
+                validate_target_weights({symbol: weight})
+                sid = self.identities.sid(symbol)
+                if sid in normalized and normalized[sid] != weight:
+                    raise ValueError(f"同一 sid {sid} 的别名目标权重冲突")
+                normalized[sid] = weight
+            weights = {
+                self.identities.code_at(sid, event.session): weight
+                for sid, weight in normalized.items()
+            }
         targets = validate_target_weights(weights)
-        if self.config.symbols is not None and set(targets) - set(self.config.symbols):
+        allowed = self.config.symbols
+        if allowed is not None and self.identities is not None:
+            allowed = self.identities.symbols_at(allowed, event.session)
+        if allowed is not None and set(targets) - set(allowed):
             raise ValueError("目标组合包含本次回测 symbols 之外的证券")
         symbols = tuple(symbol for symbol, weight in targets.items() if weight > 0)
         rows = (
@@ -257,7 +291,7 @@ class BacktestEngine:
             symbol = row["symbol"]
             if row["interval_start"].date() < self.config.start_date:
                 continue
-            previous = self._last_bar_starts.get(symbol)
+            previous = self._last_bar_starts.get(self.portfolio.identity(symbol))
             if previous is not None and row["interval_start"] < previous:
                 continue
             if symbol in bars:

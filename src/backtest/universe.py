@@ -30,6 +30,9 @@ def select_stock_universe(
         fields=("exchange", "listing_date"),
     ).table.to_pylist()
     allowed = set(allowed_symbols) if allowed_symbols is not None else None
+    identities = getattr(data, "identities", None)
+    if allowed is not None and identities is not None:
+        allowed = set(identities.symbols_at(allowed, data.as_of.date()))
     stocks = [
         row
         for row in rows

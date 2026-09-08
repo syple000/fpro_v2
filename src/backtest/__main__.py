@@ -32,6 +32,7 @@ def main() -> None:
         options=RunOptions(
             tushare_root=arguments.tushare_dir,
             qmt_root=arguments.qmt_dir,
+            security_code_history=arguments.security_code_history,
             output_dir=arguments.output_dir,
         ),
     )
@@ -99,6 +100,11 @@ def _parser() -> argparse.ArgumentParser:
         type=Path,
         default=Path("dataset/qmt"),
         help="QMT 数据根目录",
+    )
+    parser.add_argument(
+        "--security-code-history",
+        type=Path,
+        help="可选 security_code_history.parquet；启用持久 sid 和历史交易代码",
     )
     parser.add_argument(
         "--output-dir",

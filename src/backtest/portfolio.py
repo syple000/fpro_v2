@@ -9,6 +9,7 @@ from datetime import date
 
 from backtest.domain import AccountSnapshot, EquitySnapshot, Fill, Holding, Side
 from backtest.errors import AccountError, DataError
+from market_data.identity import SecurityCodeHistory, SecurityMappingError
 
 _EPSILON = 1e-6
 
@@ -23,6 +24,7 @@ class Position:
     pending_listing_quantity: int = 0
     last_price: float | None = None
     stale_price: bool = False
+    sid: int | None = None
 
     @property
     def market_value(self) -> float:
@@ -33,17 +35,21 @@ class Position:
 class Portfolio:
     """账户只接受成交和公司行动，不参与撮合决策。"""
 
-    def __init__(self, initial_cash: float) -> None:
+    def __init__(
+        self, initial_cash: float, *, identities: SecurityCodeHistory | None = None
+    ) -> None:
         """用初始现金建立无持仓、无应收款的账户。"""
         if not math.isfinite(initial_cash) or initial_cash <= 0:
             raise ValueError("initial_cash 必须是有限正数")
         self.cash = float(initial_cash)
-        self.positions: dict[str, Position] = {}
+        self.identities = identities
+        self._session: date | None = None
+        self.positions: dict[int | str, Position] = {}
         # 应收股利计入权益但尚不可用；权益数量按公司行动 ID 固定在登记日。
         self._receivables: dict[str, float] = {}
         self._entitlements: dict[str, int] = {}
         # 红股在除权日计入总持仓，到上市日才转为可卖。
-        self._pending_stock: dict[str, tuple[str, int]] = {}
+        self._pending_stock: dict[str, tuple[int | str, int]] = {}
         self._last_equity = self.cash
 
     @property
@@ -61,9 +67,37 @@ class Portfolio:
         """现金、应收股利和证券市值之和。"""
         return self.cash + self.dividend_receivable + self.market_value
 
-    def position(self, symbol: str) -> Position:
+    def identity(self, symbol: str | int) -> int | str:
+        if self.identities is None:
+            return symbol
+        if isinstance(symbol, str):
+            return self.identities.sid(symbol)
+        self.identities.aliases(symbol)
+        return symbol
+
+    def set_session(self, session: date) -> None:
+        """更码只更新展示代码；持仓字典及登记权益始终使用原 sid。"""
+        self._session = session
+        if self.identities is not None:
+            for position in self.positions.values():
+                if position.quantity == 0:
+                    continue
+                assert position.sid is not None
+                position.symbol = self.identities.code_at(position.sid, session)
+
+    def position(self, symbol: str | int) -> Position:
         """读取内部持仓；不存在时创建一个零持仓。"""
-        return self.positions.setdefault(symbol, Position(symbol))
+        key = self.identity(symbol)
+        if key not in self.positions:
+            if self.identities is None:
+                self.positions[key] = Position(str(symbol))
+            else:
+                assert isinstance(key, int)
+                code = self.identities.aliases(key)[0]
+                if self._session is not None:
+                    code = self.identities.code_at(key, self._session)
+                self.positions[key] = Position(code, sid=key)
+        return self.positions[key]
 
     def account_snapshot(self) -> AccountSnapshot:
         """创建策略和 Broker 使用的不可变账户快照。"""
@@ -73,6 +107,7 @@ class Portfolio:
                 quantity=position.quantity,
                 sellable_quantity=position.sellable_quantity,
                 market_value=position.market_value,
+                sid=position.sid,
             )
             for position in sorted(self.positions.values(), key=lambda item: item.symbol)
             if position.quantity > 0
@@ -111,7 +146,15 @@ class Portfolio:
         ):
             raise AccountError("成交金额和费用必须有限且非负")
         # 先验证全部约束，再提交现金和持仓；失败时不会创建持仓或改动账户。
-        position = self.positions.get(fill.symbol) or Position(fill.symbol)
+        if (
+            self.identities is not None and fill.sid is not None
+            and self.identities.sid(fill.symbol) != fill.sid
+        ):
+            raise SecurityMappingError(f"成交 {fill.fill_id} 的 sid 与代码不一致")
+        key = self.identity(fill.sid if fill.sid is not None else fill.symbol)
+        position = self.positions.get(key) or Position(
+            fill.symbol, sid=key if isinstance(key, int) else None
+        )
         if fill.side is Side.BUY:
             cost = fill.notional + fill.total_fee
             if cost > self.cash + _EPSILON:
@@ -126,7 +169,7 @@ class Portfolio:
             if new_cash < -_EPSILON:
                 raise AccountError("卖出成交收入及现金不足以支付费用")
         self.cash = max(0.0, new_cash)
-        self.positions[fill.symbol] = position
+        self.positions[key] = position
         if fill.side is Side.BUY:
             position.quantity += fill.quantity
             # 当日买入不增加 sellable_quantity，从而自然实现 T+1。
@@ -140,10 +183,16 @@ class Portfolio:
 
     def mark_to_market(self, prices: Mapping[str, float]) -> None:
         """用当前批次收盘价估值；缺失行情时沿用旧价并标记 stale。"""
+        normalized: dict[str | int, float] = {}
+        for symbol, price in prices.items():
+            key = self.identity(symbol)
+            if key in normalized and normalized[key] != price:
+                raise DataError(f"同一证券 {key} 的别名估值价格冲突")
+            normalized[key] = price
         for symbol, position in self.positions.items():
             if position.quantity == 0:
                 continue
-            price = prices.get(symbol)
+            price = normalized.get(symbol)
             if price is None:
                 if position.last_price is None:
                     raise DataError(f"持仓 {symbol} 没有估值价格")
@@ -155,10 +204,10 @@ class Portfolio:
             position.stale_price = False
         self.assert_valid()
 
-    def capture_entitlement(self, action_id: str, symbol: str) -> int:
+    def capture_entitlement(self, action_id: str, symbol: str | int) -> int:
         """在股权登记日冻结参与本次公司行动的持股数量。"""
         if action_id not in self._entitlements:
-            position = self.positions.get(symbol)
+            position = self.positions.get(self.identity(symbol))
             self._entitlements[action_id] = position.quantity if position else 0
         return self._entitlements[action_id]
 
@@ -183,7 +232,7 @@ class Portfolio:
     def add_stock_dividend(
         self,
         action_id: str,
-        symbol: str,
+        symbol: str | int,
         entitlement: int,
         ratio: float,
     ) -> int:
@@ -194,7 +243,7 @@ class Portfolio:
         position = self.position(symbol)
         position.quantity += quantity
         position.pending_listing_quantity += quantity
-        self._pending_stock[action_id] = (symbol, quantity)
+        self._pending_stock[action_id] = (self.identity(symbol), quantity)
         self.assert_valid()
         return quantity
 
@@ -211,9 +260,9 @@ class Portfolio:
         position.sellable_quantity += quantity
         self.assert_valid()
 
-    def write_off(self, symbol: str) -> None:
+    def write_off(self, symbol: str | int) -> None:
         """证券退市时按零价值核销持仓。"""
-        position = self.positions.get(symbol)
+        position = self.positions.get(self.identity(symbol))
         if position is None:
             return
         position.quantity = 0

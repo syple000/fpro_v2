@@ -906,6 +906,41 @@ uv run market-data-test \
 `dataset/test/data_reader`，重复运行会覆盖同名测试结果文件。单个查询失败不会阻止后续方法继续
 执行；失败项写入 manifest 的 `errors`，删除对应的旧 CSV，并使命令最终返回非零状态。
 
+## 证券代码历史
+
+有纯更码证券时，先提供可靠资料维护的 `security_code_history.parquet`，再打开数据目录：
+
+```python
+from market_data import DataCatalog, DataReader, SecurityCodeHistory
+
+identities = SecurityCodeHistory.load("dataset/security_code_history.parquet")
+catalog = DataCatalog(
+    tushare_root="dataset/tushare",
+    qmt_root="dataset/qmt",
+    identities=identities,
+)
+reader = DataReader(catalog, sources=routes)
+```
+
+表字段固定为 `sid: int64`、`code: string`、`valid_from: date32`、
+`valid_to: date32`。有效区间包含起日、不包含止日；末代码通常没有止日。
+`sid` 由资料维护者一次分配并持久保存，不从查询行号生成。只把同一证券的纯更码放到
+同一个 `sid`；合并、换股等经济权益变更需要独立业务模型。这里不提供推测的真实更码日。
+
+原始 Parquet 与 `catalog.connection` 的原始视图仍保留来源代码。内置适配查询先将同一
+`sid` 的来源别名归一，再做历史条数截取、财报版本选择和行情/因子连接；因此新代码回标
+全部历史也能查询旧历史。同一视图返回的 `symbol` 是 `DataView.as_of` 当日的交易代码，
+历史窗口内统一使用该代码，额外身份列 `sid` 始终返回（包括 `fields=()`）。要查看某一天
+的历史交易代码，可用 `identities.code_at(sid, day)`；原始来源代码可查原始存储。
+
+公告依旧按原来的 PIT 时钟过滤。账户实施事实与生命周期入口附带 `sid`，不根据未来时点
+选择展示代码。缺映射、代码归属冲突、代码有效期冲突/空档以及同一身份的冲突行情记录会
+明确报 `SecurityMappingError`；不同别名不能覆盖冲突数据。
+
+映射只加载一次，`snapshot_id` 是按固定顺序序列化的记录哈希；数据查询和 `refresh()`
+不会重新加载映射文件。当前只支持内置 Tushare/QMT 适配器。未传入映射时保持原来的
+单代码兼容接口，不会猜测哪些证券曾更码；需要更码连续性的运行必须显式配置完整映射。
+
 ## 验收条件
 
 最重要的性质是：

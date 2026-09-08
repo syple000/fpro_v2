@@ -1,5 +1,6 @@
 from datetime import date, time
 from pathlib import Path
+from typing import Literal
 
 import pytest
 
@@ -24,7 +25,7 @@ class IdleStrategy(Strategy):
 def test_qmt_end_labels_match_auction_lunch_and_close(
     tmp_path: Path,
     frequency: str,
-    period: str,
+    period: Literal["1m", "5m"],
     first_end: int,
 ) -> None:
     session = date(2026, 1, 5)

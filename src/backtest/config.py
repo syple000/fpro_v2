@@ -128,9 +128,16 @@ class RunOptions:
     # None 表示只返回内存结果，不写结果文件。
     output_dir: Path | None = None
 
+    # 可靠资料维护的持久证券代码历史；None 保持单代码兼容模式。
+    security_code_history: Path | None = None
+
     def __post_init__(self) -> None:
         """统一把外部路径转换成展开后的绝对路径。"""
         object.__setattr__(self, "tushare_root", self.tushare_root.expanduser().resolve())
         object.__setattr__(self, "qmt_root", self.qmt_root.expanduser().resolve())
+        if self.security_code_history is not None:
+            object.__setattr__(
+                self, "security_code_history", self.security_code_history.expanduser().resolve()
+            )
         if self.output_dir is not None:
             object.__setattr__(self, "output_dir", self.output_dir.expanduser().resolve())

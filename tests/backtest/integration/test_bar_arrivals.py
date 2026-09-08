@@ -15,7 +15,7 @@ from backtest.engine import BacktestEngine
 from backtest.errors import ConfigurationError
 from backtest.runner import default_source_config
 from backtest.strategy import Strategy, StrategyContext
-from market_data import DataCatalog, DataReader
+from market_data import CodeInterval, DataCatalog, DataReader, SecurityCodeHistory
 from qmt_protocol import BarQuote, HistoryBar, SequencedQuote
 from qmt_receiver import QmtDataStore
 from tushare_data import TABLE_SCHEMAS, TushareDataStore
@@ -37,41 +37,87 @@ class ObservePrices(Strategy):
 
 def quote(seq: int, start: time, received: time, close: float) -> SequencedQuote:
     return SequencedQuote(
-        seq=seq, code=SYMBOL, period="1m", source="market", subscription="SZ",
+        seq=seq,
+        code=SYMBOL,
+        period="1m",
+        source="market",
+        subscription="SZ",
         received_at=int(at_time(DAY, received).timestamp() * 1_000_000),
         quote=BarQuote(
             time=int(at_time(DAY, start).timestamp() * 1_000_000),
-            open=10, high=max(10, close), low=min(10, close), close=close, volume=1000,
+            open=10,
+            high=max(10, close),
+            low=min(10, close),
+            close=close,
+            volume=1000,
         ),
     )
 
 
 @contextmanager
 def data_reader(
-    tmp_path: Path, quotes: Sequence[SequencedQuote], mode: Literal["historical", "received"]
+    tmp_path: Path,
+    quotes: Sequence[SequencedQuote],
+    mode: Literal["historical", "received"],
+    *,
+    identities: SecurityCodeHistory | None = None,
 ) -> Iterator[DataReader]:
     with TushareDataStore(tmp_path / "tushare") as store:
-        store.write("stock_basic", pa.Table.from_pylist([{
-            "ts_code": SYMBOL, "exchange": "SZSE", "curr_type": "CNY",
-            "list_date": date(2000, 1, 1),
-        }], schema=TABLE_SCHEMAS["stock_basic"]))
-        store.write("stk_limit", pa.Table.from_pylist([{
-            "ts_code": SYMBOL, "trade_date": DAY, "up_limit": 20, "down_limit": 1,
-        }], schema=TABLE_SCHEMAS["stk_limit"]))
+        store.write(
+            "stock_basic",
+            pa.Table.from_pylist(
+                [
+                    {
+                        "ts_code": SYMBOL,
+                        "exchange": "SZSE",
+                        "curr_type": "CNY",
+                        "list_date": date(2000, 1, 1),
+                    }
+                ],
+                schema=TABLE_SCHEMAS["stock_basic"],
+            ),
+        )
+        store.write(
+            "stk_limit",
+            pa.Table.from_pylist(
+                [
+                    {
+                        "ts_code": SYMBOL,
+                        "trade_date": DAY,
+                        "up_limit": 20,
+                        "down_limit": 1,
+                    }
+                ],
+                schema=TABLE_SCHEMAS["stk_limit"],
+            ),
+        )
         store._mark_sync_all_completed("suspend_d", DAY, DAY)
     with QmtDataStore(tmp_path / "qmt") as store:
         store.append_quotes(quotes)
-    with DataCatalog(tushare_root=tmp_path / "tushare", qmt_root=tmp_path / "qmt") as catalog:
+    with DataCatalog(
+        tushare_root=tmp_path / "tushare",
+        qmt_root=tmp_path / "qmt",
+        identities=identities,
+    ) as catalog:
         yield DataReader(catalog, sources=default_source_config(), bar_availability=mode)
 
 
 def make_engine(reader: DataReader, *, holding: bool = False) -> BacktestEngine:
     config = BacktestConfig(
-        DAY, DAY, frequency="1m", symbols=(SYMBOL,), market=HOURS,
-        volume_limit=None, slippage_bps=0, bar_availability=reader.bar_availability,
+        DAY,
+        DAY,
+        frequency="1m",
+        symbols=(SYMBOL,),
+        market=HOURS,
+        volume_limit=None,
+        slippage_bps=0,
+        bar_availability=reader.bar_availability,
     )
     engine = BacktestEngine(
-        reader=reader, config=config, sessions=(DAY,), strategy=ObservePrices(),
+        reader=reader,
+        config=config,
+        sessions=(DAY,),
+        strategy=ObservePrices(),
         actions=CorporateActionProcessor(()),
     )
     if holding:
@@ -85,7 +131,9 @@ def test_historical_mode_uses_complete_bar_at_end_even_if_received_later(tmp_pat
     record = quote(1, time(9, 30), time(9, 31, 30), 11)
     with data_reader(tmp_path, [record], "historical") as reader:
         before = reader.at(at_time(DAY, time(9, 30, 30))).market.bars(
-            symbols=(SYMBOL,), frequency="1m", count=1,
+            symbols=(SYMBOL,),
+            frequency="1m",
+            count=1,
         )
         assert before.table.num_rows == 0
         engine = make_engine(reader)
@@ -108,6 +156,24 @@ def test_late_bar_updates_current_valuation_without_historical_fill(tmp_path: Pa
 
     assert result.fills == ()
     assert result.order_updates[-1].reason is OrderReason.MISSING_OPEN
+    assert result.equity[-1].market_value == 11_000
+    assert result.equity[-1].stale_position_count == 1
+    assert result.market_data_coverage is not None
+    assert result.market_data_coverage.bar_count == 1
+
+
+def test_late_bar_keeps_stale_marker_with_stable_security_identity(tmp_path: Path) -> None:
+    identities = SecurityCodeHistory(
+        [
+            CodeInterval(42, SYMBOL, date(2000, 1, 1), DAY),
+            CodeInterval(42, "000002.SZ", DAY),
+        ]
+    )
+    record = quote(1, time(9, 30), time(9, 31, 30), 11)
+    with data_reader(tmp_path, [record], "received", identities=identities) as reader:
+        engine = make_engine(reader, holding=True)
+        result = engine.run()
+    assert engine.portfolio.position(42).symbol == "000002.SZ"
     assert result.equity[-1].market_value == 11_000
     assert result.equity[-1].stale_position_count == 1
     assert result.market_data_coverage is not None
@@ -140,14 +206,33 @@ def test_received_last_bar_can_arrive_between_market_close_and_session_end(tmp_p
 
 def test_received_mode_excludes_downloaded_bars_without_receive_times(tmp_path: Path) -> None:
     with QmtDataStore(tmp_path / "qmt") as store:
-        store.write_intraday({SYMBOL: [HistoryBar(
-            index=20260105093100, open=10, high=11, low=10, close=11, volume=100,
-        )]}, "1m", "none")
+        store.write_intraday(
+            {
+                SYMBOL: [
+                    HistoryBar(
+                        index=20260105093100,
+                        open=10,
+                        high=11,
+                        low=10,
+                        close=11,
+                        volume=100,
+                    )
+                ]
+            },
+            "1m",
+            "none",
+        )
     with DataCatalog(tushare_root=tmp_path / "tushare", qmt_root=tmp_path / "qmt") as catalog:
         reader = DataReader(catalog, sources=default_source_config(), bar_availability="received")
-        table = reader.at(at_time(DAY, time(9, 32))).market.bars(
-            symbols=(SYMBOL,), frequency="1m", count=1,
-        ).table
+        table = (
+            reader.at(at_time(DAY, time(9, 32)))
+            .market.bars(
+                symbols=(SYMBOL,),
+                frequency="1m",
+                count=1,
+            )
+            .table
+        )
     assert table.num_rows == 0
 
 
@@ -157,21 +242,43 @@ def test_engine_rejects_mismatched_reader_availability(tmp_path: Path) -> None:
         pytest.raises(ConfigurationError, match="bar_availability 必须一致"),
     ):
         BacktestEngine(
-            reader=reader, config=BacktestConfig(DAY, DAY, frequency="1m"),
-            sessions=(DAY,), strategy=ObservePrices(), actions=CorporateActionProcessor(()),
+            reader=reader,
+            config=BacktestConfig(DAY, DAY, frequency="1m"),
+            sessions=(DAY,),
+            strategy=ObservePrices(),
+            actions=CorporateActionProcessor(()),
         )
 
 
 def test_latest_bar_uses_normalized_end_time_across_qmt_time_labels(tmp_path: Path) -> None:
     with QmtDataStore(tmp_path / "qmt") as store:
-        store.write_intraday({SYMBOL: [HistoryBar(
-            index=20260105093100, open=10, high=11, low=10, close=11, volume=100,
-        )]}, "1m", "none")
+        store.write_intraday(
+            {
+                SYMBOL: [
+                    HistoryBar(
+                        index=20260105093100,
+                        open=10,
+                        high=11,
+                        low=10,
+                        close=11,
+                        volume=100,
+                    )
+                ]
+            },
+            "1m",
+            "none",
+        )
     record = quote(1, time(9, 31), time(9, 32), 12)
     with data_reader(tmp_path, [record], "historical") as reader:
-        table = reader.at(at_time(DAY, time(9, 32))).market.bars(
-            symbols=(SYMBOL,), frequency="1m", count=1,
-        ).table
+        table = (
+            reader.at(at_time(DAY, time(9, 32)))
+            .market.bars(
+                symbols=(SYMBOL,),
+                frequency="1m",
+                count=1,
+            )
+            .table
+        )
         assert reader.snapshot_metadata()["qmt"] == {
             "bar_availability": "historical",
             "history_time_label": "end",
@@ -183,16 +290,26 @@ def test_latest_bar_uses_normalized_end_time_across_qmt_time_labels(tmp_path: Pa
 
 def test_next_day_arrival_does_not_rewrite_previous_equity_snapshot(tmp_path: Path) -> None:
     following = date(2026, 1, 6)
-    record = quote(1, time(9, 32), time(9, 33), 11).model_copy(update={
-        "received_at": int(at_time(following, time(9, 30)).timestamp() * 1_000_000),
-    })
+    record = quote(1, time(9, 32), time(9, 33), 11).model_copy(
+        update={
+            "received_at": int(at_time(following, time(9, 30)).timestamp() * 1_000_000),
+        }
+    )
     with data_reader(tmp_path, [record], "received") as reader:
         config = BacktestConfig(
-            DAY, following, frequency="1m", symbols=(SYMBOL,), market=HOURS,
-            volume_limit=None, bar_availability="received",
+            DAY,
+            following,
+            frequency="1m",
+            symbols=(SYMBOL,),
+            market=HOURS,
+            volume_limit=None,
+            bar_availability="received",
         )
         engine = BacktestEngine(
-            reader=reader, config=config, sessions=(DAY, following), strategy=ObservePrices(),
+            reader=reader,
+            config=config,
+            sessions=(DAY, following),
+            strategy=ObservePrices(),
             actions=CorporateActionProcessor(()),
         )
         position = engine.portfolio.position(SYMBOL)

@@ -13,6 +13,7 @@ import duckdb
 import pyarrow as pa
 
 from market_data.errors import DataSourceUnavailableError
+from market_data.identity import SecurityCodeHistory, SecurityMappingError
 from qmt_receiver.schemas import TABLE_SCHEMAS as QMT_TABLE_SCHEMAS
 from qmt_receiver.storage import load_sync_ranges
 from tushare_data.schemas import TABLE_SCHEMAS
@@ -35,6 +36,20 @@ _TUSHARE_SYNC_RANGE_SCHEMA = pa.schema(
     ]
 )
 
+# 这些快照表的同一证券/业务时点只能有一条记录。版本表仍由原适配器处理版本。
+_IDENTITY_UNIQUE_KEYS = {
+    ("tushare", "daily"): ("ts_code", "trade_date"),
+    ("tushare", "adj_factor"): ("ts_code", "trade_date"),
+    ("tushare", "daily_basic"): ("ts_code", "trade_date"),
+    ("tushare", "moneyflow"): ("ts_code", "trade_date"),
+    ("tushare", "stk_limit"): ("ts_code", "trade_date"),
+    ("data_internal", "stock_basic"): ("ts_code",),
+    ("qmt", "daily"): ("code", "trade_date", "adjustment"),
+    ("qmt", "intraday"): ("code", "event_time", "period", "adjustment"),
+    ("qmt", "dividend_factors"): ("code", "ex_date"),
+}
+_ALIAS_CONFLICT = "SECURITY_ALIAS_CONFLICT"
+
 
 class DataCatalog:
     """把 Tushare/QMT 当前有效的 Parquet 文件注册为 DuckDB 视图。"""
@@ -44,7 +59,9 @@ class DataCatalog:
         *,
         tushare_root: str | Path,
         qmt_root: str | Path,
+        identities: SecurityCodeHistory | None = None,
     ) -> None:
+        self.identities = identities
         self._sources: dict[str, tuple[Path, Mapping[str, pa.Schema]]] = {
             "tushare": (Path(tushare_root).expanduser().resolve(), TABLE_SCHEMAS),
             "qmt": (Path(qmt_root).expanduser().resolve(), QMT_TABLE_SCHEMAS),
@@ -58,6 +75,13 @@ class DataCatalog:
     def connection(self) -> duckdb.DuckDBPyConnection:
         """返回已注册 `tushare` 和 `qmt` schema 的 DuckDB 连接。"""
         return self._connection
+
+    @property
+    def adapter_connection(self) -> duckdb.DuckDBPyConnection | _IdentityConnection:
+        """适配器先归一来源别名，再执行窗口、版本选择与跨表连接。"""
+        if self.identities is None:
+            return self._connection
+        return _IdentityConnection(self._connection, self.identities)
 
     def refresh(self) -> None:
         """根据最新 Manifest 重新注册原始视图和小型参考表。"""
@@ -104,6 +128,8 @@ class DataCatalog:
             "CREATE OR REPLACE TABLE data_internal.tushare_sync_ranges "
             "AS SELECT * FROM __tushare_sync_ranges"
         )
+        if self.identities is not None:
+            self._register_identity_views()
         sync_ranges = self._connection.execute(
             "SELECT * FROM data_internal.qmt_sync_ranges ORDER BY dataset, code, period, start_date"
         ).to_arrow_table().to_pylist()
@@ -119,6 +145,60 @@ class DataCatalog:
     def snapshot_metadata(self) -> dict[str, Any]:
         """返回上次 refresh 实际加载的文件版本，不重新读取正在变化的 Manifest。"""
         return copy.deepcopy(self._snapshot)
+
+    def _register_identity_views(self) -> None:
+        """原始视图保持来源代码；额外建立固定身份的查询视图。"""
+        assert self.identities is not None
+        aliases = [
+            {"code": row["code"], "canonical": self.identities.canonical(row["code"])}
+            for row in self.identities.table().to_pylist()
+        ]
+        self._connection.register("__security_aliases", pa.Table.from_pylist(aliases))
+        self._connection.execute(
+            "CREATE OR REPLACE TABLE data_internal.security_aliases AS "
+            "SELECT DISTINCT * FROM __security_aliases"
+        )
+        for source in ("tushare", "qmt", "data_internal"):
+            self._connection.execute(f"CREATE SCHEMA IF NOT EXISTS identity_{source}")
+            tables = self._connection.execute(
+                "SELECT table_name FROM information_schema.tables WHERE table_schema = ?",
+                [source],
+            ).fetchall()
+            for (name,) in tables:
+                qualified = f"{source}.{_quote_identifier(name)}"
+                columns = self._connection.execute(f"SELECT * FROM {qualified} LIMIT 0").description
+                names = {column[0] for column in columns}
+                code = "ts_code" if "ts_code" in names else "code" if "code" in names else None
+                if code is None:
+                    select = f"SELECT * FROM {qualified}"
+                else:
+                    replacement = f"coalesce(m.canonical, r.{code}) AS {code}"
+                    if name == "stock_basic" and "symbol" in names:
+                        replacement += (
+                            ", split_part(coalesce(m.canonical, r.ts_code), '.', 1) AS symbol"
+                        )
+                    select = (
+                        f"SELECT DISTINCT r.* REPLACE ({replacement}) FROM {qualified} r "
+                        f"LEFT JOIN data_internal.security_aliases m ON r.{code} = m.code"
+                    )
+                    if source == "data_internal" and name == "stock_basic":
+                        # 来源名称、简称等非业务字段可以不同；只比较账户/股票池使用的事实。
+                        select = (
+                            "SELECT DISTINCT ts_code, exchange, market, curr_type, "
+                            f"list_date, delist_date FROM ({select}) normalized_stocks"
+                        )
+                    keys = _IDENTITY_UNIQUE_KEYS.get((source, name))
+                    if keys is not None:
+                        partition = ", ".join(keys)
+                        select = (
+                            f"SELECT * FROM ({select}) normalized "
+                            f"QUALIFY CASE WHEN count(*) OVER (PARTITION BY {partition}) > 1 "
+                            f"THEN error('{_ALIAS_CONFLICT}: {source}.{name}') ELSE true END"
+                        )
+                self._connection.execute(
+                    f"CREATE OR REPLACE VIEW identity_{source}.{_quote_identifier(name)} "
+                    f"AS {select}"
+                )
 
     def require_available(self, source: str, datasets: str | tuple[str, ...]) -> None:
         """要求最近一次全量检测确认底层数据集可用。"""
@@ -138,6 +218,29 @@ class DataCatalog:
 
     def __exit__(self, *_: object) -> None:
         self.close()
+
+
+class _IdentityConnection:
+    """把内置适配器的固定 schema 路由到归一视图；不修改原始存储。"""
+
+    def __init__(
+        self, connection: duckdb.DuckDBPyConnection, identities: SecurityCodeHistory
+    ) -> None:
+        self._connection = connection
+        self._identities = identities
+
+    def execute(self, query: str, params: object) -> duckdb.DuckDBPyConnection:
+        if isinstance(params, Mapping) and params.get("symbols") is not None:
+            symbols = self._identities.canonical_symbols(params["symbols"])
+            params = {**params, "symbols": list(symbols)}
+        for source in ("tushare", "qmt", "data_internal"):
+            query = query.replace(f"{source}.", f"identity_{source}.")
+        try:
+            return self._connection.execute(query, params)
+        except duckdb.Error as exc:
+            if _ALIAS_CONFLICT in str(exc):
+                raise SecurityMappingError(f"同一证券的源别名存在冲突记录: {exc}") from exc
+            raise
 
 
 def _active_files(table_root: Path) -> list[Path]:

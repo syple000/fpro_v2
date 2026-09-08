@@ -11,7 +11,7 @@ import duckdb
 import pyarrow as pa
 import pyarrow.compute as pc
 
-from market_data.catalog import DataCatalog
+from market_data.catalog import DataCatalog, _IdentityConnection
 from market_data.errors import (
     DataCapabilityNotSupportedError,
     DataSourceUnavailableError,
@@ -310,7 +310,7 @@ class TushareAdapter(DataAdapter):
 
     def __init__(self, catalog: DataCatalog) -> None:
         self._catalog = catalog
-        self._connection = catalog.connection
+        self._connection = catalog.adapter_connection
 
     def daily_bars(
         self,
@@ -1506,7 +1506,7 @@ class QmtAdapter(DataAdapter):
         realtime_time_label: Literal["start", "end"] = "start",
         bar_availability: Literal["historical", "received"] = "historical",
     ) -> None:
-        self._connection = catalog.connection
+        self._connection = catalog.adapter_connection
         if bar_availability not in {"historical", "received"}:
             raise ValueError("bar_availability 必须为 historical 或 received")
         self.bar_availability: Literal["historical", "received"] = bar_availability
@@ -1834,7 +1834,7 @@ class QmtAdapter(DataAdapter):
 
 
 def _fetch(
-    connection: duckdb.DuckDBPyConnection,
+    connection: duckdb.DuckDBPyConnection | _IdentityConnection,
     query: str,
     params: Mapping[str, object],
     schema: pa.Schema | None = None,

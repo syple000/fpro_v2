@@ -10,6 +10,7 @@ from market_data.errors import (
     DataSourceNotConfiguredError,
     DataSourceUnavailableError,
 )
+from market_data.identity import CodeInterval, SecurityCodeHistory, SecurityMappingError
 from market_data.protocols import DataAdapter
 from market_data.reader import ALL_SYMBOLS, DataReader, DataView
 from models import QueryResult
@@ -28,4 +29,7 @@ __all__ = [
     "DataView",
     "QueryResult",
     "SourceConfig",
+    "CodeInterval",
+    "SecurityCodeHistory",
+    "SecurityMappingError",
 ]

@@ -103,7 +103,7 @@ def test_empty_and_populated_results_have_identical_business_schemas(tmp_path) -
     orders = pq.read_table(tmp_path / "empty" / "orders.parquet")
     fills = pq.read_table(tmp_path / "populated" / "fills.parquet")
     assert orders.schema.names == [
-        "order_id", "symbol", "side", "quantity", "submitted_at", "target_weight"
+        "order_id", "symbol", "side", "quantity", "submitted_at", "target_weight", "sid"
     ]
     assert orders.schema.field("target_weight").type == pa.float64()
     assert fills.schema.field("execution_price").type == pa.float64()

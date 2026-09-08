@@ -19,6 +19,7 @@ from market_data.errors import (
     DataResultTooLargeError,
     DataSourceNotConfiguredError,
 )
+from market_data.identity import SecurityCodeHistory, SecurityMappingError
 from market_data.protocols import DataAdapter
 from models import (
     IMPLEMENTED_DIVIDEND_SCHEMA,
@@ -86,6 +87,9 @@ class DataReader:
 
         self._sources = sources
         self._catalog = catalog
+        self.identities = catalog.identities
+        if self.identities is not None and custom_adapters:
+            raise SecurityMappingError("启用代码历史时，自定义适配器尚未声明稳定身份支持")
         self._tushare_adapter = TushareAdapter(catalog)
         self._qmt_adapter = QmtAdapter(
             catalog, bar_availability=bar_availability,
@@ -127,6 +131,11 @@ class DataReader:
             raise DataResultTooLargeError(
                 f"实施分红记录超过内部上限 {self._max_result_rows} 行；请缩小 symbols"
             )
+        if self.identities is not None:
+            table = table.append_column("sid", pa.array(
+                [self.identities.sid(code) for code in table.column("symbol").to_pylist()],
+                type=pa.int64(),
+            ))
         return table
 
     def security_lifecycles(self, *, symbols: Symbols) -> pa.Table:
@@ -147,6 +156,11 @@ class DataReader:
         _validate_identity(table, ("symbol",))
         if table.num_rows > self._max_result_rows:
             raise DataResultTooLargeError("证券生命周期记录超过内部行数上限")
+        if self.identities is not None:
+            table = table.append_column("sid", pa.array(
+                [self.identities.sid(code) for code in table.column("symbol").to_pylist()],
+                type=pa.int64(),
+            ))
         return table
 
     def snapshot_metadata(self) -> dict[str, Any]:
@@ -178,6 +192,7 @@ class DataReader:
             custom_adapters=self._custom_adapters,
             source_config=self._sources,
             max_result_rows=self._max_result_rows,
+            identities=self.identities,
         )
 
 
@@ -197,6 +212,7 @@ class DataView:
         "_custom_adapters",
         "_source_config",
         "_max_result_rows",
+        "identities",
     )
 
     def __init__(
@@ -208,7 +224,9 @@ class DataView:
         custom_adapters: Mapping[str, DataAdapter],
         source_config: SourceConfig,
         max_result_rows: int,
+        identities: SecurityCodeHistory | None = None,
     ) -> None:
+        self.identities = identities
         self._as_of = as_of
         self._tushare_adapter = tushare_adapter
         self._qmt_adapter = qmt_adapter
@@ -231,6 +249,12 @@ class DataView:
         if source_id is None:
             raise DataSourceNotConfiguredError(f"逻辑数据集 {route!r} 未配置来源") from None
         return source_id
+
+    def _symbols(self, symbols: Symbols) -> tuple[str, ...] | None:
+        normalized = _symbols(symbols)
+        if self.identities is not None and normalized is not None:
+            return self.identities.canonical_symbols(normalized)
+        return normalized
 
     def _validate_table(
         self,
@@ -261,6 +285,14 @@ class DataView:
         payload = [name for name in table.schema.names if name not in identity]
         selected = _fields(fields, payload, identity)
         projected = table.select([*identity, *selected])
+        if self.identities is not None and "symbol" in identity:
+            sids = [self.identities.sid(cast(str, code))
+                    for code in projected.column("symbol").to_pylist()]
+            codes = [self.identities.code_at(sid, self.as_of.date()) for sid in sids]
+            projected = projected.set_column(
+                projected.schema.get_field_index("symbol"), "symbol", pa.array(codes, pa.string())
+            ).append_column("sid", pa.array(sids, pa.int64()))
+            presorted = False
         missing_sort = [name for name, _ in sort if name not in projected.schema.names]
         if missing_sort:
             # Sort keys are platform identity fields and must never be projected away.
@@ -307,7 +339,7 @@ class MarketReader:
         if adjustment not in {"none", "forward"}:
             raise ValueError("adjustment 只允许 'none' 或 'forward'")
         order = _order(order)
-        normalized_symbols = _symbols(symbols)
+        normalized_symbols = self._data._symbols(symbols)
         if count is not None:
             count = _positive_int(count, "count")
             if start is not None or end is not None:
@@ -425,7 +457,7 @@ class MarketReader:
         symbols: Symbols,
         fields: Sequence[str] | None = None,
     ) -> QueryResult:
-        normalized_symbols = _symbols(symbols)
+        normalized_symbols = self._data._symbols(symbols)
         identity = ("symbol",)
         route = "market.realtime_quotes"
         selected, columns = _projection(route, identity, fields)
@@ -473,7 +505,7 @@ class MarketReader:
         allowed = ("suspended", "up_limit", "down_limit", "price_limit_status", "st_type")
         selected = list(allowed) if fields is None else list(fields)
         _fields(selected, allowed, ("symbol",))
-        normalized_symbols = _symbols(symbols)
+        normalized_symbols = self._data._symbols(symbols)
         rows: dict[str, dict[str, object]] = {}
         if normalized_symbols is not None:
             rows = {
@@ -617,7 +649,7 @@ class MarketReader:
         )
         _range(start, end, "start", "end")
         order = _order(order)
-        normalized_symbols = _symbols(symbols)
+        normalized_symbols = self._data._symbols(symbols)
         route = "market.daily_metrics"
         identity = ("symbol", "trade_date")
         selected, columns = _projection(route, identity, fields)
@@ -681,7 +713,7 @@ class MarketReader:
         )
         _range(start, end, "start", "end")
         order = _order(order)
-        normalized_symbols = _symbols(symbols)
+        normalized_symbols = self._data._symbols(symbols)
         route = "market.moneyflow"
         identity = ("symbol", "trade_date")
         selected, columns = _projection(route, identity, fields)
@@ -757,7 +789,7 @@ class FundamentalsReader:
             raise ValueError(f"不支持的财报 kind: {kind!r}")
         report_start, report_end, periods = _report_range(report_start, report_end, periods)
         order = _order(order)
-        normalized_symbols = _symbols(symbols)
+        normalized_symbols = self._data._symbols(symbols)
         identity = (
             "symbol",
             "period_end",
@@ -834,7 +866,7 @@ class FundamentalsReader:
     ) -> QueryResult:
         report_start, report_end, periods = _report_range(report_start, report_end, periods)
         order = _order(order)
-        normalized_symbols = _symbols(symbols)
+        normalized_symbols = self._data._symbols(symbols)
         identity = ("symbol", "period_end", "visible_at", "announcement_date")
         route = "fundamentals.indicators"
         selected, columns = _projection(route, identity, fields)
@@ -904,7 +936,7 @@ class FundamentalsReader:
             raise ValueError(f"不支持的披露 kind: {kind!r}")
         start, end = _visible_range(visible_start, visible_end, self._data.as_of)
         order = _order(order)
-        normalized_symbols = _symbols(symbols)
+        normalized_symbols = self._data._symbols(symbols)
         identity = ("symbol", "visible_at", "period_end", "announcement_date")
         selected, columns = _projection(route, identity, fields)
         fetch_limit = self._data._max_result_rows + 1
@@ -976,7 +1008,7 @@ class CorporateActionsReader:
         """返回每个已可见公告版本；预案、决案和实施使用各自公告日期。"""
         start, end = _visible_range(visible_start, visible_end, self._data.as_of)
         order = _order(order)
-        normalized_symbols = _symbols(symbols)
+        normalized_symbols = self._data._symbols(symbols)
         identity = (
             "symbol",
             "visible_at",
@@ -1052,7 +1084,7 @@ class CorporateActionsReader:
         if start is not None and end is not None:
             _range(start, end, "start", "end")
         order = _order(order)
-        normalized_symbols = _symbols(symbols)
+        normalized_symbols = self._data._symbols(symbols)
         route = "corporate_actions.adjustment_factors"
         source = self._data._source(route)
         if source == "tushare":
@@ -1109,7 +1141,7 @@ class ClassificationReader:
     ) -> QueryResult:
         if isinstance(level, bool) or level not in {1, 2, 3}:
             raise ValueError("level 只允许 1、2、3")
-        normalized_symbols = _symbols(symbols)
+        normalized_symbols = self._data._symbols(symbols)
         route = "classification.industry"
         source = self._data._source(route)
         if source == "tushare":

@@ -357,6 +357,17 @@ data.market.bars(
 
 ## 运行和验证
 
+需要覆盖证券更码时，把可靠资料维护的本地代码历史传给
+`RunOptions(security_code_history=Path("dataset/security_code_history.parquet"))`；
+命令行对应 `--security-code-history`。表结构和数据接口见
+[证券代码历史](market_data.md#证券代码历史)。`symbols=` 可以写旧代码、新代码或两者，
+引擎按 `sid` 合并交易对象；同一证券的两个别名目标权重相同则合并，冲突则报错。
+
+启用映射后，持仓及待上市红股以 `sid` 为内部键，登记权益和实施事件 ID 也使用该身份。
+更码不迁移持仓、不核销证券。订单保留提交日代码，成交保留成交日代码，同时输出 `sid`；
+策略账户快照展示当日代码。`run_metadata.json` 保存映射记录和哈希，便于复现。
+未提供映射的兼容模式不具备跨代码身份连续性；代码缺失不能当作退市依据。
+
 `run_from_storage` 已注册全部 routes，新策略不需要处理数据源注册：
 
 ```python

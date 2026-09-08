@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Mapping
+from dataclasses import replace
 from datetime import date, datetime
 
 from backtest.clock import Event
@@ -22,14 +23,19 @@ from backtest.domain import (
 )
 from backtest.trading_rules import QuantityRule, quantity_rule
 from market_data import DataView
+from market_data.identity import SecurityCodeHistory, SecurityMappingError
 
 
 class SimulatedBroker:
     """保存订单，并在下一根完整 K 线到达时按其开盘价撮合一次。"""
 
-    def __init__(self, config: BacktestConfig) -> None:
+    def __init__(
+        self, config: BacktestConfig, *, identities: SecurityCodeHistory | None = None
+    ) -> None:
         """固定本次回测的费用、滑点和成交量限制。"""
         self.config = config
+        self.identities = identities
+        self._session = config.start_date
         self._pending: list[Order] = []
         self._orders: list[Order] = []
         self._updates: list[OrderUpdate] = []
@@ -55,7 +61,17 @@ class SimulatedBroker:
     @property
     def pending_symbols(self) -> tuple[str, ...]:
         """仍在等待下一根 K 线的证券代码。"""
-        return tuple(sorted({order.symbol for order in self._pending}))
+        symbols = {self._trading_symbol(order, self._session) for order in self._pending}
+        return tuple(sorted(symbols))
+
+    def set_session(self, session: date) -> None:
+        self._session = session
+
+    def _trading_symbol(self, order: Order, session: date) -> str:
+        if self.identities is None:
+            return order.symbol
+        assert order.sid is not None
+        return self.identities.code_at(order.sid, session)
 
     @property
     def pending_orders(self) -> tuple[Order, ...]:
@@ -65,7 +81,16 @@ class SimulatedBroker:
         """接收订单并记录 SUBMITTED 状态。"""
         if not request.symbol:
             raise ValueError("证券代码不能为空")
-        if self.config.symbols is not None and request.symbol not in self.config.symbols:
+        sid = self.identities.sid(request.symbol) if self.identities is not None else None
+        if request.sid is not None and request.sid != sid:
+            raise SecurityMappingError("订单 sid 与证券代码不一致")
+        symbol = request.symbol
+        if self.identities is not None and sid is not None:
+            symbol = self.identities.code_at(sid, submitted_at.date())
+        allowed = self.config.symbols
+        if allowed is not None and self.identities is not None:
+            allowed = self.identities.symbols_at(allowed, submitted_at.date())
+        if allowed is not None and symbol not in allowed:
             raise ValueError(f"{request.symbol} 不在本次回测的 symbols 中")
         if (
             isinstance(request.quantity, bool)
@@ -73,7 +98,7 @@ class SimulatedBroker:
             or request.quantity <= 0
         ):
             raise ValueError("委托数量必须为正整数")
-        rule = quantity_rule(request.symbol, submitted_at.date())
+        rule = quantity_rule(symbol, submitted_at.date())
         # 零股卖出需等撮合时结合账户余额校验；买入可以立即检查完整规则。
         if request.quantity > rule.maximum or (
             Side(request.side) is Side.BUY and not rule.valid(request.quantity)
@@ -81,11 +106,12 @@ class SimulatedBroker:
             raise ValueError(f"{request.symbol} 委托数量不符合申报规则: {request.quantity}")
         order = Order(
             order_id=f"O{self._next_order_id:08d}",
-            symbol=request.symbol,
+            symbol=symbol,
             side=Side(request.side),
             quantity=request.quantity,
             submitted_at=submitted_at,
             target_weight=request.target_weight,
+            sid=sid,
         )
         self._next_order_id += 1
         self._orders.append(order)
@@ -124,7 +150,7 @@ class SimulatedBroker:
         if not orders:
             return ()
         orders.sort(key=lambda order: (order.side is Side.BUY, order.symbol, order.order_id))
-        symbols = tuple(sorted({order.symbol for order in orders}))
+        symbols = tuple(sorted({self._trading_symbol(order, event.session) for order in orders}))
         statuses = self._market_statuses(data, symbols)
         previous_volumes = self._previous_volumes(
             data,
@@ -138,15 +164,17 @@ class SimulatedBroker:
         sellable = {holding.symbol: holding.sellable_quantity for holding in account.holdings}
         fills: list[Fill] = []
         for order in orders:
-            bar = bars.get(order.symbol)
+            symbol = self._trading_symbol(order, event.session)
+            executable_order = replace(order, symbol=symbol)
+            bar = bars.get(symbol)
             filled_at = bar.interval_start if bar is not None else event.interval_start
             quantity, reason, price = self._executable_quantity(
-                order,
+                executable_order,
                 bar=bar,
-                status=statuses.get(order.symbol, MarketStatus(order.symbol)),
-                previous_volume=previous_volumes.get(order.symbol),
+                status=statuses.get(symbol, MarketStatus(symbol)),
+                previous_volume=previous_volumes.get(symbol),
                 cash=cash,
-                sellable=sellable.get(order.symbol, 0),
+                sellable=sellable.get(symbol, 0),
                 trading_date=filled_at.date(),
             )
             if quantity == 0 or price is None:
@@ -161,13 +189,13 @@ class SimulatedBroker:
                 continue
 
             assert bar is not None and bar.open is not None
-            fill = self._make_fill(order, filled_at, quantity, bar.open, price)
+            fill = self._make_fill(executable_order, filled_at, quantity, bar.open, price)
             fills.append(fill)
             if order.side is Side.BUY:
                 cash -= fill.notional + fill.total_fee
             else:
                 cash += fill.notional - fill.total_fee
-                sellable[order.symbol] = sellable.get(order.symbol, 0) - quantity
+                sellable[symbol] = sellable.get(symbol, 0) - quantity
             status = (
                 OrderStatus.FILLED if quantity == order.quantity else OrderStatus.PARTIALLY_FILLED
             )
@@ -176,11 +204,14 @@ class SimulatedBroker:
         self._fills.extend(fills)
         return tuple(fills)
 
-    def cancel_symbol(self, symbol: str, reason: OrderReason, at: datetime) -> None:
+    def cancel_symbol(self, symbol: str | int, reason: OrderReason, at: datetime) -> None:
         """取消指定证券的全部待处理订单。"""
         remaining: list[Order] = []
+        sid = None
+        if self.identities is not None:
+            sid = self.identities.sid(symbol) if isinstance(symbol, str) else symbol
         for order in self._pending:
-            if order.symbol == symbol:
+            if (sid is not None and order.sid == sid) or order.symbol == symbol:
                 self._updates.append(OrderUpdate(order, OrderStatus.CANCELED, at, reason=reason))
             else:
                 remaining.append(order)
@@ -276,8 +307,10 @@ class SimulatedBroker:
         price = open_price * (1 + direction * self.config.slippage_bps / 10_000)
         # 最终成交价先限制在合法价格区间，再计算数量、费用和滑点成本。
         if _valid_price(status.up_limit):
+            assert status.up_limit is not None
             price = min(price, status.up_limit)
         if _valid_price(status.down_limit):
+            assert status.down_limit is not None
             price = max(price, status.down_limit)
         quantity = order.quantity
         reason = OrderReason.NONE
@@ -330,6 +363,7 @@ class SimulatedBroker:
             stamp_tax=stamp_tax,
             transfer_fee=transfer_fee,
             slippage_cost=abs(execution_price - market_price) * quantity,
+            sid=order.sid,
         )
         self._next_fill_id += 1
         return fill
