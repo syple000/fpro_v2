@@ -14,6 +14,7 @@ from backtest.domain import CorporateAction, Fill, Side
 from backtest.errors import CorporateActionError
 from backtest.portfolio import Portfolio
 from market_data import DataCatalog, DataReader, SourceConfig
+from market_data.identity import CodeInterval, SecurityCodeHistory
 from models import IMPLEMENTED_DIVIDEND_SCHEMA
 from tushare_data import TABLE_SCHEMAS, TushareDataStore
 
@@ -72,6 +73,72 @@ def test_cash_and_stock_dividend_follow_record_ex_pay_and_listing_dates() -> Non
         at_time(date(2026, 1, 7), time(9, 25)), portfolio, broker
     )
     assert position.sellable_quantity == 1_100
+
+
+@pytest.mark.parametrize("target", [42, "430047.BJ", "920047.BJ"])
+def test_write_off_clears_pending_stock_by_sid_but_preserves_other_entitlements(
+    target: str | int,
+) -> None:
+    """更码后核销同一 sid，旧红股上市不报错；其他红股和已确认现金照常结算。"""
+    identities = SecurityCodeHistory([
+        CodeInterval(42, "430047.BJ", date(2020, 1, 1), date(2026, 1, 6)),
+        CodeInterval(42, "920047.BJ", date(2026, 1, 6)),
+        CodeInterval(43, "600000.SH", date(2020, 1, 1)),
+    ])
+    portfolio = Portfolio(100_000, identities=identities)
+    portfolio.set_session(date(2026, 1, 2))
+    actions = []
+    for sid, symbol, shares, cash in [(42, "430047.BJ", 1_000, 0.5), (43, "600000.SH", 200, 0.2)]:
+        position = portfolio.position(sid)
+        position.quantity = position.sellable_quantity = shares
+        position.last_price = 10
+        actions.append(CorporateAction(
+            action_id=f"CA{sid}",
+            symbol=symbol,
+            record_date=date(2026, 1, 2),
+            ex_date=date(2026, 1, 5),
+            pay_date=date(2026, 1, 7),
+            listing_date=date(2026, 1, 7),
+            cash_dividend=cash,
+            cash_dividend_before_tax=None,
+            stock_dividend=0.1,
+            sid=sid,
+        ))
+    processor = CorporateActionProcessor(actions)
+    broker = SimulatedBroker(
+        BacktestConfig(date(2026, 1, 2), date(2026, 1, 7), delisting_policy="write_off"),
+        identities=identities,
+    )
+    processor.on_session_end(at_time(date(2026, 1, 2), time(16, 5)), portfolio)
+    processor.on_session_start(at_time(date(2026, 1, 5), time(9, 25)), portfolio, broker)
+    assert portfolio.position(42).pending_listing_quantity == 100
+    assert portfolio.position(43).pending_listing_quantity == 20
+    assert portfolio.dividend_receivable == 540
+
+    portfolio.set_session(date(2026, 1, 6))
+    portfolio.write_off(target)
+    portfolio.set_session(date(2026, 1, 7))
+    processor.on_session_start(at_time(date(2026, 1, 7), time(9, 25)), portfolio, broker)
+
+    assert portfolio.position(42).quantity == 0
+    assert portfolio.position(42).pending_listing_quantity == 0
+    assert portfolio.position(43).sellable_quantity == 220
+    assert portfolio.position(43).pending_listing_quantity == 0
+    assert portfolio.cash == pytest.approx(100_540)
+    assert portfolio.dividend_receivable == 0
+
+
+def test_write_off_clears_every_pending_stock_event_without_identity_mapping() -> None:
+    portfolio = _portfolio_with_shares(1_000)
+    portfolio.add_stock_dividend("FIRST", "000001.SZ", 1_000, 0.1)
+    portfolio.add_stock_dividend("SECOND", "000001.SZ", 1_000, 0.2)
+    portfolio.write_off("000001.SZ")
+    portfolio.list_stock_dividend("FIRST")
+    portfolio.list_stock_dividend("SECOND")
+    position = portfolio.position("000001.SZ")
+    assert position.quantity == 0
+    assert position.sellable_quantity == 0
+    assert position.pending_listing_quantity == 0
 
 
 def test_cash_dividend_without_ex_date_is_paid_on_pay_date() -> None:

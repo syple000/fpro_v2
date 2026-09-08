@@ -262,7 +262,8 @@ class Portfolio:
 
     def write_off(self, symbol: str | int) -> None:
         """证券退市时按零价值核销持仓。"""
-        position = self.positions.get(self.identity(symbol))
+        key = self.identity(symbol)
+        position = self.positions.get(key)
         if position is None:
             return
         position.quantity = 0
@@ -270,6 +271,12 @@ class Portfolio:
         position.pending_listing_quantity = 0
         position.last_price = None
         position.stale_price = False
+        # 红股已随总持仓核销，不能在原上市日再次解锁或恢复。
+        self._pending_stock = {
+            action_id: pending
+            for action_id, pending in self._pending_stock.items()
+            if pending[0] != key
+        }
         self.assert_valid()
 
     def equity_snapshot(self, session: date) -> EquitySnapshot:
