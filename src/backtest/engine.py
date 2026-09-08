@@ -103,7 +103,7 @@ class BacktestEngine:
                 event=event,
                 bars=bars,
                 account=self.portfolio.account_snapshot(),
-                data=data,
+                data=self.reader.at(event.interval_start),
             )
             for fill in fills:
                 self.portfolio.apply_fill(fill)

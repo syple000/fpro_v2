@@ -68,6 +68,7 @@
 
 ### BT-003：撮合使用了错误时点的交易状态
 
+- **状态**：已修复。撮合数据视图固定在 Bar 开始时点，策略继续使用决策时点。真实 Tushare 适配器回归覆盖分钟边界停牌和复牌，分别验证成交数量、时间及策略所见状态。
 - **位置**：[engine.py](../src/backtest/engine.py)，`_process_bar()`；[broker.py](../src/backtest/broker.py)，`match_bar()`、`_market_statuses()`。
 - **现状**：成交时间记作 `bar.interval_start`，停牌和涨跌停状态却来自 `reader.at(event.at)`，即 Bar 结束时点。
 - **复现**：使用实际 Tushare 适配器和构造数据，设置 09:31 开始停牌；09:31 回放本应在 09:30 开盘价成交的订单时，被结束时点的停牌状态拒绝。
