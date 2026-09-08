@@ -99,6 +99,13 @@ class BacktestEngine:
     def _process_bar(self, event: Event, data: DataView) -> None:
         """每根 Bar 都撮合和估值，与策略是否调用无关。"""
         bars = self._read_bars(event, data)
+        prices: dict[str, float] = {}
+        for symbol, bar in bars.items():
+            if bar.close is None:
+                continue
+            if not math.isfinite(bar.close) or bar.close <= 0:
+                raise DataError(f"{symbol} {event.at.isoformat()} 收盘价无效: {bar.close}")
+            prices[symbol] = float(bar.close)
 
         # 先撮合旧订单，保证本次策略产生的订单只能使用下一根 Bar 的开盘价。
         if event.kind == "bar" and self.broker.pending_symbols:
@@ -111,11 +118,6 @@ class BacktestEngine:
             for fill in fills:
                 self.portfolio.apply_fill(fill)
 
-        prices = {
-            symbol: float(bar.close)
-            for symbol, bar in bars.items()
-            if bar.close is not None and math.isfinite(bar.close) and bar.close > 0
-        }
         self.portfolio.mark_to_market(prices)
 
     def _run_strategy(self, event: Event, data: DataView) -> None:

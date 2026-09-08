@@ -9,7 +9,7 @@ from backtest.config import BacktestConfig
 from backtest.corporate_actions import CorporateActionProcessor
 from backtest.domain import BacktestResult, CorporateAction, OrderStatus, Side
 from backtest.engine import BacktestEngine
-from backtest.errors import CorporateActionError
+from backtest.errors import CorporateActionError, DataError
 from backtest.schedule import Schedule
 from backtest.strategy import Strategy, StrategyContext
 from market_data import DataReader
@@ -19,6 +19,45 @@ from tests.backtest.conftest import (
     daily_bar,
     timestamp,
 )
+
+
+@pytest.mark.parametrize("close", [0.0, -1.0, float("nan"), float("inf")])
+def test_invalid_close_is_reported_before_matching_or_valuation(close: float) -> None:
+    session = date(2026, 1, 5)
+    reader = MemoryDataReader(bar_table([daily_bar(session, close, open_price=10)]), (session,))
+    engine = BacktestEngine(
+        reader=cast(DataReader, reader),
+        config=BacktestConfig(session, session),
+        sessions=(session,),
+        strategy=OneShotStrategy(),
+        actions=CorporateActionProcessor(()),
+    )
+    position = engine.portfolio.position("000001.SZ")
+    position.quantity = 1_000
+    position.last_price = 10
+    with pytest.raises(DataError, match="000001.SZ.*2026-01-05.*收盘价无效"):
+        engine.run()
+    assert position.last_price == 10
+    assert engine.broker.fills == ()
+
+
+def test_missing_close_keeps_previous_price_and_marks_it_stale() -> None:
+    session = date(2026, 1, 5)
+    row = {**daily_bar(session, 10), "close": None}
+    reader = MemoryDataReader(bar_table([row]), (session,))
+    engine = BacktestEngine(
+        reader=cast(DataReader, reader),
+        config=BacktestConfig(session, session),
+        sessions=(session,),
+        strategy=OneShotStrategy(),
+        actions=CorporateActionProcessor(()),
+    )
+    position = engine.portfolio.position("000001.SZ")
+    position.quantity = 1_000
+    position.last_price = 10
+    result = engine.run()
+    assert result.equity[-1].market_value == 10_000
+    assert result.equity[-1].stale_position_count == 1
 
 
 class OneShotStrategy(Strategy):
