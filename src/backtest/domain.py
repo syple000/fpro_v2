@@ -180,6 +180,18 @@ class CorporateAction:
 
 
 @dataclass(frozen=True, slots=True)
+class MarketDataCoverage:
+    """请求范围内实际回放到的行情数量与未覆盖范围。"""
+
+    expected_events: int
+    events_with_bars: int
+    bar_count: int
+    symbols_with_bars: tuple[str, ...]
+    sessions_without_bars: tuple[date, ...]
+    requested_symbols_without_bars: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class BacktestResult:
     """一次回测的订单、成交和每日净值结果。"""
 
@@ -188,3 +200,4 @@ class BacktestResult:
     order_updates: tuple[OrderUpdate, ...]
     fills: tuple[Fill, ...]
     equity: tuple[EquitySnapshot, ...]
+    market_data_coverage: MarketDataCoverage | None = None

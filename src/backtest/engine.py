@@ -10,7 +10,7 @@ from backtest.broker import SimulatedBroker
 from backtest.clock import Clock, Event, market_timeline
 from backtest.config import BacktestConfig
 from backtest.corporate_actions import CorporateActionProcessor
-from backtest.domain import BacktestResult, Bar, EquitySnapshot, OrderReason
+from backtest.domain import BacktestResult, Bar, EquitySnapshot, MarketDataCoverage, OrderReason
 from backtest.errors import DataError
 from backtest.orders import create_orders, validate_target_weights
 from backtest.portfolio import Portfolio
@@ -61,6 +61,10 @@ class BacktestEngine:
             sessions, start_date=config.start_date, end_date=config.end_date
         )
         self._equity: list[EquitySnapshot] = []
+        self._bar_count = 0
+        self._events_with_bars = 0
+        self._sessions_with_bars: set[date] = set()
+        self._symbols_with_bars: set[str] = set()
 
     def run(self) -> BacktestResult:
         """逐个事件推进，最后返回订单、成交和每日净值。"""
@@ -80,12 +84,29 @@ class BacktestEngine:
         if self.clock.now is not None:
             self.broker.expire_all(self.clock.now)
         equity = tuple(self._equity)
+        if self._bar_count == 0:
+            raise DataError(
+                f"回测区间 {self.config.start_date} 至 {self.config.end_date} "
+                f"未读取到任何 {self.config.frequency} 行情，请检查数据源、证券范围和数据覆盖"
+            )
         return BacktestResult(
             sessions=tuple(snapshot.session for snapshot in equity),
             orders=self.broker.orders,
             order_updates=self.broker.updates,
             fills=self.broker.fills,
             equity=equity,
+            market_data_coverage=MarketDataCoverage(
+                expected_events=sum(event.kind in {"bar", "auction"} for event in self.events),
+                events_with_bars=self._events_with_bars,
+                bar_count=self._bar_count,
+                symbols_with_bars=tuple(sorted(self._symbols_with_bars)),
+                sessions_without_bars=tuple(
+                    row.session for row in equity if row.session not in self._sessions_with_bars
+                ),
+                requested_symbols_without_bars=tuple(
+                    sorted(set(self.config.symbols or ()) - self._symbols_with_bars)
+                ),
+            ),
         )
 
     def _start_session(self, at: datetime, data: DataView) -> None:
@@ -117,6 +138,11 @@ class BacktestEngine:
     def _process_bar(self, event: Event, data: DataView) -> None:
         """每根 Bar 都撮合和估值，与策略是否调用无关。"""
         bars = self._read_bars(event, data)
+        if bars:
+            self._bar_count += len(bars)
+            self._events_with_bars += 1
+            self._sessions_with_bars.add(event.session)
+            self._symbols_with_bars.update(bars)
         prices: dict[str, float] = {}
         for symbol, bar in bars.items():
             if bar.close is None:

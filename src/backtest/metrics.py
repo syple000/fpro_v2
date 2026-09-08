@@ -59,7 +59,7 @@ def calculate_metrics(
     blocked_reasons = Counter(update.reason.value for update in unsuccessful)
     average_equity = statistics.fmean(values)
     traded_notional = sum(fill.notional for fill in result.fills)
-    return {
+    metrics = {
         "start_session": result.sessions[0].isoformat(),
         "end_session": result.sessions[-1].isoformat(),
         "session_count": len(result.sessions),
@@ -78,6 +78,17 @@ def calculate_metrics(
         "total_fees": sum(fill.total_fee for fill in result.fills),
         "slippage_cost": sum(fill.slippage_cost for fill in result.fills),
     }
+    coverage = result.market_data_coverage
+    if coverage is not None:
+        metrics["market_data_coverage"] = {
+            "expected_events": coverage.expected_events,
+            "events_with_bars": coverage.events_with_bars,
+            "bar_count": coverage.bar_count,
+            "symbols_with_bars": list(coverage.symbols_with_bars),
+            "sessions_without_bars": [day.isoformat() for day in coverage.sessions_without_bars],
+            "requested_symbols_without_bars": list(coverage.requested_symbols_without_bars),
+        }
+    return metrics
 
 
 def _max_drawdown(values: list[float]) -> float:
