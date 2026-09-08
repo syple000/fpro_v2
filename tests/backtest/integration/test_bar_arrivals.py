@@ -35,8 +35,8 @@ class ObservePrices(Strategy):
         self.values.append(context.account.market_value)
 
 
-def quote(seq: int, label: time, received: time, close: float) -> SequencedQuote:
-    """构造源时间标签；默认测试使用结束标签，兼容测试显式指定其它口径。"""
+def quote(seq: int, end: time, received: time, close: float) -> SequencedQuote:
+    """用区间结束时间构造 QMT 推送。"""
     return SequencedQuote(
         seq=seq,
         code=SYMBOL,
@@ -45,7 +45,7 @@ def quote(seq: int, label: time, received: time, close: float) -> SequencedQuote
         subscription="SZ",
         received_at=int(at_time(DAY, received).timestamp() * 1_000_000),
         quote=BarQuote(
-            time=int(at_time(DAY, label).timestamp() * 1_000_000),
+            time=int(at_time(DAY, end).timestamp() * 1_000_000),
             open=10,
             high=max(10, close),
             low=min(10, close),
@@ -62,7 +62,6 @@ def data_reader(
     mode: Literal["historical", "received"],
     *,
     identities: SecurityCodeHistory | None = None,
-    realtime_time_label: Literal["start", "end"] = "end",
 ) -> Iterator[DataReader]:
     with TushareDataStore(tmp_path / "tushare") as store:
         store.write(
@@ -105,7 +104,6 @@ def data_reader(
             catalog,
             sources=default_source_config(),
             bar_availability=mode,
-            qmt_realtime_time_label=realtime_time_label,
         )
 
 
@@ -257,7 +255,7 @@ def test_engine_rejects_mismatched_reader_availability(tmp_path: Path) -> None:
         )
 
 
-def test_latest_bar_uses_normalized_end_time_across_qmt_time_labels(tmp_path: Path) -> None:
+def test_latest_bar_uses_end_time_across_downloads_and_pushes(tmp_path: Path) -> None:
     with QmtDataStore(tmp_path / "qmt") as store:
         store.write_intraday(
             {
@@ -275,8 +273,8 @@ def test_latest_bar_uses_normalized_end_time_across_qmt_time_labels(tmp_path: Pa
             "1m",
             "none",
         )
-    record = quote(1, time(9, 31), time(9, 32), 12)
-    with data_reader(tmp_path, [record], "historical", realtime_time_label="start") as reader:
+    record = quote(1, time(9, 32), time(9, 32), 12)
+    with data_reader(tmp_path, [record], "historical") as reader:
         table = (
             reader.at(at_time(DAY, time(9, 32)))
             .market.bars(
@@ -288,8 +286,6 @@ def test_latest_bar_uses_normalized_end_time_across_qmt_time_labels(tmp_path: Pa
         )
         assert reader.snapshot_metadata()["qmt"] == {
             "bar_availability": "historical",
-            "history_time_label": "end",
-            "realtime_time_label": "start",
         }
     assert table.to_pylist()[0]["interval_end"] == at_time(DAY, time(9, 32))
     assert table.to_pylist()[0]["close"] == 12

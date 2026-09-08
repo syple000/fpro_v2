@@ -58,8 +58,6 @@ class DataReader:
         adapters: Mapping[str, DataAdapter] | None = None,
         max_result_rows: int = 1_000_000,
         bar_availability: Literal["historical", "received"] = "historical",
-        qmt_history_time_label: Literal["start", "end"] = "end",
-        qmt_realtime_time_label: Literal["start", "end"] = "end",
     ) -> None:
         if (
             isinstance(max_result_rows, bool)
@@ -91,11 +89,7 @@ class DataReader:
         if self.identities is not None and custom_adapters:
             raise SecurityMappingError("启用代码历史时，自定义适配器尚未声明稳定身份支持")
         self._tushare_adapter = TushareAdapter(catalog)
-        self._qmt_adapter = QmtAdapter(
-            catalog, bar_availability=bar_availability,
-            history_time_label=qmt_history_time_label,
-            realtime_time_label=qmt_realtime_time_label,
-        )
+        self._qmt_adapter = QmtAdapter(catalog, bar_availability=bar_availability)
         self._custom_adapters = custom_adapters
         self._max_result_rows = max_result_rows
 
@@ -168,11 +162,7 @@ class DataReader:
         return {
             "routes": dict(self._sources.routes),
             "catalog": self._catalog.snapshot_metadata(),
-            "qmt": {
-                "bar_availability": self.bar_availability,
-                "history_time_label": self._qmt_adapter.history_time_label,
-                "realtime_time_label": self._qmt_adapter.realtime_time_label,
-            },
+            "qmt": {"bar_availability": self.bar_availability},
             "custom_adapters": {
                 source: {
                     "type": f"{type(adapter).__module__}.{type(adapter).__qualname__}",

@@ -1502,21 +1502,12 @@ class QmtAdapter(DataAdapter):
         self,
         catalog: DataCatalog,
         *,
-        history_time_label: Literal["start", "end"] = "end",
-        realtime_time_label: Literal["start", "end"] = "end",
         bar_availability: Literal["historical", "received"] = "historical",
     ) -> None:
         self._connection = catalog.adapter_connection
         if bar_availability not in {"historical", "received"}:
             raise ValueError("bar_availability 必须为 historical 或 received")
         self.bar_availability: Literal["historical", "received"] = bar_availability
-        if history_time_label not in {"start", "end"} or realtime_time_label not in {
-            "start",
-            "end",
-        }:
-            raise ValueError("QMT 时间标签必须为 start 或 end")
-        self.history_time_label = history_time_label
-        self.realtime_time_label = realtime_time_label
 
     def daily_bars(
         self,
@@ -1623,16 +1614,12 @@ class QmtAdapter(DataAdapter):
         if period is None:
             raise DataCapabilityNotSupportedError(f"QMT 不支持分钟周期 {frequency!r}")
         qmt_period, minutes = period
-        event_time = _epoch_time("event_time")
-        # QMT 历史与推送默认都是结束标签；其它已核实的采集口径可分别覆盖。
-        start_expr = f"CASE WHEN time_label = 'start' THEN {event_time} ELSE " + (
-            f"CASE WHEN CAST(timezone('{_TZ}', {event_time}) AS TIME) = TIME '09:30' "
-            f"THEN {event_time} - INTERVAL '15 minutes' "
-            f"ELSE {event_time} - INTERVAL '{minutes} minutes' END END"
-        )
-        end_expr = (
-            f"CASE WHEN time_label = 'end' THEN {event_time} "
-            f"ELSE {event_time} + INTERVAL '{minutes} minutes' END"
+        # QMT 历史与推送均用区间结束时间；09:30 记录保留原有竞价发布窗口。
+        end_expr = _epoch_time("event_time")
+        start_expr = (
+            f"CASE WHEN CAST(timezone('{_TZ}', {end_expr}) AS TIME) = TIME '09:30' "
+            f"THEN {end_expr} - INTERVAL '15 minutes' "
+            f"ELSE {end_expr} - INTERVAL '{minutes} minutes' END"
         )
         qmt_adjustment = "none"
         direction = _sql_direction(order, default="asc")
@@ -1644,8 +1631,6 @@ class QmtAdapter(DataAdapter):
             as_of=as_of,
             as_of_date=as_of.date(),
             as_of_us=as_of_us,
-            history_time_label=self.history_time_label,
-            realtime_time_label=self.realtime_time_label,
             historical=self.bar_availability == "historical",
             symbols=symbols,
             start=start,
@@ -1659,7 +1644,6 @@ class QmtAdapter(DataAdapter):
             WITH candidates AS (
                 SELECT code,
                        event_time,
-                       $history_time_label AS time_label,
                        open, high, low, close, preClose,
                        CAST(volume * 100.0 AS DOUBLE) AS volume,
                        amount,
@@ -1678,7 +1662,6 @@ class QmtAdapter(DataAdapter):
 
                 SELECT code,
                        event_time,
-                       $realtime_time_label AS time_label,
                        quote.open, quote.high, quote.low, quote.close, quote.preClose,
                        {_qmt_share_volume("quote.volume")} AS volume,
                        quote.amount,

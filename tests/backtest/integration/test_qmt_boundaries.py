@@ -10,7 +10,6 @@ from backtest.corporate_actions import CorporateActionProcessor
 from backtest.engine import BacktestEngine
 from backtest.strategy import Strategy
 from market_data import DataCatalog, DataReader, SourceConfig
-from market_data.adapters import QmtAdapter
 from qmt_protocol import BarQuote, HistoryBar, SequencedQuote
 from qmt_receiver import QmtDataStore
 from tests.backtest.conftest import timestamp
@@ -63,7 +62,6 @@ def test_qmt_end_labels_match_auction_lunch_and_close(
                     ]
                 )
     with DataCatalog(tushare_root=tmp_path / "tushare", qmt_root=tmp_path / "qmt") as catalog:
-        assert QmtAdapter(catalog).realtime_time_label == "end"
         reader = DataReader(
             catalog,
             sources=SourceConfig(routes={"market.intraday_bars": "qmt"}),
@@ -71,8 +69,6 @@ def test_qmt_end_labels_match_auction_lunch_and_close(
         )
         assert reader.snapshot_metadata()["qmt"] == {
             "bar_availability": availability,
-            "history_time_label": "end",
-            "realtime_time_label": "end",
         }
         engine = BacktestEngine(
             reader=reader,
@@ -146,26 +142,41 @@ def test_received_end_label_is_hidden_until_both_end_and_arrival(
             )
 
 
-def test_qmt_start_label_dataset_remains_explicitly_supported(tmp_path: Path) -> None:
+def test_downloaded_and_pushed_bar_share_one_interval(tmp_path: Path) -> None:
     session = date(2026, 1, 5)
+    end = timestamp(session, time(15))
     with QmtDataStore(tmp_path / "qmt") as store:
         store.write_intraday(
-            {"000001.SZ": [HistoryBar(index=20260105145900, close=13)]}, "1m", "none"
+            {"000001.SZ": [HistoryBar(index=20260105150000, close=13)]}, "1m", "none"
+        )
+        store.append_quotes(
+            [
+                SequencedQuote(
+                    seq=1,
+                    code="000001.SZ",
+                    period="1m",
+                    source="stock",
+                    subscription="000001.SZ",
+                    received_at=int(end.timestamp() * 1_000_000),
+                    quote=BarQuote(time=int(end.timestamp() * 1_000), close=13),
+                )
+            ]
         )
     with DataCatalog(tushare_root=tmp_path / "tushare", qmt_root=tmp_path / "qmt") as catalog:
         reader = DataReader(
             catalog,
-            sources=SourceConfig(routes={"market.intraday_bars": "qmt_start"}),
-            adapters={"qmt_start": QmtAdapter(catalog, history_time_label="start")},
+            sources=SourceConfig(routes={"market.intraday_bars": "qmt"}),
         )
-        row = (
-            reader.at(timestamp(session, time(15)))
+        rows = (
+            reader.at(end)
             .market.bars(
                 symbols=("000001.SZ",),
                 frequency="1m",
                 start=timestamp(session, time(14, 59)),
             )
-            .table.to_pylist()[0]
+            .table.to_pylist()
         )
-        assert row["interval_start"] == timestamp(session, time(14, 59))
-        assert row["interval_end"] == timestamp(session, time(15))
+        assert len(rows) == 1
+        assert rows[0]["interval_start"] == timestamp(session, time(14, 59))
+        assert rows[0]["interval_end"] == end
+        assert rows[0]["close"] == 13

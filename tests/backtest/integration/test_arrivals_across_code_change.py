@@ -47,7 +47,7 @@ def received_bar(
     seq: int,
     code: str,
     day: date,
-    start: time,
+    end: time,
     receipt_day: date,
     receipt: time,
     close: float,
@@ -60,7 +60,7 @@ def received_bar(
         subscription="BJ",
         received_at=int(at_time(receipt_day, receipt).timestamp() * 1_000_000),
         quote=BarQuote(
-            time=int(at_time(day, start).timestamp() * 1_000_000),
+            time=int(at_time(day, end).timestamp() * 1_000_000),
             open=10,
             high=max(10, close),
             low=min(10, close),
@@ -78,12 +78,12 @@ def test_received_bars_keep_identity_price_order_and_metadata_across_rename(
     identities = history()
     write_data(tmp_path / "tushare", "mixed")
     records = [
-        received_bar(1, OLD, BEFORE, time(9, 32), BEFORE, time(9, 33), 11),
+        received_bar(1, OLD, BEFORE, time(9, 33), BEFORE, time(9, 33), 11),
         # 更早的旧代码 Bar 到更码后才到达，不能覆盖已经见过的后续价格。
-        received_bar(2, OLD, BEFORE, time(9, 30), AFTER, time(9, 32, 30), 9),
+        received_bar(2, OLD, BEFORE, time(9, 31), AFTER, time(9, 32, 30), 9),
     ]
     if has_new_day_bar:
-        records.append(received_bar(3, NEW, AFTER, time(9, 31), AFTER, time(9, 32), 12))
+        records.append(received_bar(3, NEW, AFTER, time(9, 32), AFTER, time(9, 32), 12))
     with QmtDataStore(tmp_path / "qmt") as store:
         store.append_quotes(records)
     config = BacktestConfig(
@@ -105,8 +105,6 @@ def test_received_bars_keep_identity_price_order_and_metadata_across_rename(
             catalog,
             sources=default_source_config(),
             bar_availability="received",
-            qmt_history_time_label="start",
-            qmt_realtime_time_label="start",
         )
         metadata = capture_run_metadata(reader, strategy)
         engine = BacktestEngine(
@@ -143,6 +141,4 @@ def test_received_bars_keep_identity_price_order_and_metadata_across_rename(
     assert [row["code"] for row in saved["security_code_history"]["rows"]] == [OLD, NEW]
     assert saved["data"]["qmt"] == {
         "bar_availability": "received",
-        "history_time_label": "start",
-        "realtime_time_label": "start",
     }
