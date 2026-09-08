@@ -925,6 +925,7 @@ class CorporateActionsReader:
         fields: Sequence[str] | None = None,
         order: Literal["asc", "desc"] = "asc",
     ) -> QueryResult:
+        """返回每个已可见公告版本；预案、决案和实施使用各自公告日期。"""
         start, end = _visible_range(visible_start, visible_end, self._data.as_of)
         order = _order(order)
         normalized_symbols = _symbols(symbols)

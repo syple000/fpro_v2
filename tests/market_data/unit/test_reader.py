@@ -1434,7 +1434,69 @@ def test_dividend_uses_reader_visibility_policy(tmp_path: Path) -> None:
         after = reader.at(_as_of(3, 9, 25)).corporate_actions.dividends(symbols=("000001.SZ",))
 
     assert before.table.num_rows == 0
-    assert after.table.to_pylist()[0]["div_proc"] == "实施"
+    assert [row["div_proc"] for row in after.table.to_pylist()] == ["实施", "预案"]
+
+
+def test_dividend_versions_use_their_own_announcement_dates(tmp_path: Path) -> None:
+    """预案、通过、实施逐次可见；未来实施字段和未知公告不能提前泄露。"""
+    common = {
+        "ts_code": "000001.SZ",
+        "end_date": date(2023, 12, 31),
+        "ann_date": date(2024, 1, 1),
+        "record_date": date(2024, 1, 8),
+        "ex_date": date(2024, 1, 9),
+        "pay_date": date(2024, 1, 9),
+        "imp_ann_date": date(2024, 1, 5),
+    }
+    rows = [
+        {**common, "div_proc": "预案", "cash_div_tax": 0.1},
+        {
+            **common,
+            "div_proc": "股东大会通过",
+            "ann_date": date(2024, 1, 3),
+            "cash_div_tax": 0.2,
+        },
+        {**common, "div_proc": "实施", "cash_div_tax": 0.3},
+        {**common, "div_proc": "实施", "imp_ann_date": None, "cash_div_tax": 9.0},
+        {**common, "div_proc": "预案", "ann_date": None, "cash_div_tax": 8.0},
+    ]
+    with TushareDataStore(tmp_path / "tushare") as store:
+        store.write("dividend", _table("dividend", *rows))
+        store.write(
+            "trade_cal",
+            _table(
+                "trade_cal",
+                *(
+                    {"exchange": "SSE", "cal_date": date(2024, 1, day), "is_open": 1}
+                    for day in (2, 3, 4, 5, 8, 9)
+                ),
+            ),
+        )
+    with DataCatalog(tushare_root=tmp_path / "tushare", qmt_root=tmp_path / "qmt") as catalog:
+        reader = DataReader(
+            catalog, sources=SourceConfig(routes={"corporate_actions.dividends": "tushare"})
+        )
+        symbols = ("000001.SZ",)
+        before = reader.at(_as_of(2, 9, 24)).corporate_actions.dividends(symbols=symbols)
+        assert before.table.num_rows == 0
+        proposal = reader.at(_as_of(2, 9, 25)).corporate_actions.dividends(symbols=symbols)
+        assert [row["div_proc"] for row in proposal.table.to_pylist()] == ["预案"]
+        proposal_row = proposal.table.to_pylist()[0]
+        for field in ("record_date", "ex_date", "pay_date", "implementation_ann_date"):
+            assert proposal_row[field] is None
+        approved = reader.at(_as_of(4, 9, 25)).corporate_actions.dividends(symbols=symbols)
+        assert [row["div_proc"] for row in approved.table.to_pylist()] == ["预案", "股东大会通过"]
+        final = reader.at(_as_of(8, 9, 25)).corporate_actions.dividends(symbols=symbols)
+        amounts = final.table.column("cash_dividend_before_tax").to_pylist()
+        assert amounts == [0.1, 0.2, 0.3]
+        assert final.table.to_pylist()[-1]["record_date"] == date(2024, 1, 8)
+        filtered = reader.at(_as_of(8, 9, 25)).corporate_actions.dividends(
+            symbols=symbols,
+            visible_start=_as_of(4, 9, 25),
+            fields=("cash_dividend_before_tax",),
+            order="desc",
+        )
+        assert [row["div_proc"] for row in filtered.table.to_pylist()] == ["实施", "股东大会通过"]
 
 
 def test_implemented_dividends_filter_symbols_and_enforce_row_limit(tmp_path: Path) -> None:

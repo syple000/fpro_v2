@@ -1223,7 +1223,7 @@ class TushareAdapter(DataAdapter):
         columns: tuple[str, ...] | None = None,
     ) -> pa.Table:
         self._catalog.require_available("tushare", "dividend")
-        visible_at = _next_session_time("imp_ann_date")
+        visible_at = _next_session_time("version_ann_date")
         direction = _sql_direction(order, default="asc")
         params = _query_parameters(
             as_of=as_of,
@@ -1233,19 +1233,29 @@ class TushareAdapter(DataAdapter):
             fetch_limit=fetch_limit,
         )
         query = f"""
-            WITH visible AS MATERIALIZED (
+            WITH versions AS (
+                SELECT *, CASE WHEN div_proc = '实施' THEN imp_ann_date
+                               ELSE ann_date END AS version_ann_date
+                FROM tushare.dividend
+                WHERE ($symbols IS NULL OR ts_code IN (SELECT unnest($symbols)))
+            ), visible AS MATERIALIZED (
                 SELECT *,
                        {visible_at} AS visible_at
-                FROM tushare.dividend
-                WHERE imp_ann_date IS NOT NULL
-                  AND ($symbols IS NULL OR ts_code IN (SELECT unnest($symbols)))
+                FROM versions
+                WHERE version_ann_date IS NOT NULL
+                  AND version_ann_date < CAST($as_of AS DATE)
             )
             SELECT ts_code AS symbol, visible_at, end_date, ann_date, div_proc,
                    stk_div AS stock_dividend, stk_bo_rate AS stock_bonus_rate,
                    stk_co_rate AS stock_conversion_rate, cash_div AS cash_dividend,
-                   cash_div_tax AS cash_dividend_before_tax, record_date, ex_date, pay_date,
-                   div_listdate AS listing_date, imp_ann_date AS implementation_ann_date,
-                   base_date, base_share * 10000.0 AS base_share
+                   cash_div_tax AS cash_dividend_before_tax,
+                   CASE WHEN div_proc = '实施' THEN record_date END AS record_date,
+                   CASE WHEN div_proc = '实施' THEN ex_date END AS ex_date,
+                   CASE WHEN div_proc = '实施' THEN pay_date END AS pay_date,
+                   CASE WHEN div_proc = '实施' THEN div_listdate END AS listing_date,
+                   CASE WHEN div_proc = '实施' THEN imp_ann_date END AS implementation_ann_date,
+                   CASE WHEN div_proc = '实施' THEN base_date END AS base_date,
+                   CASE WHEN div_proc = '实施' THEN base_share * 10000.0 END AS base_share
             FROM visible
             WHERE visible_at <= $as_of
               AND ($start IS NULL OR visible_at >= $start)

@@ -85,6 +85,7 @@ DAILY_BASIC_READY 17:05
 | `forecast`、`express`、`fina_audit` | `next_session(ann_date)` 09:25 | 公告日当天不可见 |
 | `fina_indicator` | `next_session(ann_date)` 09:25 | 按 Tushare 已定义的指标口径使用 |
 | 完整 `dividend` 实施记录 | `next_session(imp_ann_date)` 09:25 | 不用预案 `ann_date` 替补 |
+| `dividend` 预案、决案及其他非实施版本 | `next_session(ann_date)` 09:25 | 按本版本真实公告日；不返回实施日期字段 |
 | `sw_industry` 成员 | `in_date` 当日 09:25 | 只返回当前行业，不返回未来退出信息 |
 | `stock_basic` 上市区间 | `list_date` 当日 09:25 | 用 `[list_date, delist_date)` 构造股票池，不返回未来退市日期 |
 | `trade_cal` | 不走普通 PIT 规则 | 作为回测引擎配置 |
@@ -154,8 +155,10 @@ Tushare 财务数据大多只有公告日期，没有精确发布时间。因此
 
 ### 分红、复权和行业
 
-严格 Reader 默认只返回 `imp_ann_date` 已公布的完整分红实施记录。若以后需要研究预案，应增加
-独立的预案接口，只返回预案阶段已经知道的字段，不能提前返回后来补入的登记日和除权日。
+Reader 返回各阶段已可见的公告版本：实施按 `imp_ann_date`，非实施按该版本的
+`ann_date`。非实施行屏蔽登记日、除权日、派息日、上市日、实施公告日和实施基准信息，
+不能通过早期公告提前看到后来补入的实施字段。缺少对应真实公告日期的行保留在存储中，
+但不能放入 PIT 查询。原始行必须代表该阶段公告；接口不能从今天的最终记录重建缺失历史。
 
 `adjustment="forward"` 表示平台统一的前复权输出语义，不规定数据源必须采用哪一种计算方式。
 无论由哪个数据源实现，它都与其他查询一样遵守 PIT 规则，只能使用 `as_of` 时已经可见的数据。
@@ -346,7 +349,7 @@ Reader 根据 `ROUTE_SCHEMAS` 校验字段名称、顺序、类型和可空性�
 | `fundamentals.cashflow` | 现金流量表 |
 | `fundamentals.indicators` | 财务指标 |
 | `fundamentals.forecast`、`fundamentals.express`、`fundamentals.audit` | 业绩预告、快报和审计意见 |
-| `corporate_actions.dividends` | 分红实施记录 |
+| `corporate_actions.dividends` | 分红各阶段公告版本；账户实施事实复用同一来源 |
 | `corporate_actions.adjustment_factors` | 复权因子 |
 | `classification.industry` | 行业分类和成员 |
 | `reference.stocks` | 指定时点仍在上市区间内的股票主数据 |
@@ -685,9 +688,11 @@ dividends = data.corporate_actions.dividends(
 )
 ```
 
-默认只返回已可见的完整实施记录，按
+返回全部已可见的预案、决案、实施及其他公告版本，不把同一报告期压缩为最后一条，按
 `visible_at ASC, symbol ASC, ex_date ASC, end_date ASC, ann_date ASC, div_proc ASC,
-imp_ann_date ASC` 排序。预案将来使用独立方法，不能通过参数让完整实施字段提前出现。
+imp_ann_date ASC` 排序。需要仅研究实施公告时，查询后按 `div_proc == "实施"` 筛选。
+实施使用 `imp_ann_date`，非实施使用该版本的 `ann_date`，均在下一交易日 09:25 可见；
+日期字段含义参见 [Tushare 分红送股](https://tushare.pro/document/2?doc_id=103)。
 
 `visible_end` 默认为 `as_of` 且不得晚于 `as_of`；可见时间范围两端都包含。
 
