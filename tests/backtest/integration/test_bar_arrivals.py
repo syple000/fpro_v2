@@ -35,7 +35,8 @@ class ObservePrices(Strategy):
         self.values.append(context.account.market_value)
 
 
-def quote(seq: int, start: time, received: time, close: float) -> SequencedQuote:
+def quote(seq: int, label: time, received: time, close: float) -> SequencedQuote:
+    """构造源时间标签；默认测试使用结束标签，兼容测试显式指定其它口径。"""
     return SequencedQuote(
         seq=seq,
         code=SYMBOL,
@@ -44,7 +45,7 @@ def quote(seq: int, start: time, received: time, close: float) -> SequencedQuote
         subscription="SZ",
         received_at=int(at_time(DAY, received).timestamp() * 1_000_000),
         quote=BarQuote(
-            time=int(at_time(DAY, start).timestamp() * 1_000_000),
+            time=int(at_time(DAY, label).timestamp() * 1_000_000),
             open=10,
             high=max(10, close),
             low=min(10, close),
@@ -61,6 +62,7 @@ def data_reader(
     mode: Literal["historical", "received"],
     *,
     identities: SecurityCodeHistory | None = None,
+    realtime_time_label: Literal["start", "end"] = "end",
 ) -> Iterator[DataReader]:
     with TushareDataStore(tmp_path / "tushare") as store:
         store.write(
@@ -99,7 +101,12 @@ def data_reader(
         qmt_root=tmp_path / "qmt",
         identities=identities,
     ) as catalog:
-        yield DataReader(catalog, sources=default_source_config(), bar_availability=mode)
+        yield DataReader(
+            catalog,
+            sources=default_source_config(),
+            bar_availability=mode,
+            qmt_realtime_time_label=realtime_time_label,
+        )
 
 
 def make_engine(reader: DataReader, *, holding: bool = False) -> BacktestEngine:
@@ -128,7 +135,7 @@ def make_engine(reader: DataReader, *, holding: bool = False) -> BacktestEngine:
 
 
 def test_historical_mode_uses_complete_bar_at_end_even_if_received_later(tmp_path: Path) -> None:
-    record = quote(1, time(9, 30), time(9, 31, 30), 11)
+    record = quote(1, time(9, 31), time(9, 31, 30), 11)
     with data_reader(tmp_path, [record], "historical") as reader:
         before = reader.at(at_time(DAY, time(9, 30, 30))).market.bars(
             symbols=(SYMBOL,),
@@ -146,7 +153,7 @@ def test_historical_mode_uses_complete_bar_at_end_even_if_received_later(tmp_pat
 
 
 def test_late_bar_updates_current_valuation_without_historical_fill(tmp_path: Path) -> None:
-    record = quote(1, time(9, 30), time(9, 31, 30), 11)
+    record = quote(1, time(9, 31), time(9, 31, 30), 11)
     with data_reader(tmp_path, [record], "received") as reader:
         engine = make_engine(reader, holding=True)
         engine.broker.submit(OrderRequest(SYMBOL, Side.BUY, 100), at_time(DAY, time(9, 30)))
@@ -169,7 +176,7 @@ def test_late_bar_keeps_stale_marker_with_stable_security_identity(tmp_path: Pat
             CodeInterval(42, "000002.SZ", DAY),
         ]
     )
-    record = quote(1, time(9, 30), time(9, 31, 30), 11)
+    record = quote(1, time(9, 31), time(9, 31, 30), 11)
     with data_reader(tmp_path, [record], "received", identities=identities) as reader:
         engine = make_engine(reader, holding=True)
         result = engine.run()
@@ -182,8 +189,8 @@ def test_late_bar_keeps_stale_marker_with_stable_security_identity(tmp_path: Pat
 
 def test_received_older_arrival_never_overwrites_newer_market_price(tmp_path: Path) -> None:
     records = [
-        quote(1, time(9, 30), time(9, 32, 30), 9),
-        quote(2, time(9, 31), time(9, 32), 12),
+        quote(1, time(9, 31), time(9, 32, 30), 9),
+        quote(2, time(9, 32), time(9, 32), 12),
     ]
     with data_reader(tmp_path, records, "received") as reader:
         engine = make_engine(reader, holding=True)
@@ -194,7 +201,7 @@ def test_received_older_arrival_never_overwrites_newer_market_price(tmp_path: Pa
 
 
 def test_received_last_bar_can_arrive_between_market_close_and_session_end(tmp_path: Path) -> None:
-    record = quote(1, time(9, 32), time(9, 33, 30), 13)
+    record = quote(1, time(9, 33), time(9, 33, 30), 13)
     with data_reader(tmp_path, [record], "received") as reader:
         engine = make_engine(reader, holding=True)
         result = engine.run()
@@ -269,7 +276,7 @@ def test_latest_bar_uses_normalized_end_time_across_qmt_time_labels(tmp_path: Pa
             "none",
         )
     record = quote(1, time(9, 31), time(9, 32), 12)
-    with data_reader(tmp_path, [record], "historical") as reader:
+    with data_reader(tmp_path, [record], "historical", realtime_time_label="start") as reader:
         table = (
             reader.at(at_time(DAY, time(9, 32)))
             .market.bars(
@@ -290,7 +297,7 @@ def test_latest_bar_uses_normalized_end_time_across_qmt_time_labels(tmp_path: Pa
 
 def test_next_day_arrival_does_not_rewrite_previous_equity_snapshot(tmp_path: Path) -> None:
     following = date(2026, 1, 6)
-    record = quote(1, time(9, 32), time(9, 33), 11).model_copy(
+    record = quote(1, time(9, 33), time(9, 33), 11).model_copy(
         update={
             "received_at": int(at_time(following, time(9, 30)).timestamp() * 1_000_000),
         }

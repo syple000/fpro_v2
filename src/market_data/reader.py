@@ -59,7 +59,7 @@ class DataReader:
         max_result_rows: int = 1_000_000,
         bar_availability: Literal["historical", "received"] = "historical",
         qmt_history_time_label: Literal["start", "end"] = "end",
-        qmt_realtime_time_label: Literal["start", "end"] = "start",
+        qmt_realtime_time_label: Literal["start", "end"] = "end",
     ) -> None:
         if (
             isinstance(max_result_rows, bool)

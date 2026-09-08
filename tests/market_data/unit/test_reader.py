@@ -709,7 +709,7 @@ def test_qmt_current_and_completed_intraday_bar_use_received_boundary(tmp_path: 
                     subscription="SZ",
                     received_at=_us(bar_received_at),
                     quote=BarQuote(
-                        time=_us(interval_start),
+                        time=_us(_as_of(2, 9, 31)),
                         open=9.7,
                         high=9.9,
                         low=9.6,

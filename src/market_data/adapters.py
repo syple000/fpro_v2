@@ -1503,7 +1503,7 @@ class QmtAdapter(DataAdapter):
         catalog: DataCatalog,
         *,
         history_time_label: Literal["start", "end"] = "end",
-        realtime_time_label: Literal["start", "end"] = "start",
+        realtime_time_label: Literal["start", "end"] = "end",
         bar_availability: Literal["historical", "received"] = "historical",
     ) -> None:
         self._connection = catalog.adapter_connection
@@ -1624,7 +1624,7 @@ class QmtAdapter(DataAdapter):
             raise DataCapabilityNotSupportedError(f"QMT 不支持分钟周期 {frequency!r}")
         qmt_period, minutes = period
         event_time = _epoch_time("event_time")
-        # 历史下载与实时持久化分别声明标签语义，不能把两种数据一起平移。
+        # QMT 历史与推送默认都是结束标签；其它已核实的采集口径可分别覆盖。
         start_expr = f"CASE WHEN time_label = 'start' THEN {event_time} ELSE " + (
             f"CASE WHEN CAST(timezone('{_TZ}', {event_time}) AS TIME) = TIME '09:30' "
             f"THEN {event_time} - INTERVAL '15 minutes' "

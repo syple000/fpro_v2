@@ -98,12 +98,20 @@ D 表示记录的 `trade_date`、公告日期或生效日期。可见日期为�
 ### 分钟线和日线
 
 分钟线统一转换为半开区间 `[interval_start, interval_end)`，到 `interval_end` 才进入
-`market.bars()`。`QmtAdapter(history_time_label="end", realtime_time_label="start")`
+`market.bars()`。`QmtAdapter(history_time_label="end", realtime_time_label="end")`
 分别声明两个数据集的标签语义；不同采集口径可用独立 source_id 注入适配器。
 历史默认对应本地下载数据的结束标签；09:30 开盘记录单独归入 09:15–09:30 发布窗口，
 回测只用其估值，不模拟竞价成交。午休及收盘结束标签保留。其它周期或数据集接入前须核实口径。
 QMT 的事件时间必须在导入时归一化；如果以后增加 Tushare 分钟表，必须先验证
 其 `trade_time` 表示区间开始还是结束，不能由 Reader 临时猜测。
+
+推送的结束标签默认值依据 [迅投社区的 5 分钟逐 K 线说明](https://www.xuntou.net/forum.php?mod=viewthread&tid=939)：
+09:30 开盘后已在运行 `handlebar`，对应 Bar 的时间戳是 09:35。这支持结束标签，但从
+`handlebar` 推至本项目 `subscribe_quote` 仍是跨接口推断，不是当前券商客户端的实测协议。
+2026-09-08 22:46–22:48 的实机订阅观察约 90 秒，四个 1m/5m 订阅成功但推送为零条，
+不能据此验证标签或收线行为。回归用的是构造数据。结束标签也不表示每次推送均已收线；
+当前可见性仅检查区间结束及（`received` 模式下）接收时点，源版本是否最终完成仍须盘中核实。
+原始 `quote.time` 和落盘 `event_time` 不平移；只在适配层计算 `interval_start/end`。
 
 日线分成两个可见事件：
 
