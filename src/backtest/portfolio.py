@@ -44,7 +44,7 @@ class Portfolio:
         self._entitlements: dict[str, int] = {}
         # 红股在除权日计入总持仓，到上市日才转为可卖。
         self._pending_stock: dict[str, tuple[str, int]] = {}
-        self._last_equity: float | None = None
+        self._last_equity = self.cash
 
     @property
     def dividend_receivable(self) -> float:
@@ -202,10 +202,10 @@ class Portfolio:
         self.assert_valid()
 
     def equity_snapshot(self, session: date) -> EquitySnapshot:
-        """生成日终净值，并相对上一交易日计算简单收益率。"""
+        """生成日终净值；首日以初始资金、后续以上日净值计算收益率。"""
         equity = self.total_equity
         daily_return = None
-        if self._last_equity is not None and self._last_equity > 0:
+        if self._last_equity > 0:
             daily_return = equity / self._last_equity - 1
         self._last_equity = equity
         active = [position for position in self.positions.values() if position.quantity > 0]
