@@ -88,27 +88,49 @@ class Portfolio:
     def unlock_t1(self) -> None:
         """交易日开始时把此前买入的普通股票变为可卖。"""
         for position in self.positions.values():
-            position.sellable_quantity = (
-                position.quantity - position.pending_listing_quantity
-            )
+            position.sellable_quantity = position.quantity - position.pending_listing_quantity
         self.assert_valid()
 
     def apply_fill(self, fill: Fill) -> None:
         """消费一笔已由 Broker 决定的成交，更新现金、数量和成本。"""
-        position = self.position(fill.symbol)
+        self.assert_valid()
+        if (
+            isinstance(fill.quantity, bool)
+            or not isinstance(fill.quantity, int)
+            or fill.quantity <= 0
+        ):
+            raise AccountError("成交数量必须是正整数")
+        if any(
+            not math.isfinite(value) or value < 0
+            for value in (
+                fill.notional,
+                fill.commission,
+                fill.stamp_tax,
+                fill.transfer_fee,
+            )
+        ):
+            raise AccountError("成交金额和费用必须有限且非负")
+        # 先验证全部约束，再提交现金和持仓；失败时不会创建持仓或改动账户。
+        position = self.positions.get(fill.symbol) or Position(fill.symbol)
         if fill.side is Side.BUY:
             cost = fill.notional + fill.total_fee
             if cost > self.cash + _EPSILON:
                 raise AccountError("买入成交超过可用现金")
-            self.cash -= cost
-            position.quantity += fill.quantity
-            # 当日买入不增加 sellable_quantity，从而自然实现 T+1。
+            new_cash = self.cash - cost
         else:
             if fill.quantity > position.quantity:
                 raise AccountError("卖出成交超过持仓")
             if fill.quantity > position.sellable_quantity:
                 raise AccountError("卖出成交超过可卖持仓")
-            self.cash += fill.notional - fill.total_fee
+            new_cash = self.cash + fill.notional - fill.total_fee
+            if new_cash < -_EPSILON:
+                raise AccountError("卖出成交收入及现金不足以支付费用")
+        self.cash = max(0.0, new_cash)
+        self.positions[fill.symbol] = position
+        if fill.side is Side.BUY:
+            position.quantity += fill.quantity
+            # 当日买入不增加 sellable_quantity，从而自然实现 T+1。
+        else:
             position.quantity -= fill.quantity
             position.sellable_quantity -= fill.quantity
             if position.quantity == 0:

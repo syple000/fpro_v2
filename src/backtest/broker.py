@@ -295,6 +295,11 @@ class SimulatedBroker:
             if affordable < quantity:
                 quantity = affordable
                 reason = OrderReason.INSUFFICIENT_CASH
+        elif quantity > 0:
+            notional = price * quantity
+            fees = sum(self._fees(Side.SELL, notional, trading_date))
+            if cash + notional - fees < -1e-9:
+                return 0, OrderReason.INSUFFICIENT_CASH, None
         return max(quantity, 0), reason, price
 
     def _make_fill(

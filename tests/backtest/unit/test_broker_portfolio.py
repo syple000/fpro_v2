@@ -1,3 +1,4 @@
+from dataclasses import replace
 from datetime import date, time
 from typing import cast
 
@@ -124,8 +125,46 @@ def test_limit_up_blocks_buy() -> None:
 
 
 def test_portfolio_rejects_overspending_fill() -> None:
+    portfolio = Portfolio(1_000)
     with pytest.raises(AccountError, match="超过可用现金"):
-        Portfolio(1_000).apply_fill(_fill(Side.BUY, 1_000, 10))
+        portfolio.apply_fill(_fill(Side.BUY, 1_000, 10))
+    assert portfolio.cash == 1_000
+    assert portfolio.positions == {}
+
+
+def test_sale_that_cannot_pay_fees_leaves_broker_and_account_without_a_fill() -> None:
+    day = date(2026, 1, 5)
+    portfolio = Portfolio(1.1)
+    portfolio.apply_fill(_fill(Side.BUY, 100, 0.01))
+    portfolio.unlock_t1()
+    before = portfolio.account_snapshot()
+    broker = SimulatedBroker(BacktestConfig(day, day, volume_limit=None, slippage_bps=0))
+    broker.submit(OrderRequest("000001.SZ", Side.SELL, 100), at_time(day, time(9, 30)))
+    assert (
+        broker.match_bar(
+            event=_event(day),
+            bars={"000001.SZ": _bar(day, 0.01)},
+            account=before,
+            data=_data(broker.config),
+        )
+        == ()
+    )
+    assert broker.fills == ()
+    assert broker.updates[-1].reason is OrderReason.INSUFFICIENT_CASH
+    assert portfolio.account_snapshot() == before
+    with pytest.raises(AccountError, match="不足以支付费用"):
+        portfolio.apply_fill(replace(_fill(Side.SELL, 100, 0.01), commission=5))
+    assert portfolio.account_snapshot() == before
+    assert portfolio.position("000001.SZ").quantity == 100
+
+
+def test_small_sale_can_pay_fees_from_existing_cash() -> None:
+    portfolio = Portfolio(10)
+    portfolio.apply_fill(_fill(Side.BUY, 100, 0.01))
+    portfolio.unlock_t1()
+    portfolio.apply_fill(replace(_fill(Side.SELL, 100, 0.01), commission=5))
+    assert portfolio.cash == 5
+    assert portfolio.position("000001.SZ").quantity == 0
 
 
 @pytest.mark.parametrize("side,expected", [(Side.BUY, 100.01), (Side.SELL, 99.99)])
