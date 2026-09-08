@@ -6,7 +6,15 @@ import pytest
 from backtest.broker import SimulatedBroker
 from backtest.clock import Event, at_time
 from backtest.config import BacktestConfig
-from backtest.domain import AccountSnapshot, Bar, Holding, OrderReason, OrderRequest, Side
+from backtest.domain import (
+    AccountSnapshot,
+    Bar,
+    Holding,
+    OrderReason,
+    OrderRequest,
+    OrderStatus,
+    Side,
+)
 from backtest.orders import create_orders
 from backtest.portfolio import Portfolio
 from backtest.trading_rules import quantity_rule
@@ -62,20 +70,67 @@ def test_target_orders_split_at_board_maximum_and_keep_odd_lot_liquidation() -> 
     ]
 
 
-def test_capacity_below_star_minimum_does_not_create_invalid_fill() -> None:
+@pytest.mark.parametrize(
+    "symbol,requested,capacity",
+    [("688001.SH", 201, 199), ("920047.BJ", 101, 99), ("000001.SZ", 100, 99)],
+)
+@pytest.mark.parametrize("side", [Side.BUY, Side.SELL])
+def test_legal_orders_can_partially_fill_below_submission_minimum(
+    symbol: str, requested: int, capacity: int, side: Side
+) -> None:
+    """申报合法后，部分成交不受申报最低量或整手递增限制。"""
     config = BacktestConfig(DAY, DAY, volume_limit=0.1)
     broker = SimulatedBroker(config)
     opening = at_time(DAY, time(9, 30))
-    broker.submit(OrderRequest("688001.SH", Side.BUY, 201), opening)
-    previous = {**daily_bar(date(2026, 1, 2), 10), "symbol": "688001.SH", "volume": 1_990}
+    broker.submit(OrderRequest(symbol, side, requested), opening)
+    previous = {
+        **daily_bar(date(2026, 1, 2), 10), "symbol": symbol, "volume": capacity * 10
+    }
     data = MemoryDataReader(bar_table([previous]), (DAY,)).at(at_time(DAY, time(16, 5)))
-    assert (
-        broker.match_bar(
-            event=Event(data.as_of, DAY, opening, "1d"),
-            bars={"688001.SH": Bar("688001.SH", opening, 10, 10)},
-            account=Portfolio(100_000).account_snapshot(),
-            data=cast(DataView, data),
-        )
-        == ()
+    portfolio = Portfolio(100_000)
+    if side is Side.SELL:
+        position = portfolio.position(symbol)
+        position.quantity = position.sellable_quantity = requested
+        position.last_price = 10
+    (fill,) = broker.match_bar(
+        event=Event(data.as_of, DAY, opening, "1d"),
+        bars={symbol: Bar(symbol, opening, 10, 10)},
+        account=portfolio.account_snapshot(),
+        data=cast(DataView, data),
     )
+    assert fill.quantity == capacity
+    assert broker.updates[-1].status is OrderStatus.PARTIALLY_FILLED
     assert broker.updates[-1].reason is OrderReason.VOLUME_LIMIT
+    portfolio.apply_fill(fill)
+    expected = capacity if side is Side.BUY else requested - capacity
+    assert portfolio.position(symbol).quantity == expected
+
+
+@pytest.mark.parametrize(
+    "symbol,requested,affordable",
+    [("688001.SH", 201, 199), ("920047.BJ", 101, 99), ("000001.SZ", 100, 99)],
+)
+def test_cash_can_fund_partial_execution_below_submission_minimum(
+    symbol: str, requested: int, affordable: int
+) -> None:
+    """最低佣金和过户费计入现金约束，但不能把不足最低申报量的成交归零。"""
+    config = BacktestConfig(DAY, DAY, volume_limit=None, slippage_bps=0)
+    broker = SimulatedBroker(config)
+    opening = at_time(DAY, time(9, 30))
+    broker.submit(OrderRequest(symbol, Side.BUY, requested), opening)
+    data = MemoryDataReader(bar_table([]), (DAY,)).at(opening)
+    cash = affordable * 10 + 5.1
+    portfolio = Portfolio(cash)
+    (fill,) = broker.match_bar(
+        event=Event(at_time(DAY, time(16, 5)), DAY, opening, "1d"),
+        bars={symbol: Bar(symbol, opening, 10, 10)},
+        account=portfolio.account_snapshot(),
+        data=cast(DataView, data),
+    )
+    assert fill.quantity == affordable
+    assert broker.updates[-1].status is OrderStatus.PARTIALLY_FILLED
+    assert broker.updates[-1].reason is OrderReason.INSUFFICIENT_CASH
+    portfolio.apply_fill(fill)
+    assert portfolio.position(symbol).quantity == affordable
+    assert portfolio.cash == pytest.approx(cash - fill.notional - fill.total_fee)
+    assert 0 <= portfolio.cash < 10

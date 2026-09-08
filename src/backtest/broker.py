@@ -21,7 +21,7 @@ from backtest.domain import (
     OrderUpdate,
     Side,
 )
-from backtest.trading_rules import QuantityRule, quantity_rule
+from backtest.trading_rules import quantity_rule
 from market_data import DataView
 from market_data.identity import SecurityCodeHistory, SecurityMappingError
 
@@ -328,10 +328,9 @@ class SimulatedBroker:
         if order.side is Side.SELL and quantity > sellable:
             quantity = sellable
             reason = OrderReason.INSUFFICIENT_SELLABLE
-        if not (order.side is Side.SELL and quantity == sellable):
-            quantity = rule.round_down(quantity)
+        # 最低量和递增单位约束原始申报；合法订单的部分成交可以逐股发生。
         if order.side is Side.BUY:
-            affordable = self._affordable_quantity(quantity, price, cash, trading_date, rule)
+            affordable = self._affordable_quantity(quantity, price, cash, trading_date)
             if affordable < quantity:
                 quantity = affordable
                 reason = OrderReason.INSUFFICIENT_CASH
@@ -391,20 +390,19 @@ class SimulatedBroker:
         execution_price: float,
         cash: float,
         trading_date: date,
-        rule: QuantityRule,
     ) -> int:
-        """在最低佣金存在时逐手寻找可负担数量。"""
-        quantity = rule.round_down(requested)
+        """先按本金取上界，再逐股检查含最低佣金的实际可负担数量。"""
+        quantity = min(requested, max(0, math.floor(cash / execution_price)))
         while quantity > 0:
             notional = execution_price * quantity
             fees = sum(self._fees(Side.BUY, notional, trading_date))
             if notional + fees <= cash + 1e-9:
                 return quantity
-            quantity = rule.round_down(quantity - rule.step)
+            quantity -= 1
         return 0
 
     def _volume_capacity(self, previous_volume: float | None) -> int | None:
-        """把上一根 K 线成交量参与率转换成整手容量。"""
+        """把上一根 K 线成交量参与率转换成整数股容量。"""
         if self.config.volume_limit is None:
             return None
         if previous_volume is None or not math.isfinite(previous_volume):
