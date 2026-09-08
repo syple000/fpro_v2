@@ -154,7 +154,8 @@ class SimulatedBroker:
                 )
                 continue
 
-            fill = self._make_fill(order, filled_at, quantity, price)
+            assert bar is not None and bar.open is not None
+            fill = self._make_fill(order, filled_at, quantity, bar.open, price)
             fills.append(fill)
             if order.side is Side.BUY:
                 cash -= fill.notional + fill.total_fee
@@ -262,6 +263,13 @@ class SimulatedBroker:
         if order.side is Side.SELL and _reaches_limit(open_price, status.down_limit, buy=False):
             return 0, OrderReason.LIMIT_DOWN, None
 
+        direction = 1 if order.side is Side.BUY else -1
+        price = open_price * (1 + direction * self.config.slippage_bps / 10_000)
+        # 最终成交价先限制在合法价格区间，再计算数量、费用和滑点成本。
+        if _valid_price(status.up_limit):
+            price = min(price, status.up_limit)
+        if _valid_price(status.down_limit):
+            price = max(price, status.down_limit)
         quantity = order.quantity
         reason = OrderReason.NONE
         capacity = self._volume_capacity(previous_volume)
@@ -272,11 +280,11 @@ class SimulatedBroker:
             quantity = sellable
             reason = OrderReason.INSUFFICIENT_SELLABLE
         if order.side is Side.BUY:
-            affordable = self._affordable_quantity(quantity, open_price, cash, trading_date)
+            affordable = self._affordable_quantity(quantity, price, cash, trading_date)
             if affordable < quantity:
                 quantity = affordable
                 reason = OrderReason.INSUFFICIENT_CASH
-        return max(quantity, 0), reason, open_price
+        return max(quantity, 0), reason, price
 
     def _make_fill(
         self,
@@ -284,10 +292,9 @@ class SimulatedBroker:
         at: datetime,
         quantity: int,
         market_price: float,
+        execution_price: float,
     ) -> Fill:
         """应用滑点和交易费用，生成成交记录。"""
-        direction = 1 if order.side is Side.BUY else -1
-        execution_price = market_price * (1 + direction * self.config.slippage_bps / 10_000)
         notional = execution_price * quantity
         commission, stamp_tax, transfer_fee = self._fees(order.side, notional, at.date())
         fill = Fill(
@@ -324,12 +331,11 @@ class SimulatedBroker:
     def _affordable_quantity(
         self,
         requested: int,
-        market_price: float,
+        execution_price: float,
         cash: float,
         trading_date: date,
     ) -> int:
         """在最低佣金存在时逐手寻找可负担数量。"""
-        execution_price = market_price * (1 + self.config.slippage_bps / 10_000)
         quantity = requested // LOT_SIZE * LOT_SIZE
         while quantity > 0:
             notional = execution_price * quantity

@@ -47,12 +47,17 @@ def _bar(at_date: date, price: float) -> Bar:
     )
 
 
-def _data(config: BacktestConfig, *, up_limit: float | None = None) -> DataView:
+def _data(
+    config: BacktestConfig,
+    *,
+    up_limit: float | None = None,
+    down_limit: float | None = None,
+) -> DataView:
     session = config.start_date
     reader = MemoryDataReader(
         bar_table([daily_bar(session, 10)]),
         (session,),
-        statuses={"000001.SZ": {"up_limit": up_limit}},
+        statuses={"000001.SZ": {"up_limit": up_limit, "down_limit": down_limit}},
     )
     return cast(DataView, reader.at(at_time(session, time(16, 5))))
 
@@ -121,6 +126,46 @@ def test_limit_up_blocks_buy() -> None:
 def test_portfolio_rejects_overspending_fill() -> None:
     with pytest.raises(AccountError, match="超过可用现金"):
         Portfolio(1_000).apply_fill(_fill(Side.BUY, 1_000, 10))
+
+
+@pytest.mark.parametrize("side,expected", [(Side.BUY, 100.01), (Side.SELL, 99.99)])
+def test_slippage_is_bounded_before_quantity_and_fee_calculation(
+    side: Side, expected: float
+) -> None:
+    day = date(2026, 1, 5)
+    config = BacktestConfig(day, day, volume_limit=None, slippage_bps=5)
+    portfolio = Portfolio(100_000)
+    if side is Side.SELL:
+        portfolio.apply_fill(_fill(Side.BUY, 100, 100))
+        portfolio.unlock_t1()
+    broker = SimulatedBroker(config)
+    broker.submit(OrderRequest("000001.SZ", side, 100), at_time(day, time(9, 30)))
+    (fill,) = broker.match_bar(
+        event=_event(day),
+        bars={"000001.SZ": _bar(day, 100)},
+        account=portfolio.account_snapshot(),
+        data=_data(config, up_limit=100.01, down_limit=99.99),
+    )
+    assert fill.execution_price == expected
+    assert fill.notional == pytest.approx(expected * 100)
+    assert fill.slippage_cost == pytest.approx(1)
+    portfolio.apply_fill(fill)
+    portfolio.assert_valid()
+
+
+def test_affordability_uses_bounded_execution_price() -> None:
+    day = date(2026, 1, 5)
+    config = BacktestConfig(day, day, volume_limit=None, slippage_bps=5)
+    broker = SimulatedBroker(config)
+    broker.submit(OrderRequest("000001.SZ", Side.BUY, 100), at_time(day, time(9, 30)))
+    (fill,) = broker.match_bar(
+        event=_event(day),
+        bars={"000001.SZ": _bar(day, 100)},
+        account=Portfolio(10_006.2).account_snapshot(),
+        data=_data(config, up_limit=100.01),
+    )
+    assert fill.quantity == 100
+    assert fill.notional + fill.total_fee <= 10_006.2
 
 
 def test_order_submitted_after_bar_open_waits_for_next_bar() -> None:
