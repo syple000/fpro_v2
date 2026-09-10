@@ -57,7 +57,6 @@ class DataReader:
         sources: SourceConfig,
         adapters: Mapping[str, DataAdapter] | None = None,
         max_result_rows: int = 1_000_000,
-        bar_availability: Literal["historical", "received"] = "historical",
     ) -> None:
         if (
             isinstance(max_result_rows, bool)
@@ -89,14 +88,9 @@ class DataReader:
         if self.identities is not None and custom_adapters:
             raise SecurityMappingError("启用代码历史时，自定义适配器尚未声明稳定身份支持")
         self._tushare_adapter = TushareAdapter(catalog)
-        self._qmt_adapter = QmtAdapter(catalog, bar_availability=bar_availability)
+        self._qmt_adapter = QmtAdapter(catalog)
         self._custom_adapters = custom_adapters
         self._max_result_rows = max_result_rows
-
-    @property
-    def bar_availability(self) -> Literal["historical", "received"]:
-        """当前 Reader 固定使用的分钟 Bar 可见性规则。"""
-        return self._qmt_adapter.bar_availability
 
     def implemented_dividends(self, *, symbols: Symbols) -> pa.Table:
         """账户专用：读取固定快照的实施事实，不按策略时钟过滤公告。
@@ -162,7 +156,7 @@ class DataReader:
         return {
             "routes": dict(self._sources.routes),
             "catalog": self._catalog.snapshot_metadata(),
-            "qmt": {"bar_availability": self.bar_availability},
+            "qmt": {"intraday_bars": "downloaded"},
             "custom_adapters": {
                 source: {
                     "type": f"{type(adapter).__module__}.{type(adapter).__qualname__}",

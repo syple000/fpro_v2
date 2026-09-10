@@ -1,4 +1,4 @@
-"""构造跨更码日的接收回放；日期仅用于测试，不代表真实更码事实。"""
+"""构造跨更码日的历史回测；日期仅用于测试，不代表真实更码事实。"""
 
 import json
 from datetime import date, time
@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from backtest.clock import at_time
+from backtest.clock import MarketHours, at_time
 from backtest.config import BacktestConfig
 from backtest.corporate_actions import CorporateActionProcessor
 from backtest.domain import OrderReason, Side
@@ -17,9 +17,8 @@ from backtest.output import write_results
 from backtest.runner import default_source_config
 from backtest.strategy import Strategy, StrategyContext
 from market_data import DataCatalog, DataReader
-from qmt_protocol import BarQuote, SequencedQuote
+from qmt_protocol import BarQuote, HistoryBar, SequencedQuote
 from qmt_receiver import QmtDataStore
-from tests.backtest.integration.test_bar_arrivals import HOURS
 from tests.backtest.integration.test_security_identity import (
     DAYS,
     NEW,
@@ -30,6 +29,9 @@ from tests.backtest.integration.test_security_identity import (
 )
 
 BEFORE, AFTER = DAYS[1:3]
+HOURS = MarketHours(
+    segments=((time(9, 30), time(9, 33)),), daily_bar_at=time(9, 33), session_end=time(9, 34)
+)
 
 
 class ObserveAndOrder(Strategy):
@@ -71,21 +73,49 @@ def received_bar(
 
 
 @pytest.mark.parametrize("has_new_day_bar", [False, True])
-def test_received_bars_keep_identity_price_order_and_metadata_across_rename(
+def test_downloaded_bars_keep_identity_and_ignore_pushes_across_rename(
     tmp_path: Path,
     has_new_day_bar: bool,
 ) -> None:
     identities = history()
     write_data(tmp_path / "tushare", "mixed")
-    records = [
-        received_bar(1, OLD, BEFORE, time(9, 33), BEFORE, time(9, 33), 11),
-        # 更早的旧代码 Bar 到更码后才到达，不能覆盖已经见过的后续价格。
-        received_bar(2, OLD, BEFORE, time(9, 31), AFTER, time(9, 32, 30), 9),
-    ]
-    if has_new_day_bar:
-        records.append(received_bar(3, NEW, AFTER, time(9, 32), AFTER, time(9, 32), 12))
     with QmtDataStore(tmp_path / "qmt") as store:
-        store.append_quotes(records)
+        store.write_intraday(
+            {
+                OLD: [
+                    HistoryBar(
+                        index=int(BEFORE.strftime("%Y%m%d") + "093300"),
+                        open=10,
+                        close=11,
+                        volume=1000,
+                    )
+                ]
+            },
+            "1m",
+            "none",
+        )
+        if has_new_day_bar:
+            store.write_intraday(
+                {
+                    NEW: [
+                        HistoryBar(
+                            index=int(AFTER.strftime("%Y%m%d") + "093200"),
+                            open=10,
+                            close=12,
+                            volume=1000,
+                        )
+                    ]
+                },
+                "1m",
+                "none",
+            )
+        # 更码前后的盘中快照均不得覆盖历史线，也不能补缺或触发成交。
+        store.append_quotes(
+            [
+                received_bar(1, OLD, BEFORE, time(9, 33), BEFORE, time(9, 32, 30), 9),
+                received_bar(2, NEW, AFTER, time(9, 31), AFTER, time(9, 31), 9),
+            ]
+        )
     config = BacktestConfig(
         BEFORE,
         AFTER,
@@ -93,7 +123,6 @@ def test_received_bars_keep_identity_price_order_and_metadata_across_rename(
         market=HOURS,
         symbols=(NEW,),
         volume_limit=None,
-        bar_availability="received",
     )
     strategy = ObserveAndOrder()
     with DataCatalog(
@@ -104,7 +133,6 @@ def test_received_bars_keep_identity_price_order_and_metadata_across_rename(
         reader = DataReader(
             catalog,
             sources=default_source_config(),
-            bar_availability="received",
         )
         metadata = capture_run_metadata(reader, strategy)
         engine = BacktestEngine(
@@ -140,5 +168,5 @@ def test_received_bars_keep_identity_price_order_and_metadata_across_rename(
     assert saved["security_code_history"]["snapshot_id"] == identities.snapshot_id
     assert [row["code"] for row in saved["security_code_history"]["rows"]] == [OLD, NEW]
     assert saved["data"]["qmt"] == {
-        "bar_availability": "received",
+        "intraday_bars": "downloaded",
     }

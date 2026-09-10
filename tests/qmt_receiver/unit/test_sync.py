@@ -1,9 +1,14 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from datetime import date
+from datetime import UTC, date, datetime
 from pathlib import Path
+from typing import Literal
 
+import pytest
+
+import qmt_receiver.sync as sync_module
+from fpro_common import datetime_to_utc_us
 from market_data import DataCatalog
 from qmt_protocol import (
     BalanceRecord,
@@ -29,6 +34,7 @@ class FakeSyncClient:
         self.adjustments: list[DividendType] = []
         self.history_modes: list[HistoryMode] = []
         self.history_periods: list[XtDataPeriod] = []
+        self.history_ranges: list[tuple[str, str]] = []
 
     def download_history(
         self,
@@ -40,6 +46,7 @@ class FakeSyncClient:
     ) -> HistoryDownloadResponse:
         self.history_modes.append(mode)
         self.history_periods.append(period)
+        self.history_ranges.append((start_time, end_time))
         return HistoryDownloadResponse(completed=True)
 
     def query_history(
@@ -55,7 +62,8 @@ class FakeSyncClient:
     ) -> HistoryQueryResponse:
         self.adjustments.append(dividend_type)
         close = 10.0 if dividend_type == "none" else 8.0
-        index = 20240102 if period == "1d" else 20240102093000
+        row_date = max("20240102", start_time)
+        index = int(row_date if period == "1d" else row_date + "093000")
         return HistoryQueryResponse(
             period=period,
             data={
@@ -239,3 +247,81 @@ def test_sync_daily_skips_completed_ranges_and_force_refetches(tmp_path: Path) -
     assert (first, skipped, forced) == (1, 0, 1)
     assert client.history_modes == ["incremental", "full"]
     assert completed == [(date(2024, 1, 1), date(2024, 1, 31))]
+
+
+@pytest.mark.parametrize("period", ["1d", "1m"])
+@pytest.mark.parametrize("force", [False, True])
+def test_history_sync_defers_today_and_future_then_completes_after_date_rollover(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    period: Literal["1d", "1m"],
+    force: bool,
+) -> None:
+    # UTC 1 月 2 日 16:30 已是上海 1 月 3 日，避免依赖机器本地时区。
+    now = datetime(2024, 1, 2, 16, 30, tzinfo=UTC)
+    monkeypatch.setattr(sync_module, "utc_now_us", lambda: datetime_to_utc_us(now))
+    client = FakeSyncClient()
+    with QmtDataStore(tmp_path / "qmt") as store:
+
+        def sync(start: str, end: str) -> int:
+            if period == "1d":
+                return sync_daily(client, store, ["000001.SZ"], start, end, force=force)
+            return sync_intraday(
+                client,
+                store,
+                ["000001.SZ"],
+                start,
+                end,
+                period=period,
+                force=force,
+            )
+
+        assert sync("20240103", "20240105") == 0
+        assert client.history_ranges == []
+        sync("20240101", "20240105")
+        assert client.history_ranges == [("20240101", "20240102")]
+        dataset = "daily" if period == "1d" else "intraday"
+        checkpoint_period = None if period == "1d" else period
+        assert store.sync_completed_ranges(dataset, "000001.SZ", period=checkpoint_period) == [
+            (date(2024, 1, 1), date(2024, 1, 2)),
+        ]
+        now = datetime(2024, 1, 3, 16, 30, tzinfo=UTC)
+        sync("20240101", "20240105")
+        assert client.history_ranges[-1] == (
+            "20240101" if force else "20240103",
+            "20240103",
+        )
+        assert store.sync_completed_ranges(dataset, "000001.SZ", period=checkpoint_period) == [
+            (date(2024, 1, 1), date(2024, 1, 3)),
+        ]
+
+
+@pytest.mark.parametrize("period", ["1d", "1m"])
+def test_history_sync_leaves_omitted_symbols_pending(
+    tmp_path: Path,
+    period: Literal["1d", "1m"],
+) -> None:
+    client = FakeSyncClient()
+    with QmtDataStore(tmp_path / "qmt") as store:
+
+        def sync() -> int:
+            stocks = ["000001.SZ", "600000.SH"]
+            if period == "1d":
+                return sync_daily(client, store, stocks, "20240101", "20240131")
+            return sync_intraday(
+                client,
+                store,
+                stocks,
+                "20240101",
+                "20240131",
+                period=period,
+            )
+
+        assert sync() == 1  # Fake 只返回第一只证券。
+        dataset = "daily" if period == "1d" else "intraday"
+        checkpoint_period = None if period == "1d" else period
+        assert store.sync_completed_ranges(dataset, "600000.SH", period=checkpoint_period) == []
+        assert sync() == 1  # 再次请求被遗漏证券，而不是被错误的 checkpoint 跳过。
+        assert store.sync_completed_ranges(dataset, "600000.SH", period=checkpoint_period) == [
+            (date(2024, 1, 1), date(2024, 1, 31)),
+        ]

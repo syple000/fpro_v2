@@ -661,7 +661,7 @@ def test_reader_uses_refreshed_catalog_without_reopening_snapshots(tmp_path: Pat
         assert _cashflow_value(data) == 2.0
 
 
-def test_qmt_current_and_completed_intraday_bar_use_received_boundary(tmp_path: Path) -> None:
+def test_qmt_current_uses_receipt_and_downloaded_bars_use_interval_end(tmp_path: Path) -> None:
     qmt_root = tmp_path / "qmt"
     interval_start = _as_of(2, 9, 30)
     received_at = _as_of(2, 9, 31)
@@ -682,6 +682,10 @@ def test_qmt_current_and_completed_intraday_bar_use_received_boundary(tmp_path: 
                 ]
             },
             "none",
+        )
+        store.write_intraday(
+            {"000001.SZ": [HistoryBar(index=20240102093100, close=10.2, volume=1)]},
+            "1m", "none",
         )
         store.append_quotes(
             [
@@ -729,7 +733,7 @@ def test_qmt_current_and_completed_intraday_bar_use_received_boundary(tmp_path: 
         }
     )
     with DataCatalog(tushare_root=tmp_path / "tushare", qmt_root=qmt_root) as catalog:
-        reader = DataReader(catalog, sources=config, bar_availability="received")
+        reader = DataReader(catalog, sources=config)
         before = reader.at(datetime(2024, 1, 2, 9, 30, 30, tzinfo=SHANGHAI)).market.bars(
             symbols=("000001.SZ",),
             frequency="1m",
@@ -754,6 +758,7 @@ def test_qmt_current_and_completed_intraday_bar_use_received_boundary(tmp_path: 
         )
 
     assert before.table.num_rows == 0
+    assert after.table.to_pylist()[0]["close"] == 10.2
     assert after.table.to_pylist()[0]["interval_end"] == _as_of(2, 9, 31)
     assert after.table.to_pylist()[0]["volume"] == 100.0
     assert tick_current.table.to_pylist() == [

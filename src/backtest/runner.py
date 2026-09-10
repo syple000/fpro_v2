@@ -165,7 +165,6 @@ def run_from_storage(
     ) as catalog:
         reader = DataReader(
             catalog, sources=routes, max_result_rows=50_000_000,
-            bar_availability=config.bar_availability,
         )
         return run_backtest(
             reader=reader,

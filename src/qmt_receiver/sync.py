@@ -6,7 +6,9 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from typing import Protocol
+from zoneinfo import ZoneInfo
 
+from fpro_common import utc_now_us, utc_us_to_datetime
 from qmt_protocol import (
     DividendFactorsResponse,
     DividendType,
@@ -95,8 +97,8 @@ def sync_daily(
     *,
     force: bool = False,
 ) -> int:
-    """同步不复权日线；已完成区间默认跳过。"""
-    requested_start, requested_end = _requested_dates(start_time, end_time)
+    """同步前一自然日及以前的不复权日线；已完成区间默认跳过。"""
+    requested_start, requested_end = _history_dates(start_time, end_time)
     total = 0
     for range_start, range_end, batch_stocks in _pending_batches(
         store,
@@ -126,7 +128,8 @@ def sync_daily(
         )
         total += store.write_daily(response.data, "none")
         for code in batch_stocks:
-            store.mark_sync_completed("daily", code, range_start, range_end)
+            if code in response.data:
+                store.mark_sync_completed("daily", code, range_start, range_end)
     return total
 
 
@@ -140,10 +143,10 @@ def sync_intraday(
     period: XtDataPeriod,
     force: bool = False,
 ) -> int:
-    """同步 QMT 原生不复权历史分钟线；已完成区间默认跳过。"""
+    """同步前一自然日及以前的不复权分钟线；当天区间留待后续同步。"""
     if period not in _INTRADAY_PERIODS:
         raise ValueError(f"分钟线不支持周期 {period!r}")
-    requested_start, requested_end = _requested_dates(start_time, end_time)
+    requested_start, requested_end = _history_dates(start_time, end_time)
     total = 0
     for range_start, range_end, batch_stocks in _pending_batches(
         store,
@@ -174,7 +177,8 @@ def sync_intraday(
         )
         total += store.write_intraday(response.data, period, "none")
         for code in batch_stocks:
-            store.mark_sync_completed("intraday", code, range_start, range_end, period=period)
+            if code in response.data:
+                store.mark_sync_completed("intraday", code, range_start, range_end, period=period)
     return total
 
 
@@ -295,6 +299,13 @@ def _pending_batches(
         (range_start, range_end, tuple(batch_stocks))
         for (range_start, range_end), batch_stocks in sorted(grouped.items())
     ]
+
+
+def _history_dates(start_time: str, end_time: str) -> tuple[date, date]:
+    """历史表不接收当天快照，force 也不能绕过这个边界。"""
+    start, end = _requested_dates(start_time, end_time)
+    today = utc_us_to_datetime(utc_now_us()).astimezone(ZoneInfo("Asia/Shanghai")).date()
+    return start, min(end, today - timedelta(days=1))
 
 
 def _requested_dates(start_time: str, end_time: str) -> tuple[date, date]:

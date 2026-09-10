@@ -11,7 +11,7 @@ from backtest.clock import Clock, Event, market_timeline
 from backtest.config import BacktestConfig
 from backtest.corporate_actions import CorporateActionProcessor
 from backtest.domain import BacktestResult, Bar, EquitySnapshot, MarketDataCoverage, OrderReason
-from backtest.errors import ConfigurationError, CorporateActionError, DataError
+from backtest.errors import CorporateActionError, DataError
 from backtest.orders import create_orders, validate_target_weights
 from backtest.portfolio import Portfolio
 from backtest.strategy import Strategy, StrategyContext
@@ -35,8 +35,6 @@ class BacktestEngine:
         """创建回测所需的时钟、账户和模拟 Broker。"""
         if not sessions:
             raise DataError("回测区间内没有交易日")
-        if getattr(reader, "bar_availability", config.bar_availability) != config.bar_availability:
-            raise ConfigurationError("DataReader 与 BacktestConfig 的 bar_availability 必须一致")
         if actions is None:
             raise TypeError(
                 "actions 必须显式传入公司行动处理器；空事件请使用 CorporateActionProcessor(())"
@@ -68,8 +66,6 @@ class BacktestEngine:
         self._sessions_with_bars: set[date] = set()
         self._symbols_with_bars: set[str] = set()
         self._last_bar_starts: dict[str | int, datetime] = {}
-        self._last_market_interval_start: datetime | None = None
-        self._last_price_check: datetime | None = None
 
     def run(self) -> BacktestResult:
         """逐个事件推进，最后返回订单、成交和每日净值。"""
@@ -81,19 +77,8 @@ class BacktestEngine:
             elif event.kind in {"bar", "auction"}:
                 self._process_bar(event, data)
             elif event.kind == "strategy":
-                if (
-                    self.config.bar_availability == "received"
-                    and self._last_price_check != event.at
-                ):
-                    self._process_bar(event, data)
                 self._run_strategy(event, data)
             elif event.kind == "session_end":
-                if (
-                    self.config.bar_availability == "received"
-                    and self._last_price_check != event.at
-                ):
-                    # 收盘后到日终之间到达的价格仍可用于日终估值，但绝不补成交。
-                    self._process_bar(event, data)
                 self._end_session(event)
             self.portfolio.assert_valid()
 
@@ -173,8 +158,6 @@ class BacktestEngine:
 
     def _process_bar(self, event: Event, data: DataView) -> None:
         """每根 Bar 都撮合和估值，与策略是否调用无关。"""
-        if event.kind in {"bar", "auction"}:
-            self._last_market_interval_start = event.interval_start
         bars = self._read_bars(event, data)
         new_bars = {
             symbol: bar
@@ -215,15 +198,6 @@ class BacktestEngine:
                 self.portfolio.apply_fill(fill)
 
         self.portfolio.mark_to_market(prices)
-        self._last_price_check = event.at
-        for position in self.portfolio.positions.values():
-            symbol = position.symbol
-            if (
-                symbol in bars
-                and self._last_market_interval_start is not None
-                and bars[symbol].interval_start < self._last_market_interval_start
-            ):
-                position.stale_price = position.quantity > 0
 
     def _run_strategy(self, event: Event, data: DataView) -> None:
         """只在策略声明的时间调用；历史价格继续通过 DataView 查询。"""
@@ -268,24 +242,14 @@ class BacktestEngine:
 
     def _read_bars(self, event: Event, data: DataView) -> dict[str, Bar]:
         """读取当前事件区间内用于撮合和估值的 open、close。"""
-        if self.config.bar_availability == "received":
-            # 按行情时间取最新可见记录，迟到的旧 Bar 不得覆盖已见到的更新价格。
-            rows = data.market.bars(
-                symbols=self.config.symbols or ALL_SYMBOLS,
-                frequency=event.frequency,
-                count=1,
-                fields=("open", "close"),
-                adjustment="none",
-            ).table.to_pylist()
-        else:
-            rows = data.market.bars(
-                symbols=self.config.symbols or ALL_SYMBOLS,
-                frequency=event.frequency,
-                start=event.interval_start,
-                end=event.at,
-                fields=("open", "close"),
-                adjustment="none",
-            ).table.to_pylist()
+        rows = data.market.bars(
+            symbols=self.config.symbols or ALL_SYMBOLS,
+            frequency=event.frequency,
+            start=event.interval_start,
+            end=event.at,
+            fields=("open", "close"),
+            adjustment="none",
+        ).table.to_pylist()
         bars: dict[str, Bar] = {}
         for row in rows:
             symbol = row["symbol"]

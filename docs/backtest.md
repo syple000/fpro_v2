@@ -145,18 +145,15 @@ Broker 和 Portfolio 需要明确的业务字段。这个对象不读取数据�
 调用策略；配置时直接报错，需要改为 `1m` 撮合。这样避免 Bar 中途下单或撤单影响更早的开盘成交。
 Broker 也会检查委托时间，开盘之后提交的订单不会回填到该根 Bar 的开盘。
 
-`BacktestConfig.bar_availability` 默认 `"historical"`：使用固定快照中完整的 Bar，
-忽略原始接收延迟，但仍在 Bar 结束后才让策略看到。需要重放接收延迟时设置为 `"received"`，
-该模式仅用于分钟撮合；QMT 只读取带 `received_at` 的持久化 `bars`，下载的 `intraday`
-没有接收时间，不能混入该模式。`run_from_storage` 自动配置 Reader；自行构造 DataReader
-时须传入一致的 `bar_availability`。
+回测使用固定历史快照，分钟 Bar 在区间结束后才让策略看到。QMT 分钟行情只读取下载的
+`intraday`，推送 `bars` 不参与撮合、估值或缺口补齐；只有推送数据的区间视为缺少历史行情。
+日终和策略事件不会额外读取迟到推送。历史数据缺失时持仓价格继续标为 stale。
 
-接收模式在后续市场、策略及日终时点使用最新已到达的价格。迟到 Bar 只改变当前估值，
-不补记历史开盘成交，也不改写之前的净值；旧区间价格会标为 stale。更旧行情到达时，
-不会覆盖已经可见的更新价格。QMT 历史与实时分钟线统一固定使用结束标签，不提供标签配置。
-运行元数据记录 `bar_availability`，不再记录时间标签字段。
-推送口径的社区依据、跨接口推断和实测边界见
-[分钟线说明](market_data.md#分钟线和日线)；时间标签不等于 Bar 已完成标志。
+`BacktestConfig` 与 `DataReader` 已移除 `bar_availability` 参数，包括原 `historical` / `received`
+模式；迁移旧调用时删除该参数。运行元数据用 `data.qmt.intraday_bars="downloaded"` 记录口径。
+原 `received` 路径未验证推送收线，且实时表压缩不能保留完整事件版本，因此不再承诺接收延迟回放。
+实盘实时行情通过 `QmtReceiver.receive()` 的事件或队列消费。
+QMT 下载分钟线固定使用结束标签，详见 [分钟线说明](market_data.md#分钟线和日线)。
 
 ## 文件职责
 

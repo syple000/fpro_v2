@@ -1472,18 +1472,10 @@ class TushareAdapter(DataAdapter):
 
 
 class QmtAdapter(DataAdapter):
-    """把 QMT 下载历史行情和已接收实时事件归一为平台字段。"""
+    """历史 K 线读取下载表，当前行情读取已接收 tick，并归一为平台字段。"""
 
-    def __init__(
-        self,
-        catalog: DataCatalog,
-        *,
-        bar_availability: Literal["historical", "received"] = "historical",
-    ) -> None:
+    def __init__(self, catalog: DataCatalog) -> None:
         self._connection = catalog.adapter_connection
-        if bar_availability not in {"historical", "received"}:
-            raise ValueError("bar_availability 必须为 historical 或 received")
-        self.bar_availability: Literal["historical", "received"] = bar_availability
 
     def daily_bars(
         self,
@@ -1590,7 +1582,8 @@ class QmtAdapter(DataAdapter):
         if period is None:
             raise DataCapabilityNotSupportedError(f"QMT 不支持分钟周期 {frequency!r}")
         qmt_period, minutes = period
-        # QMT 历史与推送均用区间结束时间；09:30 记录保留原有竞价发布窗口。
+        # 下载分钟线使用区间结束时间；09:30 记录保留原有竞价发布窗口。
+        # 推送 bars 可能只是盘中快照，不能作为完整历史 K 线或用于补缺。
         end_expr = _epoch_time("event_time")
         start_expr = (
             f"CASE WHEN CAST(timezone('{_TZ}', {end_expr}) AS TIME) = TIME '09:30' "
@@ -1599,15 +1592,11 @@ class QmtAdapter(DataAdapter):
         )
         qmt_adjustment = "none"
         direction = _sql_direction(order, default="asc")
-        as_of_us = _epoch_us(as_of)
-        assert as_of_us is not None
         params = _query_parameters(
             period=qmt_period,
             adjustment=qmt_adjustment,
             as_of=as_of,
             as_of_date=as_of.date(),
-            as_of_us=as_of_us,
-            historical=self.bar_availability == "historical",
             symbols=symbols,
             start=start,
             end=end,
@@ -1617,62 +1606,26 @@ class QmtAdapter(DataAdapter):
             fetch_limit=fetch_limit,
         )
         query = f"""
-            WITH candidates AS (
-                SELECT code,
-                       event_time,
-                       open, high, low, close, preClose,
+            WITH platform_bars AS (
+                SELECT code AS symbol,
+                       {start_expr} AS interval_start,
+                       {end_expr} AS interval_end,
+                       open, high, low, close, preClose AS pre_close,
                        CAST(volume * 100.0 AS DOUBLE) AS volume,
-                       amount,
-                       CAST(NULL AS BIGINT) AS received_at,
-                       CAST(0 AS BIGINT) AS seq
+                       amount
                 FROM qmt.intraday
-                WHERE $historical
-                  AND period = $period
+                WHERE period = $period
                   AND adjustment = $adjustment
                   AND trading_date <= $as_of_date
                   AND ($symbols IS NULL OR code IN (SELECT unnest($symbols)))
                   AND ($start_date IS NULL OR trading_date >= $start_date)
                   AND trading_date <= $end_date
-
-                UNION ALL
-
-                SELECT code,
-                       event_time,
-                       quote.open, quote.high, quote.low, quote.close, quote.preClose,
-                       {_qmt_share_volume("quote.volume")} AS volume,
-                       quote.amount,
-                       received_at,
-                       seq
-                FROM qmt.bars
-                WHERE period = $period
-                  AND trading_date <= $as_of_date
-                  AND ($symbols IS NULL OR code IN (SELECT unnest($symbols)))
-                  AND ($start_date IS NULL OR trading_date >= $start_date)
-                  AND trading_date <= $end_date
-                  AND event_time IS NOT NULL
-                  AND ($historical OR received_at <= $as_of_us)
-            ), platform_bars AS (
-                SELECT code AS symbol,
-                       {start_expr} AS interval_start,
-                       {end_expr} AS interval_end,
-                       open, high, low, close,
-                       preClose AS pre_close,
-                       volume,
-                       amount,
-                       event_time, received_at, seq
-                FROM candidates
-            ), latest AS (
-                SELECT * FROM platform_bars
-                QUALIFY row_number() OVER (
-                    PARTITION BY symbol, interval_start, interval_end
-                    ORDER BY received_at DESC NULLS LAST, seq DESC
-                ) = 1
             )
             SELECT symbol,
                    interval_start,
                    interval_end,
                    open, high, low, close, pre_close, volume, amount
-            FROM latest
+            FROM platform_bars
             WHERE interval_end <= $as_of
               AND ($start IS NULL OR interval_start >= $start)
               AND ($end IS NULL OR interval_start < $end)

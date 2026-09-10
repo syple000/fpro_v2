@@ -70,8 +70,8 @@ agent 保留 XtData 原始 `quote.time`。receiver 落盘时才生成业务字�
 
 `sync.py` 将 agent 的直接查询结果写入 `QmtDataStore`：
 
-- `sync_daily()`：同步 QMT 原生不复权日线；默认增量下载。
-- `sync_intraday()`：按指定分钟周期同步 QMT 原生不复权历史 K 线。
+- `sync_daily()`：同步前一自然日及以前的 QMT 原生不复权日线；默认增量下载。
+- `sync_intraday()`：按指定分钟周期同步前一自然日及以前的 QMT 原生不复权历史 K 线。
 - `sync_financial()`：同步八类具体财务记录。
 - `sync_dividend_factors()`：同步具体 `DividendFactor` 记录。
 - `sync_all()`：依次同步日线、1 分钟线、财务和除权因子，并接受关键字参数 `force=False`。
@@ -108,7 +108,8 @@ with (
 ```
 
 QMT 日线、分钟线和除权因子的完成区间记录在 `<root>/_meta/sync/*.json`，键由数据集、证券代码
-以及分钟周期组成。一次查询和落盘全部成功后才原子提交区间；重叠或相邻区间自动合并，重复同步
+以及分钟周期组成。一次查询和落盘成功后才原子提交区间；日线和分钟线仅为响应中明确返回的证券提交，
+遗漏的证券保持待补。重叠或相邻区间自动合并，重复同步
 默认只补缺口。日线和分钟线缺口使用 XtData `incremental` 下载；`force=True` 忽略 meta，行情
 请求 `full` 下载并覆盖 Parquet，除权因子也重新查询。当前券商内置 XtData 没有下载模式参数，
 因此 `incremental` / `full` 在上游缓存下载阶段等价；`force` 仍保证绕过本项目 checkpoint 并重写
@@ -116,6 +117,14 @@ QMT 日线、分钟线和除权因子的完成区间记录在 `<root>/_meta/sync
 
 `sync_all()` 默认包含 1 分钟线；其他分钟周期按实际需要调用 `sync_intraday()`。同步 checkpoint
 使用 `YYYYMMDD` 日级闭区间。命令行 `qmt-receiver-test sync` 同样支持 `--force`。
+
+日线与分钟线同步按调用开始时的 `Asia/Shanghai` 日期，将请求上界截到前一自然日；
+当天和未来区间不下载、不写入历史表、不标记完成，`force=True` 也不绕过此限制。
+跨日后再次同步原区间即可补入新的一天。这是保守的离线同步边界，不假定盘后某分钟一定完成发布。
+响应明确包含证券但区间内缺少部分 K 线的情况，仍需数据质量检查；成功响应不是逐根完整性证明。
+旧版本已经写入的盘中历史数据和错误 checkpoint 不会自动清理，应对受影响的已结束日期使用
+`force=True` 重新同步。
+
 
 历史、财务和除权返回在进入 receiver 时已经是具体行结构。存储层只做物理表映射，不再解析通用 DataFrame 或任意 JSON 单元。
 
@@ -129,6 +138,9 @@ QMT 日线、分钟线和除权因子的完成区间记录在 `<root>/_meta/sync
 | `intraday` | `trading_date` | `(code, period, adjustment, event_time)` |
 | `financial` | `report_date` | `(code, dataset)` |
 | `dividend_factors` | `ex_date` | `code` |
+
+`bars` 是推送快照存档，不作为 `market.bars()` 的历史数据或接收回放来源。实时消费使用
+`QmtReceiver.receive()` 的返回事件或队列；依赖完整 K 线的策略仍需接入层确认收线。
 
 实时表公共信封列为 `trading_date`、`seq`、`code`、`period`、`source`、`subscription`、`received_at`、`event_time` 和 `quote`。`quote` 是具体 Arrow struct：tick 和 bar 各自使用固定字段集合。
 

@@ -70,8 +70,8 @@ DAILY_BASIC_READY 17:05
 | 数据集 | `visible_at` | 备注 |
 | --- | --- | --- |
 | QMT tick | `received_at` | 使用本系统实际收到该事件的时间，不使用行情自带时间冒充可见时间 |
-| QMT 实时 bar | `max(interval_end, received_at)` | 只返回本系统已经收到的完整 K 线 |
-| 历史分钟线 | `interval_end` | 由适配器登记其区间语义 |
+| QMT 推送 bar | 原始接收事件 | 不进入 `market.bars()`；由实时事件接口消费 |
+| 历史分钟线 | `interval_end` | QMT 只读取下载表 `intraday`，不以推送补缺 |
 | `daily.open` | 交易日 D 09:30 | 作为开盘事件，不作为完整日线 |
 | 完整 `daily` | D 16:05 | 此前禁止返回当日最终 high/low/close/volume/amount |
 | `daily_basic` | D 17:05 | 属于日终数据 |
@@ -98,19 +98,26 @@ D 表示记录的 `trade_date`、公告日期或生效日期。可见日期为�
 ### 分钟线和日线
 
 分钟线统一转换为半开区间 `[interval_start, interval_end)`，到 `interval_end` 才进入
-`market.bars()`。QMT 历史与实时分钟线统一固定使用结束标签，`QmtAdapter` 和 `DataReader`
-均不提供时间标签配置。09:30 开盘记录单独归入 09:15–09:30 发布窗口，
-回测只用其估值，不模拟竞价成交。午休及收盘结束标签保留。其它周期或数据集接入前须核实口径。
+`market.bars()`。QMT 只读取下载的 `qmt.intraday`，固定使用结束标签，不提供时间标签配置。
+09:30 开盘记录单独归入 09:15–09:30 发布窗口，回测只用其估值，不模拟竞价成交。
+午休及收盘结束标签保留。其它周期或数据集接入前须核实口径。
 QMT 的事件时间必须在导入时归一化；如果以后增加 Tushare 分钟表，必须先验证
 其 `trade_time` 表示区间开始还是结束，不能由 Reader 临时猜测。
 
-推送的结束标签口径依据 [迅投社区的 5 分钟逐 K 线说明](https://www.xuntou.net/forum.php?mod=viewthread&tid=939)：
-09:30 开盘后已在运行 `handlebar`，对应 Bar 的时间戳是 09:35。这支持结束标签，但从
-`handlebar` 推至本项目 `subscribe_quote` 仍是跨接口推断，不是当前券商客户端的实测协议。
-2026-09-08 22:46–22:48 的实机订阅观察约 90 秒，四个 1m/5m 订阅成功但推送为零条，
-不能据此验证标签或收线行为。回归用的是构造数据。结束标签也不表示每次推送均已收线；
-当前可见性仅检查区间结束及（`received` 模式下）接收时点，源版本是否最终完成仍须盘中核实。
-原始 `quote.time` 和落盘 `event_time` 不平移；只在适配层计算 `interval_start/end`。
+`qmt.bars` 保存原始推送快照。区间结束、接收时间或“最新版本”都不能证明某条快照已经收线，
+所以它不参与历史查询、去重、补缺或普通 Bar 回测。历史分钟线缺失时保持缺失。
+`DataReader`、`QmtAdapter` 和 `BacktestConfig` 已移除 `bar_availability` 参数；旧调用须删除该参数。
+Reader 快照元数据用 `qmt.intraday_bars="downloaded"` 记录当前口径。
+
+实盘引擎通过 `QmtReceiver.receive()` 返回的事件或队列消费实时行情，再向策略分发；
+策略需要完整实时 K 线时，接入层还须提供经过核实的收线确认或历史补查流程。
+当前不提供基于原始 `qmt.bars` 的接收延迟回放，实时表压缩也不保证保留所有接收版本。
+`market.current()` 继续从已接收 tick 获取当前行情，并按 `received_at` 限制可见性。
+
+推送的结束标签曾参考 [迅投社区的 5 分钟逐 K 线说明](https://www.xuntou.net/forum.php?mod=viewthread&tid=939)，
+但从 `handlebar` 推至本项目 `subscribe_quote` 是跨接口推断，不是当前券商客户端的实测协议。
+2026-09-08 22:46–22:48 的盘后实机订阅未收到 Bar，不能据此验证推送标签或收线行为。
+原始 `quote.time` 和落盘 `event_time` 保持原值，历史适配层不再依赖推送标签。
 
 日线分成两个可见事件：
 
@@ -196,7 +203,7 @@ adjusted_price(t) = raw_price(t) / product(dr(e), t < ex_date(e) <= anchor(as_of
 `dividend_factors` 完成区间；任何返回 K 线到 `as_of` 锚点之间没有被一个完整因子区间覆盖时，
 整次前复权查询明确失败。旧的原生 `front/front_ratio` 分区只作复核，Reader 不读取。
 
-同一公式用于 QMT 日线和下载/实时分钟线。实机抽样已逐项比较未复权行情现场计算值与 QMT 原生
+同一公式用于 QMT 日线和下载分钟线。实机抽样已逐项比较未复权行情现场计算值与 QMT 原生
 `front_ratio`：OHLC 和前收盘价达到浮点精度一致，成交量和成交额完全不变。
 
 Reader 只把 `adjustment` 语义传给当前行情适配器，不读取因子、不拼接数据源，也不要求配置
