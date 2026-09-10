@@ -48,3 +48,23 @@ tests/<module>/stress/         并发和压力下的正确性测试
 
 新增模块时应沿用这个边界，不要把模块专属脚本或测试继续堆到项目根目录。
 更具体的测试放置规则见 [tests/README.md](tests/README.md)。
+
+## Python 类型检查
+
+以项目根目录打开 VS Code，使用项目 `.venv` 中的 Python 3.11。工作区配置让 Pylance 检查整个
+项目；`pyproject.toml` 统一登记 `src` 导入路径、`standard` 检查规则，以及源码、脚本、测试和示例的
+检查范围。命令行 Pyright 也会使用 `.venv`，无需依赖终端是否激活虚拟环境：
+
+```bash
+.venv/bin/pyright
+```
+
+工作区默认解释器路径适用于 Linux / WSL；Windows 中选择 `.venv\Scripts\python.exe`，
+命令行使用 `.venv\Scripts\pyright.exe`。开发环境需要安装 `dev` 和所开发模块的依赖组；
+`dev` 包含 `pyarrow-stubs`，用于补充 Arrow 的类型信息。
+
+如果工作区曾选择其他解释器，新增的默认路径不会替换已保存的选择；执行
+`Python: Select Interpreter` 选择项目 `.venv`，再执行 `Python: Restart Language Server` 刷新诊断。
+这是 [VS Code 默认解释器设置](https://code.visualstudio.com/docs/python/settings-reference#_general-python-settings)
+的既定行为。Pylance 使用编辑器选择的解释器，命令行 Pyright 使用 `venvPath` / `venv`，两者应指向
+同一环境；不要通过关闭缺失导入或类型错误诊断来处理环境问题。

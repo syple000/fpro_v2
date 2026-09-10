@@ -5,7 +5,8 @@ dist/
 __pycache__/
 *.py[cod]
 .idea/
-.vscode/
+/.vscode/*
+!/.vscode/settings.json
 /dataset
 /runs
 data_validation.json
