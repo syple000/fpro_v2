@@ -50,6 +50,59 @@ STOCK_BASIC_FIELDS = (
     "act_ent_type",
 )
 
+# 历史每日股票列表，PIT 日期：trade_date；官方文档：
+# https://tushare.pro/document/2?doc_id=262
+BAK_BASIC_FIELDS = (
+    # 交易日期
+    "trade_date",
+    # TS股票代码
+    "ts_code",
+    # 股票名称
+    "name",
+    # 行业
+    "industry",
+    # 地域
+    "area",
+    # 市盈率（动）
+    "pe",
+    # 流通股本（亿）
+    "float_share",
+    # 总股本（亿）
+    "total_share",
+    # 总资产（亿）
+    "total_assets",
+    # 流动资产（亿）
+    "liquid_assets",
+    # 固定资产（亿）
+    "fixed_assets",
+    # 公积金
+    "reserved",
+    # 每股公积金
+    "reserved_pershare",
+    # 每股收益
+    "eps",
+    # 每股净资产
+    "bvps",
+    # 市净率
+    "pb",
+    # 上市日期
+    "list_date",
+    # 未分配利润
+    "undp",
+    # 每股未分配利润
+    "per_undp",
+    # 收入同比（%）
+    "rev_yoy",
+    # 利润同比（%）
+    "profit_yoy",
+    # 毛利率（%）
+    "gpr",
+    # 净利润率（%）
+    "npr",
+    # 股东人数（quicksync 实测返回数字字符串，落盘转为 int64）
+    "holder_num",
+)
+
 # PIT 日期：trade_date。
 DAILY_FIELDS = (
     # 股票代码
@@ -1489,6 +1542,7 @@ STRING_FIELDS = {
 }
 
 INTEGER_FIELDS = {
+    "holder_num",
     "buy_sm_vol",
     "sell_sm_vol",
     "buy_md_vol",
@@ -1519,6 +1573,7 @@ def _source_schema(fields: tuple[str, ...]) -> pa.Schema:
 
 
 STOCK_BASIC_SCHEMA = _source_schema(STOCK_BASIC_FIELDS)
+BAK_BASIC_SCHEMA = _source_schema(BAK_BASIC_FIELDS)
 DAILY_SCHEMA = _source_schema(DAILY_FIELDS)
 DAILY_BASIC_SCHEMA = _source_schema(DAILY_BASIC_FIELDS)
 ADJ_FACTOR_SCHEMA = _source_schema(ADJ_FACTOR_FIELDS)
@@ -1553,6 +1608,7 @@ TRADE_CAL_SCHEMA = pa.schema(
 
 TABLE_SCHEMAS = {
     "stock_basic": STOCK_BASIC_SCHEMA,
+    "bak_basic": BAK_BASIC_SCHEMA,
     "daily": DAILY_SCHEMA,
     "daily_basic": DAILY_BASIC_SCHEMA,
     "adj_factor": ADJ_FACTOR_SCHEMA,
@@ -1574,6 +1630,7 @@ TABLE_SCHEMAS = {
 
 SOURCE_FIELDS = {
     "stock_basic": STOCK_BASIC_FIELDS,
+    "bak_basic": BAK_BASIC_FIELDS,
     "daily": DAILY_FIELDS,
     "daily_basic": DAILY_BASIC_FIELDS,
     "adj_factor": ADJ_FACTOR_FIELDS,
@@ -1595,6 +1652,7 @@ SOURCE_FIELDS = {
 
 TABLE_PARTITION_BY = {
     "stock_basic": "list_date",
+    "bak_basic": "trade_date",
     "daily": "trade_date",
     "daily_basic": "trade_date",
     "adj_factor": "trade_date",
@@ -1617,6 +1675,7 @@ TABLE_PARTITION_BY = {
 # 下列为分区内的“源数据版本键”，分区字段不重复写入。
 TABLE_PRIMARY_KEY = {
     "stock_basic": ("ts_code",),
+    "bak_basic": ("ts_code",),
     "daily": ("ts_code",),
     "daily_basic": ("ts_code",),
     "adj_factor": ("ts_code",),

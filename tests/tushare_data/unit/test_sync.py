@@ -20,6 +20,7 @@ from tushare_data import (
     TABLE_SCHEMAS,
     TushareDataStore,
     TushareProClient,
+    sync_bak_basic,
     sync_daily,
     sync_dividend,
     sync_fina_audit,
@@ -327,6 +328,7 @@ def test_sync_inc_uses_planned_windows_and_ignores_sync_all_progress(
     datasets = (
         "daily",
         "stock_basic",
+        "bak_basic",
         "stk_limit",
         "suspend_d",
         "stock_st",
@@ -358,6 +360,7 @@ def test_sync_inc_uses_planned_windows_and_ignores_sync_all_progress(
 
     assert calls["daily"] == (date(2024, 6, 27), current)
     assert calls["stock_basic"] == (current, current)
+    assert calls["bak_basic"] == calls["daily"]
     assert calls["stk_limit"] == calls["suspend_d"] == calls["stock_st"] == calls["daily"]
     assert calls["daily_basic"] == (date(2024, 6, 22), current)
     assert calls["moneyflow"] == calls["adj_factor"] == calls["daily_basic"]
@@ -399,6 +402,7 @@ def test_sync_all_resumes_failed_chunk_and_then_skips_completed_range(
         "trade_cal",
         "daily",
         "stock_basic",
+        "bak_basic",
         "daily_basic",
         "stk_limit",
         "stock_st",
@@ -946,6 +950,159 @@ def test_sw_industry_full_market_api_is_paginated(tmp_path: Path) -> None:
     ]
 
 
+def _bak_basic_record(ts_code: str, trade_date: str) -> dict[str, object]:
+    # 基于 2026-09-10 实测的 20240102 / 000001.SZ 返回；用参数构造跨股、跨日场景。
+    return {
+        "trade_date": trade_date,
+        "ts_code": ts_code,
+        "name": "平安银行",
+        "industry": "银行",
+        "area": "深圳",
+        "pe": 3.38,
+        "float_share": 194.06,
+        "total_share": 194.06,
+        "total_assets": 55163.88,
+        "liquid_assets": 0.0,
+        "fixed_assets": 99.67,
+        "reserved": 807.59,
+        "reserved_pershare": 4.16,
+        "eps": 1.94,
+        "bvps": 20.4,
+        "pb": 0.45,
+        "list_date": "19910403",
+        "undp": 2182.46,
+        "per_undp": 11.25,
+        "rev_yoy": -7.69,
+        "profit_yoy": 8.12,
+        "gpr": 38.43,
+        "npr": 31.05,
+        "holder_num": "530229",
+    }
+
+
+def test_bak_basic_paginates_market_history_and_upserts_date_partitions(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first_day, second_day = date(2024, 1, 2), date(2024, 1, 3)
+    records = {
+        "20240102": [
+            _bak_basic_record("000001.SZ", "20240102"),
+            {**_bak_basic_record("000002.SZ", "20240102"), "list_date": "0"},
+            {**_bak_basic_record("600000.SH", "20240102"), "holder_num": None},
+        ],
+        "20240103": [{**_bak_basic_record("000001.SZ", "20240103"), "name": "次日名称"}],
+    }
+
+    def responder(api_name: str, fields: str, arguments: dict[str, object]) -> pd.DataFrame:
+        if api_name == "trade_cal":
+            frame = _calendar_frame(fields, arguments)
+            frame["is_open"] = frame["cal_date"].isin(records).astype(int)
+        else:
+            assert api_name == "bak_basic"
+            assert set(fields.split(",")) == set(_bak_basic_record("000001.SZ", "20240102"))
+            assert set(arguments) == {"trade_date", "limit", "offset"}
+            frame = pd.DataFrame(records[str(arguments["trade_date"])])
+        offset, limit = int(str(arguments["offset"])), int(str(arguments["limit"]))
+        return frame.iloc[offset : offset + limit].reset_index(drop=True)
+
+    fetch_pages = sync_module._fetch_pages
+    monkeypatch.setattr(sync_module, "_fetch_pages", lambda request: fetch_pages(request, 2))
+    pro, api = _client(responder)
+    with TushareDataStore(tmp_path) as store:
+        assert sync_bak_basic(pro, store, "20240101", "20240107") == 4
+        first = store.read("bak_basic", first_day).to_pylist()
+        assert first[0] == {
+            **records["20240102"][0],
+            "trade_date": first_day,
+            "list_date": date(1991, 4, 3),
+            "holder_num": 530229,
+        }
+        assert first[1]["list_date"] is None
+        assert first[2]["holder_num"] is None
+        records["20240102"][0]["name"] = "修订名称"
+        assert sync_bak_basic(pro, store, first_day, first_day) == 3
+        assert store.read("bak_basic", first_day).num_rows == 3
+        history = store.read("bak_basic", [first_day, second_day], ts_code="000001.SZ")
+        assert [(row["trade_date"], row["name"]) for row in history.to_pylist()] == [
+            (first_day, "修订名称"),
+            (second_day, "次日名称"),
+        ]
+        assert not store._sync_all_completed_ranges("bak_basic")
+
+    calls = [args for name, _, args in api.calls if name == "bak_basic"]
+    assert [(call["trade_date"], call["offset"]) for call in calls] == [
+        ("20240102", 0),
+        ("20240102", 2),
+        ("20240103", 0),
+        ("20240102", 0),
+        ("20240102", 2),
+    ]
+    assert sorted(
+        path.parent.relative_to(tmp_path / "bak_basic").as_posix()
+        for path in (tmp_path / "bak_basic").rglob("_manifest.json")
+    ) == ["trade_date=value%3A2024-01-02", "trade_date=value%3A2024-01-03"]
+
+
+@pytest.mark.parametrize("failure", ["request", "missing_column", "invalid_list_date"])
+def test_bak_basic_failed_chunk_can_resume_and_force_refresh(
+    tmp_path: Path,
+    failure: str,
+) -> None:
+    fail = True
+
+    def responder(api_name: str, fields: str, arguments: dict[str, object]) -> pd.DataFrame:
+        if api_name == "trade_cal":
+            return _calendar_frame(fields, arguments)
+        assert api_name == "bak_basic"
+        row = _bak_basic_record("000001.SZ", str(arguments["trade_date"]))
+        if fail and arguments["trade_date"] == "20240103":
+            if failure == "request":
+                raise RuntimeError("simulated request failure")
+            if failure == "missing_column":
+                del row["holder_num"]
+            else:
+                row["list_date"] = "20241301"
+        return pd.DataFrame([row])
+
+    pro, api = _client(responder)
+    with TushareDataStore(tmp_path) as store:
+        with pytest.raises((RuntimeError, ValueError)):
+            sync_module.sync_datasets(pro, store, ("bak_basic",), "20240102", "20240103")
+        assert store._sync_all_completed_ranges("bak_basic") == []
+        assert store.read("bak_basic", date(2024, 1, 2)).num_rows == 0
+
+        fail = False
+        assert sync_module.sync_datasets(pro, store, ("bak_basic",), "20240102", "20240103") == {
+            "bak_basic": 2
+        }
+        call_count = len(api.calls)
+        assert sync_module.sync_datasets(pro, store, ("bak_basic",), "20240102", "20240103") == {
+            "bak_basic": 0
+        }
+        assert len(api.calls) == call_count
+        assert sync_module.sync_datasets(
+            pro, store, ("bak_basic",), "20240102", "20240103", force=True
+        ) == {"bak_basic": 2}
+        assert store._sync_all_completed_ranges("bak_basic") == [
+            (date(2024, 1, 2), date(2024, 1, 3))
+        ]
+        assert store.read("bak_basic", [date(2024, 1, 2), date(2024, 1, 3)]).num_rows == 2
+
+
+def test_bak_basic_allows_empty_historical_response(tmp_path: Path) -> None:
+    def responder(api_name: str, fields: str, arguments: dict[str, object]) -> pd.DataFrame:
+        if api_name == "trade_cal":
+            return _calendar_frame(fields, arguments)
+        assert api_name == "bak_basic"
+        return pd.DataFrame()
+
+    pro, _ = _client(responder)
+    with TushareDataStore(tmp_path) as store:
+        assert sync_bak_basic(pro, store, "20160104", "20160104") == 0
+    assert not list((tmp_path / "bak_basic").rglob("_manifest.json"))
+
+
 def test_stock_basic_fetches_listed_delisted_and_paused_stocks(tmp_path: Path) -> None:
     columns = SOURCE_FIELDS["stock_basic"]
 
@@ -1238,6 +1395,7 @@ def test_official_integer_fields_use_int64() -> None:
     ):
         assert TABLE_SCHEMAS["moneyflow"].field(name).type == pa.int64()
     assert TABLE_SCHEMAS["express"].field("is_audit").type == pa.int64()
+    assert TABLE_SCHEMAS["bak_basic"].field("holder_num").type == pa.int64()
 
 
 def test_storage_read_filters_only_source_fields(tmp_path: Path) -> None:

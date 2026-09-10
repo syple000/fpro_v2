@@ -591,8 +591,10 @@ def _check_table(
     issues.extend(_check_duplicate_primary_keys(dataset, partition, partition_date, table))
     issues.extend(_check_required_values(dataset, partition, partition_date, table))
     issues.extend(_check_finite_floats(dataset, partition, partition_date, table))
-    rows = table.select(_CHECK_COLUMNS[dataset]).to_pylist()
-    issues.extend(_DATASET_CHECKERS[dataset](partition, partition_date, rows))
+    checker = _DATASET_CHECKERS.get(dataset)
+    if checker is not None:
+        rows = table.select(_CHECK_COLUMNS[dataset]).to_pylist()
+        issues.extend(checker(partition, partition_date, rows))
     return issues
 
 

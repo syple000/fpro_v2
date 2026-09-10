@@ -24,6 +24,10 @@ API 游标和存储分区是两个独立概念。同步层不会根据请求区�
 快照，按稳定的 `list_date` 分区；`G/UN` 尚未上市且通常没有 `list_date`，不进入历史可交易
 股票主表。`sync_all` 对一次缺失区间只请求一轮完整快照，`sync_inc` 每次运行都会刷新。
 
+`bak_basic` 提供历史每日股票列表，按请求区间内沪、深、北交易日历的开市日逐日获取全市场
+数据，并按 `trade_date` 分区。它复用日频表的分页和 31 个自然日分块逻辑；
+`sync_all` / `sync_datasets` 支持断点续传和 `force`，`sync_inc` 每次刷新最近 5 个交易日。
+
 所有分页请求都按实际返回行数推进 `offset`。`fina_audit` 是唯一个需要先
 拉股票列表再逐股请求的业务：每只股票使用完整待同步日期区间，每完成 30 只
 股票就写盘一次；其余表优先使用全市场接口。
@@ -50,6 +54,7 @@ checkpoint，重跑 `sync_all` 只补未完成区间。
 | 业务 | 分区 | 分区内主键 |
 | --- | --- | --- |
 | `stock_basic` | `list_date` | `ts_code` |
+| `bak_basic` | `trade_date` | `ts_code` |
 | `daily`、`daily_basic`、`adj_factor`、`stk_limit`、`moneyflow` | `trade_date` | `ts_code` |
 | `suspend_d` | `trade_date` | `ts_code, suspend_type, suspend_timing` |
 | `stock_st` | `trade_date` | `ts_code, type` |
@@ -94,6 +99,26 @@ in_date <= as_of AND (out_date IS NULL OR out_date > as_of)
 原始字段。统一 Reader 的 `reference.stocks()` 只用 `list_date/delist_date` 构造指定时点的上市
 区间，不把当前 `list_status` 或未来 `delist_date` 暴露给策略；默认只返回人民币股票。
 
+`bak_basic` 独立保存历史日期的名称、行业、地域以及估值、股本、资产、每股指标、同比、利润率
+和股东人数，共 24 个字段，全部显式请求和落盘。字段及单位见
+[官方股票历史列表文档](https://tushare.pro/document/2?doc_id=262) 和
+[`BAK_BASIC_FIELDS`](../src/tushare_data/schemas.py)。`trade_date/list_date` 存为 `date32`，
+`holder_num` 存为 `int64`，其余指标存为 `float64`，代码、名称、行业、地域存为字符串。
+保留接口原始单位，例如股本和资产中的“亿”不转换为 `daily_basic` 的“万”。
+该接口的字段集不同于 `stock_basic`，不从当前快照补填历史缺少的交易所、上市状态或退市日；
+统一 Reader 的 `reference.stocks()` 仍沿用现有主数据逻辑。
+
+2026-09-10 使用项目 quicksync 客户端实测：默认返回与官方 24 个字段一致；
+2016-12-30 返回 3,071 行，2024-01-02 返回 5,344 行（5,000 + 344），
+2026-09-09 返回 5,569 行（5,000 + 569），分页间代码无重复。
+`holder_num` 实际返回数字字符串；部分 `list_date` 为字符串 `"0"`，表示未知上市日，
+归一化时只将 `bak_basic.list_date` 的该占位值转为空日期，并保留整条记录。
+合法的未来上市日期也按原样保存，不按上市日或当前股票清单过滤历史返回。
+
+官方标注数据从 2016 年开始，但不保证每个交易日均有数据；实测 2016-01-04 返回空列表。
+同步保留实际返回，不用当前 `stock_basic` 填补历史空日。空返回沿用现有同步语义：不创建分区，
+完整块成功后仍记录完成区间；上游后续补齐时可用 `force=True` 重拉。
+
 ## 运行
 
 ```bash
@@ -125,6 +150,23 @@ Python 入口为
 `sync_datasets(pro, store, ("daily", "adj_factor"), start_date, end_date, force=True)`。
 `datasets` 保持调用方顺序并顺序执行，用于数据清洗后的精确补数；未指定时
 `sync_all` 仍按原有方式并行同步全部数据集。
+
+只回填全部可用历史股票列表（日期上限按需调整）：
+
+```bash
+uv run --group tushare-data tushare-data-test \
+  --mode sync_all \
+  --datasets bak_basic \
+  --start-date 20160101 \
+  --end-date 20260909 \
+  --data-dir dataset/tushare
+```
+
+也可直接调用 `sync_bak_basic(pro, store, start_date, end_date)`；该入口每次都会请求指定区间。
+需要完成区间和续传语义时，使用
+`sync_datasets(pro, store, ("bak_basic",), start_date, end_date)`。
+数据目录形如 `<root>/bak_basic/trade_date=value%3A2024-01-02/`，同日按 `ts_code` 去重，
+重抓时后写记录更新同日数据，不覆盖其他日期的快照。
 
 后续持续刷新：
 

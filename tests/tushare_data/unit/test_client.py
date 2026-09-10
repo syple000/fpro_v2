@@ -111,6 +111,7 @@ def test_client_uses_full_market_parameters_and_one_limiter() -> None:
     ("business_method", "parameter_names"),
     [
         (TushareProClient.daily, ("trade_date", "fields", "limit", "offset")),
+        (TushareProClient.bak_basic, ("trade_date", "fields", "limit", "offset")),
         (TushareProClient.daily_basic, ("trade_date", "fields", "limit", "offset")),
         (TushareProClient.adj_factor, ("trade_date", "fields", "limit", "offset")),
         (TushareProClient.suspend_d, ("trade_date", "fields", "limit", "offset")),

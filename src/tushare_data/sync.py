@@ -158,6 +158,26 @@ def sync_stock_basic(
     return store.write("stock_basic", data)
 
 
+def sync_bak_basic(
+    pro: TushareProClient,
+    store: TushareDataStore,
+    start_date: str | date,
+    end_date: str | date,
+) -> int:
+    """按交易日分页获取全市场历史股票列表及基本面快照，按 trade_date 分区。"""
+    fields = ",".join(SOURCE_FIELDS["bak_basic"])
+    return _sync_trade_date_dataset(
+        pro,
+        store,
+        "bak_basic",
+        start_date,
+        end_date,
+        lambda day, limit, offset: pro.bak_basic(
+            trade_date=day, fields=fields, limit=limit, offset=offset
+        ),
+    )
+
+
 def sync_daily_basic(
     pro: TushareProClient,
     store: TushareDataStore,
@@ -658,6 +678,7 @@ def _sync_specs() -> tuple[MarketSyncSpec, ...]:
     return (
         ("trade_cal", sync_trade_cal, CALENDAR_REQUEST_DAYS),
         ("stock_basic", sync_stock_basic, None),
+        ("bak_basic", sync_bak_basic, MARKET_WRITE_CHUNK_DAYS),
         ("daily", sync_daily, MARKET_WRITE_CHUNK_DAYS),
         ("daily_basic", sync_daily_basic, MARKET_WRITE_CHUNK_DAYS),
         ("stk_limit", sync_stk_limit, MARKET_WRITE_CHUNK_DAYS),
@@ -756,6 +777,7 @@ def sync_inc(
         stable_start = open_dates[-min(len(open_dates), INC_STABLE_TRADING_DAYS)]
         factor_start = open_dates[-min(len(open_dates), INC_FACTOR_TRADING_DAYS)]
         for dataset, function in (
+            ("bak_basic", sync_bak_basic),
             ("daily", sync_daily),
             ("stk_limit", sync_stk_limit),
             ("suspend_d", sync_suspend_d),
@@ -770,6 +792,7 @@ def sync_inc(
             jobs.append((dataset, function, factor_start, current))
     else:
         for dataset in (
+            "bak_basic",
             "daily",
             "stk_limit",
             "suspend_d",
@@ -995,6 +1018,9 @@ def _normalise_frame(dataset: str, frame: pd.DataFrame) -> pa.Table:
         for field in schema:
             name = field.name
             value = cleaned.get(name)
+            # bak_basic 实测以字符串 "0" 表示未知上市日，历史列表仍需保留该记录。
+            if dataset == "bak_basic" and name == "list_date" and value == "0":
+                value = None
             if name in DATE_FIELDS and value is not None:
                 value = _parse_date(value)
             elif pa.types.is_floating(field.type) and value is not None:

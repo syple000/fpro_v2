@@ -145,6 +145,9 @@ class TushareProClient:
     def daily(self, trade_date: str, fields: str, limit: int, offset: int) -> pd.DataFrame:
         return self._query("daily", fields, limit, offset, trade_date=trade_date)
 
+    def bak_basic(self, trade_date: str, fields: str, limit: int, offset: int) -> pd.DataFrame:
+        return self._query("bak_basic", fields, limit, offset, trade_date=trade_date)
+
     def daily_basic(self, trade_date: str, fields: str, limit: int, offset: int) -> pd.DataFrame:
         return self._query("daily_basic", fields, limit, offset, trade_date=trade_date)
 
