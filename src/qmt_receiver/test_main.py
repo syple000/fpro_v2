@@ -35,6 +35,7 @@ def run_realtime(
     with QmtAgentClient(base_url) as client, QmtDataStore(data_dir) as store:
         store.compact_realtime()
         client.subscribe_markets(markets)
+        client.subscribe_stocks(["000001.SZ"], "1m")
         receiver = QmtReceiver(client, store, timeout_ms=timeout_ms)
         while True:
             result = receiver.receive(quote_queue)
