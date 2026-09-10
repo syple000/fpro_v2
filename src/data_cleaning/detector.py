@@ -22,7 +22,16 @@ from tushare_data.schemas import TABLE_PARTITION_BY, TABLE_PRIMARY_KEY, TABLE_SC
 from tushare_data.suspensions import parse_suspension_timing
 
 _DENSE_MARKET_DATASETS = frozenset({"daily", "daily_basic", "adj_factor", "stk_limit", "moneyflow"})
-_MARKET_DATE_DATASETS = _DENSE_MARKET_DATASETS | {"suspend_d", "trade_cal"}
+_MARKET_DATE_DATASETS = _DENSE_MARKET_DATASETS | {"bak_basic", "suspend_d", "trade_cal"}
+_BAK_BASIC_REFERENCES = frozenset({"stock_basic", "trade_cal", "suspend_d"})
+_BAK_BASIC_NONNEGATIVE_FIELDS = (
+    "float_share",
+    "total_share",
+    "total_assets",
+    "liquid_assets",
+    "fixed_assets",
+    "holder_num",
+)
 _ANNOUNCEMENT_DATASETS = frozenset(
     {"forecast", "express", "fina_audit", "fina_indicator", "income", "balancesheet", "cashflow"}
 )
@@ -51,6 +60,12 @@ _MISSING_PARTITION_CHECK = {"missing_market_partition_v1": "不缺已知交易�
 _CLOSED_MARKET_CHECK = {"closed_market_partition_v1": "日级市场数据只出现在开市日"}
 
 _DATASET_CHECKS = {
+    "bak_basic": {
+        "bak_basic_value_v1": "历史股票代码和名称有效",
+        "bak_basic_range_v1": "股本、资产和股东人数非负",
+        "bak_basic_reference_v1": "历史列表覆盖检查所需主数据和交易日历可用",
+        "bak_basic_stock_coverage_v1": "在市且当日未停牌的股票都有历史列表记录",
+    },
     "stock_basic": {
         "stock_basic_identity_v1": "代码、证券代码和交易所一致",
         "stock_basic_lifecycle_v1": "上市状态和上市退市日期合理",
@@ -121,6 +136,7 @@ _DATASET_CHECKS = {
 }
 
 _CHECK_COLUMNS: dict[str, tuple[str, ...]] = {
+    "bak_basic": ("trade_date", "ts_code", "name", *_BAK_BASIC_NONNEGATIVE_FIELDS),
     "stock_basic": (
         "list_date",
         "ts_code",
@@ -370,7 +386,10 @@ def source_fingerprint(root: str | Path, datasets: Iterable[str]) -> str:
     """对 Manifest 内容、活跃文件名和大小生成快速输入指纹。"""
     source = Path(root).expanduser().resolve()
     digest = sha256()
-    for dataset in sorted(datasets):
+    selected = set(datasets)
+    if "bak_basic" in selected:
+        selected.update(_BAK_BASIC_REFERENCES)
+    for dataset in sorted(selected):
         table_root = source / dataset
         for manifest in sorted(table_root.rglob("_manifest.json")):
             relative = manifest.relative_to(source).as_posix()
@@ -992,6 +1011,51 @@ def check_stock_basic(partition: str, partition_date: date | None, rows: Rows) -
     return issues
 
 
+def check_bak_basic(partition: str, partition_date: date | None, rows: Rows) -> list[Issue]:
+    """检查历史列表身份和确定的非负指标；允许未知/未来上市日和亏损财务指标。"""
+    issues: list[Issue] = []
+    for row in rows:
+        key = _row_key("bak_basic", row)
+        refetch = _suggested_refetch("bak_basic", row, partition_date)
+        code = row["ts_code"]
+        if not (
+            isinstance(code, str)
+            and len(code) == 9
+            and code[:6].isdigit()
+            and code[6:] in {".SH", ".SZ", ".BJ"}
+            and _nonblank_text(row["name"])
+        ):
+            issues.append(
+                _manual(
+                    "bak_basic",
+                    partition,
+                    key,
+                    "bak_basic_value_v1",
+                    row,
+                    ("ts_code", "name"),
+                    refetch,
+                )
+            )
+        invalid = [
+            name
+            for name in _BAK_BASIC_NONNEGATIVE_FIELDS
+            if _finite_number(row[name]) and _number(row[name]) < 0
+        ]
+        if invalid:
+            issues.append(
+                _manual(
+                    "bak_basic",
+                    partition,
+                    key,
+                    "bak_basic_range_v1",
+                    row,
+                    invalid,
+                    refetch,
+                )
+            )
+    return issues
+
+
 def check_daily_basic(partition: str, partition_date: date | None, rows: Rows) -> list[Issue]:
     """检查 daily_basic：非负范围、股本顺序和市值恒等式。"""
     issues: list[Issue] = []
@@ -1473,16 +1537,101 @@ def check_cross_dataset_consistency(
     through: date,
     start: date | None,
 ) -> list[Issue]:
-    """只在相关数据集同时被选择时执行明确的跨表检查。"""
+    """检查选定数据集的跨表约束；历史列表自动读取本地主数据、日历和停牌表。"""
     selected = set(datasets)
     issues: list[Issue] = []
     if {"daily", "adj_factor"} <= selected:
         issues.extend(_check_daily_and_adj_factor(root, through=through, start=start))
+    if "bak_basic" in selected:
+        issues.extend(_check_bak_basic_coverage(root, through=through, start=start))
+    return issues
+
+
+def _check_bak_basic_coverage(root: Path, *, through: date, start: date | None) -> list[Issue]:
+    # stock_basic 按上市日分区，必须读取检测窗口之前上市的证券；当前 D/P 状态不排除历史。
+    stocks = [
+        row
+        for partition in _partition_index(
+            root, "stock_basic", through=date.max, start=None
+        ).values()
+        for row in _read_partition_rows(partition)
+    ]
+    calendars = _partition_index(root, "trade_cal", through=through, start=start)
+    missing_references = [
+        name
+        for name, available in (("stock_basic", bool(stocks)), ("trade_cal", bool(calendars)))
+        if not available
+    ]
+    if missing_references:
+        return [
+            Issue.create(
+                dataset="bak_basic",
+                partition=None,
+                key={"dataset": "bak_basic"},
+                rule_id="bak_basic_reference_v1",
+                fix_mode="MANUAL",
+                observed={"missing_references": missing_references},
+                suggested=None,
+                message="无法检查历史列表覆盖，请先补齐本地 " + ", ".join(missing_references),
+            )
+        ]
+
+    history = _partition_index(root, "bak_basic", through=through, start=start)
+    suspensions = _partition_index(root, "suspend_d", through=through, start=start)
+    issues: list[Issue] = []
+    for current, calendar in sorted(calendars.items()):
+        exchanges = {
+            row.get("exchange")
+            for row in _read_partition_rows(calendar)
+            if row.get("cal_date") == current and row.get("is_open") == 1
+        }
+        if not exchanges:
+            continue
+        listed_codes = {
+            str(row["ts_code"])
+            for row in stocks
+            if row.get("ts_code") is not None
+            and row.get("exchange") in exchanges
+            and isinstance(listed := row.get("list_date"), date)
+            and listed <= current
+            and (
+                row.get("delist_date") is None
+                or (isinstance(row["delist_date"], date) and current < row["delist_date"])
+            )
+        }
+        suspension = suspensions.get(current)
+        # suspend_d 按日记录事件；同日 S（含日内停牌）豁免，R 不豁免，不向后传播停牌。
+        suspended_codes = {
+            str(row["ts_code"])
+            for row in (_read_partition_rows(suspension) if suspension else [])
+            if row.get("ts_code") is not None
+            and row.get("trade_date") == current
+            and row.get("suspend_type") == "S"
+        }
+        present_codes = {
+            code
+            for code, row in _rows_by_code(history.get(current)).items()
+            if row.get("trade_date") == current
+        }
+        missing = sorted(listed_codes - suspended_codes - present_codes)
+        if missing:
+            issues.append(
+                _cross_partition_issue(
+                    dataset="bak_basic",
+                    partition=history.get(current),
+                    day=current,
+                    rule_id="bak_basic_stock_coverage_v1",
+                    count=len(missing),
+                    samples=missing[:10],
+                    severity="ERROR",
+                    message="在市且当日未停牌的股票缺少 bak_basic 历史列表记录",
+                )
+            )
     return issues
 
 
 def _check_daily_and_adj_factor(root: Path, *, through: date, start: date | None) -> list[Issue]:
-    """前复权回测的唯一跨表硬要求：每条日线都有同日因子。"""
+    """前复权回测要求每条日线都有同日因子。"""
     daily = _partition_index(root, "daily", through=through, start=start)
     factors = _partition_index(root, "adj_factor", through=through, start=start)
     issues: list[Issue] = []
@@ -1643,6 +1792,7 @@ def _report_type_valid(row: Mapping[str, object]) -> bool:
 
 
 _DATASET_CHECKERS: dict[str, DatasetChecker] = {
+    "bak_basic": check_bak_basic,
     "stock_basic": check_stock_basic,
     "daily": check_daily,
     "daily_basic": check_daily_basic,
