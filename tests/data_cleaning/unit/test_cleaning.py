@@ -525,28 +525,20 @@ def test_adj_factor_decrease_is_not_treated_as_corruption(tmp_path: Path) -> Non
     assert report.passed
 
 
-def test_bak_basic_keeps_common_checks_alongside_business_checks(tmp_path: Path) -> None:
+def test_bak_basic_uses_common_checks_without_dataset_specific_rules(tmp_path: Path) -> None:
     with TushareDataStore(tmp_path) as store:
         store.write(
             "bak_basic",
             _table(
                 "bak_basic",
-                {
-                    "ts_code": "000001.SZ",
-                    "trade_date": date(2024, 1, 2),
-                    "name": "平安银行",
-                    "pe": math.inf,
-                },
+                {"ts_code": "000001.SZ", "trade_date": date(2024, 1, 2), "pe": math.inf},
             ),
         )
 
     report = detect(tmp_path, through=date(2024, 1, 2), datasets=("bak_basic",))
 
     assert report.row_counts == {"bak_basic": 1}
-    assert {issue.rule_id for issue in report.issues} == {
-        "finite_float_v1",
-        "bak_basic_reference_v1",
-    }
+    assert [issue.rule_id for issue in report.issues] == ["finite_float_v1"]
 
 
 def test_market_data_rejects_quality_state_after_manifests_change(tmp_path: Path) -> None:

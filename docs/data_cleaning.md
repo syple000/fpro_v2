@@ -145,7 +145,6 @@ data-cleaning repair --issues <报告> --decisions <补丁.jsonl>
 - 交易日历自然日和 SSE/SZSE 必需覆盖（BSE 记录存在时也校验）；
 - 开市日分区覆盖；
 - 复权因子为正、每条日线都有同日因子；
-- 历史股票列表的代码、名称、股本、资产和股东人数，以及在市未停牌股票的逐日覆盖；
 - 涨跌停价格顺序；
 - 财务公告日期、报告期和版本字段；
 - 其他数据集的必要字段取值和日期顺序。
@@ -155,41 +154,6 @@ data-cleaning repair --issues <报告> --decisions <补丁.jsonl>
 
 证券在本地历史中的第一条日线允许没有 `pre_close`：此前没有可用价格就无法连接前一日
 收益，回测会跳过这个端点，不猜值也不制造告警。
-
-### `bak_basic` 清洗和交叉验证
-
-`bak_basic` 按 `trade_date` 限定检测窗口，检查代码、名称以及股本、资产和股东人数的非负
-范围。亏损对应的负 EPS、净资产、估值、同比、利润率等不按负值直接判错；未知或未来
-上市日也允许保留。非有限浮点数沿用通用规则修成 `null`，其他业务错误重拉对应交易日。
-
-单独指定 `--datasets bak_basic` 也会读取本地 `stock_basic`、`trade_cal`、`suspend_d`
-进行交叉验证：
-
-- 读取完整 `stock_basic`，包括检测窗口之前上市的证券，按
-  `list_date <= trade_date AND (delist_date IS NULL OR trade_date < delist_date)` 判断在市；
-  当前 `L/D/P` 状态不代替历史上市区间。
-- 只检查该股票所属交易所的开市日，在 `start/through` 范围内逐日比较；不指定 `start`
-  时使用本地日历覆盖的历史日期。单只股票缺行和整天缺少分区都会被识别。
-- 本地 `suspend_d` 当日存在该股票的 `S` 记录时豁免，包含日内停牌；只有 `R` 记录时
-  仍须检查。停牌表是按日记录的稀疏事件表，没有当日 `S` 记录按未停牌处理，不向后传播
-  旧日期的停牌事件。因此交叉验证前应同步好范围内的停复牌数据。
-- 在市且未停牌的股票缺少当日 `bak_basic` 时，生成 ERROR
-  `bak_basic_stock_coverage_v1`，按日期记录缺失数量和最多 10 个样例代码。
-
-缺少本地主数据或检测范围内的日历时，报告 `bak_basic_reference_v1`，需先补齐依据。
-这些依赖表同样进入检测报告的输入指纹；依赖更新后旧报告不能继续用于修复。
-
-```bash
-uv run --group data-cleaning data-cleaning detect \
-  --input dataset/tushare --datasets bak_basic \
-  --start 2017-01-01 --through 2026-09-09
-```
-
-随后将打印的报告路径传给前述 `data-cleaning repair --issues <报告>`。
-覆盖和业务异常会自动合并受影响日期，并通过 `sync_datasets(..., force=True)` 重拉
-该日全市场 `bak_basic`，即使此前该日期已标记同步完成也会重新请求。
-修复沿用分区备份、失败恢复和显式回滚；复检仍缺失的记录继续保持 ERROR，上游空返回
-不算修复成功。
 
 ## `MarketData` 如何生效
 

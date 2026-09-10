@@ -659,11 +659,6 @@ def repair_unknown_issue(issue: Issue) -> RepairInstruction:
     return _manual(issue, f"规则 {issue.rule_id} 没有登记自动修复方式")
 
 
-def repair_bak_basic_reference(issue: Issue) -> RepairInstruction:
-    """依赖资料不足时先补齐依据，不猜测应有的历史股票列表。"""
-    return _manual(issue, issue.message)
-
-
 def _patch(issue: Issue, message: str) -> RepairInstruction:
     suggested = issue.suggested or {}
     values = suggested.get("values")
@@ -722,7 +717,6 @@ def _manual(issue: Issue, message: str) -> RepairInstruction:
 
 
 _REPAIRERS: dict[str, IssueRepairer] = {
-    "bak_basic_reference_v1": repair_bak_basic_reference,
     "dataset_empty_v1": repair_dataset_empty,
     "manifest_v1": repair_manifest,
     "manifest_file_missing_v1": repair_missing_manifest_file,
@@ -745,9 +739,6 @@ _REPAIRERS: dict[str, IssueRepairer] = {
 }
 
 _BUSINESS_REPAIR_MESSAGES = {
-    "bak_basic_value_v1": "重拉 bak_basic 对应交易日，恢复股票代码和名称",
-    "bak_basic_range_v1": "重拉 bak_basic 对应交易日，复核股本、资产和股东人数",
-    "bak_basic_stock_coverage_v1": "重拉 bak_basic 缺失交易日的全市场历史列表",
     "closed_market_partition_v1": "重拉该日期；若上游仍返回数据，人工核对交易日历",
     "stock_basic_identity_v1": "重拉 stock_basic 对应上市日期",
     "stock_basic_lifecycle_v1": "重拉 stock_basic 对应上市日期",
